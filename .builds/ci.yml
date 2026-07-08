@@ -1,0 +1,25 @@
+image: nixos/unstable
+arch: x86_64
+# Keep this manifest lean: no image packages are needed for the generated checks.
+# If packages are later required on nixos/unstable, use channel-prefixed names
+# (for example, nixos.git); unprefixed names fail before tasks start.
+environment:
+  NIX_CONFIG: |
+    experimental-features = nix-command flakes
+    extra-substituters = https://averagechris-dotfiles.cachix.org
+    extra-trusted-public-keys = averagechris-dotfiles.cachix.org-1:VwJkl5dG1+xGDY5x884mH/kVwwpgwBAdBKIF3BZiia4=
+sources:
+  - https://git.sr.ht/~averagechris/rdny
+tasks:
+  - fmt: |
+      cd rdny
+      nix run .#ci-fmt
+  - clippy: |
+      cd rdny
+      nix run .#ci-clippy
+  - test: |
+      cd rdny
+      nix run .#ci-test
+  - package: |
+      cd rdny
+      nix build .#rdny --print-build-logs

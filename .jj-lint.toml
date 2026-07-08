@@ -1,0 +1,10 @@
+lints = [
+  { name = "nix fmt", command = "nix fmt -- --check ." },
+  { name = "ci fmt", command = "nix run .#ci-fmt" },
+  { name = "ci clippy", command = "nix run .#ci-clippy" },
+  { name = "ci test", command = "nix run .#ci-test" },
+  { name = "cargo machete", command = "nix run .#ci-machete" },
+  { name = "cargo sort", command = "nix run .#ci-sort" },
+  { name = "cargo deny", command = "nix run .#ci-deny" },
+  { name = "cargo audit", command = "nix run .#ci-audit" },
+]

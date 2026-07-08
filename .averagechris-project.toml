@@ -1,0 +1,15 @@
+# Public project metadata for future averagechris fleet enrollment.
+# This file is informational today; site registry updates are manual.
+[project]
+name = "rdny"
+description = "Chrome automation CLI in Rust, deeply inspired by simonw/rodney"
+pages_subdir = "rdny"
+srht_repo = "rdny"
+artifact_prefix = "rdny"
+binaries = ["rdny"]
+version_file = "Cargo.toml"
+homepage_tier = "more"
+downloads = true
+
+[pages]
+docs = ["overview.html", "examples.html", "demo.html", "changelog.html"]

@@ -1,0 +1,22 @@
+[package]
+name = "rdny"
+version = "0.1.0"
+edition = "2024"
+description = "Chrome automation CLI in Rust, deeply inspired by simonw/rodney"
+authors = ["Christopher Cummings"]
+license = "MIT"
+repository = "https://git.sr.ht/~averagechris/rdny"
+homepage = "https://git.sr.ht/~averagechris/rdny"
+readme = "README.md"
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "rdny"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
