@@ -9,6 +9,32 @@ use std::{env, fs, path::PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+/// Persisted viewport/mobile emulation override.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ViewportOverride {
+    pub width: u32,
+    pub height: u32,
+    #[serde(default = "default_viewport_scale")]
+    pub scale: f64,
+    pub mobile: bool,
+}
+
+fn default_viewport_scale() -> f64 {
+    1.0
+}
+
+impl ViewportOverride {
+    pub fn cdp_params(&self) -> Value {
+        json!({
+            "width": self.width,
+            "height": self.height,
+            "deviceScaleFactor": self.scale,
+            "mobile": self.mobile,
+        })
+    }
+}
 
 /// Persisted session record (state.json in the state dir).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -25,6 +51,9 @@ pub struct SessionState {
     pub browser_path: Option<PathBuf>,
     /// Current page target id (set at start, updated by `rdny page`).
     pub target_id: Option<String>,
+    /// Optional persisted viewport/mobile emulation override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub viewport: Option<ViewportOverride>,
 }
 
 /// Resolve the rdny state directory (created if missing).
@@ -118,7 +147,39 @@ mod tests {
             user_data_dir: Some(PathBuf::from("/tmp/rdny-profile")),
             browser_path: Some(PathBuf::from("/Applications/Google Chrome.app")),
             target_id: Some("target-1".to_string()),
+            viewport: None,
         }
+    }
+
+    #[test]
+    fn viewport_round_trips_in_state_json() {
+        let mut state = sample_state();
+        state.viewport = Some(ViewportOverride {
+            width: 375,
+            height: 812,
+            scale: 2.0,
+            mobile: true,
+        });
+
+        let raw = serde_json::to_string(&state).unwrap();
+        assert!(raw.contains("viewport"));
+        assert_eq!(serde_json::from_str::<SessionState>(&raw).unwrap(), state);
+    }
+
+    #[test]
+    fn old_state_json_without_viewport_deserializes() {
+        let raw = r#"{
+            "ws_url":"ws://127.0.0.1:9222/devtools/browser/abc",
+            "host":"127.0.0.1",
+            "port":9222,
+            "pid":123,
+            "user_data_dir":"/tmp/rdny-profile",
+            "browser_path":"/Applications/Google Chrome.app",
+            "target_id":"target-1"
+        }"#;
+
+        let state = serde_json::from_str::<SessionState>(raw).unwrap();
+        assert_eq!(state.viewport, None);
     }
 
     #[test]

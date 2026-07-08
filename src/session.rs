@@ -58,6 +58,13 @@ pub fn connect(timeout_secs: f64) -> Result<PageSession> {
         .with_context(|| format!("connecting to browser websocket {}", state.ws_url))?;
     client.set_timeout(timeout.max(Duration::from_secs(5)));
     let session_id = client.attach_to_target(&target_id)?;
+    if let Some(viewport) = &state.viewport {
+        client.call(
+            Some(&session_id),
+            "Emulation.setDeviceMetricsOverride",
+            viewport.cdp_params(),
+        )?;
+    }
     Ok(PageSession {
         client,
         session_id,

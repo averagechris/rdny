@@ -4,6 +4,8 @@
 
 ### Added
 
+- `rdny viewport` prints, persists, resets, and reapplies viewport/mobile
+  emulation overrides across commands (~averagechris/projects#97).
 - `rdny logs` captures console messages, thrown exceptions, and browser
   log entries; `--follow` streams until interrupted, otherwise events
   drain for the global `--timeout` window (~averagechris/projects#95).

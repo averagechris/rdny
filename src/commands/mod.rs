@@ -6,6 +6,7 @@ pub mod nav;
 pub mod pageinfo;
 pub mod shot;
 pub mod tabs;
+pub mod viewport;
 pub mod wait;
 
 use anyhow::{Context, Result};

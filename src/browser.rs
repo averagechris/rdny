@@ -93,6 +93,7 @@ pub fn launch(opts: &LaunchOpts, data_root: &Path) -> Result<SessionState> {
         user_data_dir: Some(profile_dir),
         browser_path: Some(binary),
         target_id,
+        viewport: None,
     })
 }
 
@@ -113,6 +114,7 @@ pub fn connect(host: &str, port: u16) -> Result<SessionState> {
         user_data_dir: None,
         browser_path: None,
         target_id: first_page_target(host, port),
+        viewport: None,
     })
 }
 

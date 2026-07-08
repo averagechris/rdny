@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use crate::session::PageSession;
+use crate::state::ViewportOverride;
 
 /// Capture a page screenshot (default file: screenshot.png).
 pub fn screenshot(
@@ -13,6 +14,7 @@ pub fn screenshot(
     width: Option<u32>,
     height: Option<u32>,
     file: Option<&Path>,
+    persisted_viewport: Option<&ViewportOverride>,
 ) -> Result<()> {
     let override_set = width.is_some() || height.is_some();
     if override_set {
@@ -36,7 +38,7 @@ pub fn screenshot(
     })();
 
     if override_set {
-        let _ = sess.call("Emulation.clearDeviceMetricsOverride", json!({}));
+        let _ = crate::commands::viewport::restore_persisted(sess, persisted_viewport);
     }
 
     result

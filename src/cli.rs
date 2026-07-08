@@ -63,6 +63,8 @@ pub enum Command {
     },
     /// Capture console and browser logs.
     Logs(LogsArgs),
+    /// Print or set viewport/mobile emulation.
+    Viewport(ViewportArgs),
     /// Click an element.
     Click { selector: String },
     /// Type text into an element.
@@ -131,6 +133,25 @@ pub struct LogsArgs {
     /// Keep streaming log events until interrupted.
     #[arg(long)]
     pub follow: bool,
+}
+
+#[derive(Debug, Parser)]
+pub struct ViewportArgs {
+    /// Viewport width.
+    #[arg(conflicts_with = "reset", requires = "height")]
+    pub width: Option<u32>,
+    /// Viewport height.
+    #[arg(conflicts_with = "reset", requires = "width")]
+    pub height: Option<u32>,
+    /// Device scale factor.
+    #[arg(long, default_value_t = 1.0)]
+    pub scale: f64,
+    /// Enable mobile emulation.
+    #[arg(long)]
+    pub mobile: bool,
+    /// Clear persisted viewport/mobile emulation.
+    #[arg(long)]
+    pub reset: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -248,6 +269,14 @@ pub fn run() -> Result<()> {
         Command::Logs(args) => {
             commands::logs::logs(&mut session::connect(cli.timeout)?, args.follow)?
         }
+        Command::Viewport(args) => commands::viewport::viewport(
+            &mut session::connect(cli.timeout)?,
+            args.width,
+            args.height,
+            args.scale,
+            args.mobile,
+            args.reset,
+        )?,
         Command::Click { selector } => {
             commands::interact::click(&mut session::connect(cli.timeout)?, &selector)?
         }
@@ -284,12 +313,16 @@ pub fn run() -> Result<()> {
         Command::Waitstable => commands::wait::waitstable(&mut session::connect(cli.timeout)?)?,
         Command::Waitidle => commands::wait::waitidle(&mut session::connect(cli.timeout)?)?,
         Command::Sleep { seconds } => commands::wait::sleep(seconds)?,
-        Command::Screenshot(args) => commands::shot::screenshot(
-            &mut session::connect(cli.timeout)?,
-            args.width,
-            args.height,
-            args.file.as_deref(),
-        )?,
+        Command::Screenshot(args) => {
+            let state = crate::state::require()?;
+            commands::shot::screenshot(
+                &mut session::connect(cli.timeout)?,
+                args.width,
+                args.height,
+                args.file.as_deref(),
+                state.viewport.as_ref(),
+            )?
+        }
         Command::ScreenshotEl { selector, file } => commands::shot::screenshot_el(
             &mut session::connect(cli.timeout)?,
             &selector,
@@ -422,12 +455,58 @@ mod tests {
             Command::Logs(LogsArgs { follow: true })
         ));
         assert!(matches!(
+            parse(&["rdny", "viewport"]),
+            Command::Viewport(ViewportArgs {
+                width: None,
+                height: None,
+                scale: 1.0,
+                mobile: false,
+                reset: false,
+            })
+        ));
+        assert!(matches!(
             parse(&["rdny", "page", "2"]),
             Command::Page { index: 2 }
         ));
         assert!(
             matches!(parse(&["rdny", "download", "a.link", "-"]), Command::Download { selector, file: Some(file) } if selector == "a.link" && file.as_os_str() == "-")
         );
+    }
+
+    #[test]
+    fn parses_viewport_args() {
+        assert!(matches!(
+            parse(&["rdny", "viewport", "375", "812"]),
+            Command::Viewport(ViewportArgs {
+                width: Some(375),
+                height: Some(812),
+                scale: 1.0,
+                mobile: false,
+                reset: false,
+            })
+        ));
+        assert!(matches!(
+            parse(&["rdny", "viewport", "375", "812", "--scale", "2", "--mobile"]),
+            Command::Viewport(ViewportArgs {
+                width: Some(375),
+                height: Some(812),
+                scale: 2.0,
+                mobile: true,
+                reset: false,
+            })
+        ));
+        assert!(matches!(
+            parse(&["rdny", "viewport", "--reset"]),
+            Command::Viewport(ViewportArgs {
+                width: None,
+                height: None,
+                scale: 1.0,
+                mobile: false,
+                reset: true,
+            })
+        ));
+        assert!(Cli::try_parse_from(["rdny", "viewport", "375"]).is_err());
+        assert!(Cli::try_parse_from(["rdny", "viewport", "375", "812", "--reset"]).is_err());
     }
 
     #[test]
