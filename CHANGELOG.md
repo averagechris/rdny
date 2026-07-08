@@ -4,6 +4,8 @@
 
 ### Added
 
+- `rdny cookie` manages browser cookies with set, list, get, and delete
+  subcommands (~averagechris/projects#98).
 - `rdny viewport` prints, persists, resets, and reapplies viewport/mobile
   emulation overrides across commands (~averagechris/projects#97).
 - `rdny logs` captures console messages, thrown exceptions, and browser

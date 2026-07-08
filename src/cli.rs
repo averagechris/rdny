@@ -1,7 +1,7 @@
 //! Command-line surface and dispatch.
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 
@@ -44,6 +44,8 @@ pub enum Command {
     Reload(ReloadArgs),
     /// Clear the browser cache.
     ClearCache,
+    /// Manage cookies for the current browser session.
+    Cookie(CookieArgs),
     /// Print the current page URL.
     Url,
     /// Print the current page title.
@@ -155,6 +157,76 @@ pub struct ViewportArgs {
 }
 
 #[derive(Debug, Parser)]
+pub struct CookieArgs {
+    #[command(subcommand)]
+    pub command: CookieCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CookieCommand {
+    /// Set a cookie by name and value.
+    Set(CookieSetArgs),
+    /// List cookies visible to the current page.
+    List,
+    /// Print a cookie value by name.
+    Get { name: String },
+    /// Delete a cookie by name, domain, and path.
+    Delete(CookieDeleteArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct CookieSetArgs {
+    /// Cookie name.
+    pub name: String,
+    /// Cookie value.
+    pub value: String,
+    /// Cookie domain.
+    #[arg(long)]
+    pub domain: String,
+    /// Cookie path.
+    #[arg(long, default_value = "/")]
+    pub path: String,
+    /// Mark the cookie as secure.
+    #[arg(long)]
+    pub secure: bool,
+    /// Mark the cookie as HTTP-only.
+    #[arg(long = "http-only")]
+    pub http_only: bool,
+    /// SameSite policy: strict, lax, or none.
+    #[arg(long = "same-site", value_enum, ignore_case = true)]
+    pub same_site: Option<CookieSameSiteArg>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum CookieSameSiteArg {
+    Strict,
+    Lax,
+    None,
+}
+
+impl From<CookieSameSiteArg> for commands::cookie::SameSite {
+    fn from(value: CookieSameSiteArg) -> Self {
+        match value {
+            CookieSameSiteArg::Strict => Self::Strict,
+            CookieSameSiteArg::Lax => Self::Lax,
+            CookieSameSiteArg::None => Self::None,
+        }
+    }
+}
+
+#[derive(Debug, Parser)]
+pub struct CookieDeleteArgs {
+    /// Cookie name.
+    pub name: String,
+    /// Cookie domain.
+    #[arg(long)]
+    pub domain: String,
+    /// Cookie path.
+    #[arg(long, default_value = "/")]
+    pub path: String,
+}
+
+#[derive(Debug, Parser)]
 #[command(disable_help_flag = true)]
 pub struct ScreenshotArgs {
     /// Screenshot width.
@@ -246,6 +318,30 @@ pub fn run() -> Result<()> {
             commands::nav::reload(&mut session::connect(cli.timeout)?, args.hard)?
         }
         Command::ClearCache => commands::nav::clear_cache(&mut session::connect(cli.timeout)?)?,
+        Command::Cookie(args) => match args.command {
+            CookieCommand::Set(args) => commands::cookie::set(
+                &mut session::connect(cli.timeout)?,
+                &commands::cookie::SetCookie {
+                    name: &args.name,
+                    value: &args.value,
+                    domain: &args.domain,
+                    path: &args.path,
+                    secure: args.secure,
+                    http_only: args.http_only,
+                    same_site: args.same_site.map(Into::into),
+                },
+            )?,
+            CookieCommand::List => commands::cookie::list(&mut session::connect(cli.timeout)?)?,
+            CookieCommand::Get { name } => {
+                commands::cookie::get(&mut session::connect(cli.timeout)?, &name)?
+            }
+            CookieCommand::Delete(args) => commands::cookie::delete(
+                &mut session::connect(cli.timeout)?,
+                &args.name,
+                &args.domain,
+                &args.path,
+            )?,
+        },
         Command::Url => commands::pageinfo::url(&mut session::connect(cli.timeout)?)?,
         Command::Title => commands::pageinfo::title(&mut session::connect(cli.timeout)?)?,
         Command::Html { selector } => {
@@ -507,6 +603,94 @@ mod tests {
         ));
         assert!(Cli::try_parse_from(["rdny", "viewport", "375"]).is_err());
         assert!(Cli::try_parse_from(["rdny", "viewport", "375", "812", "--reset"]).is_err());
+    }
+
+    #[test]
+    fn parses_cookie_commands() {
+        match parse(&[
+            "rdny",
+            "cookie",
+            "set",
+            "sid",
+            "abc",
+            "--domain",
+            "example.com",
+        ]) {
+            Command::Cookie(CookieArgs {
+                command: CookieCommand::Set(args),
+            }) => {
+                assert_eq!(args.name, "sid");
+                assert_eq!(args.value, "abc");
+                assert_eq!(args.domain, "example.com");
+                assert_eq!(args.path, "/");
+                assert!(!args.secure);
+                assert!(!args.http_only);
+                assert_eq!(args.same_site, None);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        assert!(matches!(
+            parse(&["rdny", "cookie", "list"]),
+            Command::Cookie(CookieArgs {
+                command: CookieCommand::List
+            })
+        ));
+        assert!(matches!(
+            parse(&["rdny", "cookie", "get", "sid"]),
+            Command::Cookie(CookieArgs {
+                command: CookieCommand::Get { name }
+            }) if name == "sid"
+        ));
+    }
+
+    #[test]
+    fn parses_cookie_set_all_flags() {
+        match parse(&[
+            "rdny",
+            "cookie",
+            "set",
+            "sid",
+            "abc",
+            "--domain",
+            "example.com",
+            "--path",
+            "/app",
+            "--secure",
+            "--http-only",
+            "--same-site",
+            "LaX",
+        ]) {
+            Command::Cookie(CookieArgs {
+                command: CookieCommand::Set(args),
+            }) => {
+                assert_eq!(args.path, "/app");
+                assert!(args.secure);
+                assert!(args.http_only);
+                assert_eq!(args.same_site, Some(CookieSameSiteArg::Lax));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_cookie_args() {
+        assert!(Cli::try_parse_from(["rdny", "cookie", "set", "sid", "abc"]).is_err());
+        assert!(Cli::try_parse_from(["rdny", "cookie", "delete", "sid"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "rdny",
+                "cookie",
+                "set",
+                "sid",
+                "abc",
+                "--domain",
+                "example.com",
+                "--same-site",
+                "invalid",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
