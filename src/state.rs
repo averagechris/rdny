@@ -57,6 +57,14 @@ pub struct SessionState {
     /// Optional persisted viewport/mobile emulation override.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub viewport: Option<ViewportOverride>,
+    /// Whether commands should collect CDP screencast frames.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recording: bool,
+}
+
+/// Directory where video frames are accumulated while recording.
+pub fn frames_dir() -> Result<PathBuf> {
+    Ok(state_dir()?.join("frames"))
 }
 
 /// Resolve the rdny state directory (created if missing).
@@ -177,6 +185,7 @@ mod tests {
             target_id: Some("target-1".to_string()),
             label: None,
             viewport: None,
+            recording: false,
         }
     }
 
@@ -219,6 +228,20 @@ mod tests {
         let state = serde_json::from_str::<SessionState>(raw).unwrap();
         assert_eq!(state.viewport, None);
         assert_eq!(state.label, None);
+        assert!(!state.recording);
+    }
+
+    #[test]
+    fn recording_round_trips_and_skips_false() {
+        let state = sample_state();
+        let raw = serde_json::to_string(&state).unwrap();
+        assert!(!raw.contains("recording"));
+
+        let mut state = state;
+        state.recording = true;
+        let raw = serde_json::to_string(&state).unwrap();
+        assert!(raw.contains("recording"));
+        assert_eq!(serde_json::from_str::<SessionState>(&raw).unwrap(), state);
     }
 
     #[test]

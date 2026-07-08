@@ -2,7 +2,8 @@
 //! attach to the current page target, and provide the CDP helpers the
 //! command implementations build on.
 
-use std::time::Duration;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -16,6 +17,7 @@ use crate::state;
 pub struct PageSession {
     client: CdpClient,
     session_id: String,
+    frames_dir: Option<PathBuf>,
     /// Overall budget for waiting-style commands (from --timeout).
     pub timeout: Duration,
 }
@@ -65,9 +67,23 @@ pub fn connect(timeout_secs: f64) -> Result<PageSession> {
             viewport.cdp_params(),
         )?;
     }
+    let frames_dir = if state.recording {
+        let frames_dir = state::frames_dir()?;
+        std::fs::create_dir_all(&frames_dir)
+            .with_context(|| format!("creating video frames directory {}", frames_dir.display()))?;
+        client.call(
+            Some(&session_id),
+            "Page.startScreencast",
+            json!({"format": "jpeg", "quality": 70, "everyNthFrame": 1}),
+        )?;
+        Some(frames_dir)
+    } else {
+        None
+    };
     Ok(PageSession {
         client,
         session_id,
+        frames_dir,
         timeout,
     })
 }
@@ -97,7 +113,52 @@ impl PageSession {
 
     /// Pull the next buffered/incoming CDP event.
     pub fn next_event(&mut self, timeout: Duration) -> Result<Option<Event>> {
-        self.client.next_event(timeout)
+        loop {
+            let Some(event) = self.client.next_event(timeout)? else {
+                return Ok(None);
+            };
+            if !self.process_recording_event(&event)? {
+                return Ok(Some(event));
+            }
+        }
+    }
+
+    /// Drain buffered and briefly-arriving events, capturing screencast frames.
+    pub fn drain_events(&mut self, max_wait: Duration) -> Result<()> {
+        let deadline = Instant::now() + max_wait;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(());
+            }
+            let Some(event) = self
+                .client
+                .next_event((deadline - now).min(Duration::from_millis(50)))?
+            else {
+                return Ok(());
+            };
+            let _ = self.process_recording_event(&event)?;
+        }
+    }
+
+    fn process_recording_event(&mut self, event: &Event) -> Result<bool> {
+        if event.method != "Page.screencastFrame"
+            || event.session_id.as_deref() != Some(self.session_id.as_str())
+        {
+            return Ok(false);
+        }
+        let Some(frames_dir) = self.frames_dir.as_deref() else {
+            return Ok(false);
+        };
+        if let Some(ack_id) =
+            crate::commands::video::handle_screencast_frame(&event.params, frames_dir)?
+        {
+            self.call(
+                "Page.screencastFrameAck",
+                json!({"sessionId": ack_id.parse::<i64>().unwrap_or_default()}),
+            )?;
+        }
+        Ok(true)
     }
 
     /// Flat-protocol session id for this attached page target.

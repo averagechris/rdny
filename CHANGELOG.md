@@ -4,6 +4,8 @@
 
 ### Added
 
+- `rdny start-video` / `rdny stop-video` records video via CDP screencast
+  frames (~averagechris/projects#109).
 - Instance labels plus `rdny list` and `rdny cleanup` for discovering and
   reaping per-state-dir browser sessions (~averagechris/projects#108).
 - `rdny cookie` manages browser cookies with set, list, get, and delete

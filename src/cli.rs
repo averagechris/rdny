@@ -115,6 +115,10 @@ pub enum Command {
     Page { index: usize },
     /// Open a new page.
     Newpage { url: Option<String> },
+    /// Start collecting video frames from commands.
+    StartVideo,
+    /// Stop collecting frames and assemble a video file.
+    StopVideo { file: Option<PathBuf> },
 }
 
 #[derive(Debug, Parser)]
@@ -259,6 +263,18 @@ pub struct ScreenshotArgs {
 /// Parse argv and execute the selected command.
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
+    let recording_active = crate::state::load()?.is_some_and(|state| state.recording);
+    let drain_after_dispatch =
+        recording_active && !matches!(cli.command, Command::StopVideo { .. });
+    let mut page_session = None;
+    macro_rules! sess {
+        () => {{
+            if page_session.is_none() {
+                page_session = Some(session::connect(cli.timeout)?);
+            }
+            page_session.as_mut().expect("session just connected")
+        }};
+    }
     match cli.command {
         Command::Start(args) => {
             if let Some(state) = crate::state::load()?
@@ -333,16 +349,14 @@ pub fn run() -> Result<()> {
         },
         Command::List => commands::instances::list()?,
         Command::Cleanup(args) => commands::instances::cleanup(args.all)?,
-        Command::Open { url } => commands::nav::open(&mut session::connect(cli.timeout)?, &url)?,
-        Command::Back => commands::nav::back(&mut session::connect(cli.timeout)?)?,
-        Command::Forward => commands::nav::forward(&mut session::connect(cli.timeout)?)?,
-        Command::Reload(args) => {
-            commands::nav::reload(&mut session::connect(cli.timeout)?, args.hard)?
-        }
-        Command::ClearCache => commands::nav::clear_cache(&mut session::connect(cli.timeout)?)?,
+        Command::Open { url } => commands::nav::open(sess!(), &url)?,
+        Command::Back => commands::nav::back(sess!())?,
+        Command::Forward => commands::nav::forward(sess!())?,
+        Command::Reload(args) => commands::nav::reload(sess!(), args.hard)?,
+        Command::ClearCache => commands::nav::clear_cache(sess!())?,
         Command::Cookie(args) => match args.command {
             CookieCommand::Set(args) => commands::cookie::set(
-                &mut session::connect(cli.timeout)?,
+                sess!(),
                 &commands::cookie::SetCookie {
                     name: &args.name,
                     value: &args.value,
@@ -353,102 +367,72 @@ pub fn run() -> Result<()> {
                     same_site: args.same_site.map(Into::into),
                 },
             )?,
-            CookieCommand::List => commands::cookie::list(&mut session::connect(cli.timeout)?)?,
-            CookieCommand::Get { name } => {
-                commands::cookie::get(&mut session::connect(cli.timeout)?, &name)?
+            CookieCommand::List => commands::cookie::list(sess!())?,
+            CookieCommand::Get { name } => commands::cookie::get(sess!(), &name)?,
+            CookieCommand::Delete(args) => {
+                commands::cookie::delete(sess!(), &args.name, &args.domain, &args.path)?
             }
-            CookieCommand::Delete(args) => commands::cookie::delete(
-                &mut session::connect(cli.timeout)?,
-                &args.name,
-                &args.domain,
-                &args.path,
-            )?,
         },
-        Command::Url => commands::pageinfo::url(&mut session::connect(cli.timeout)?)?,
-        Command::Title => commands::pageinfo::title(&mut session::connect(cli.timeout)?)?,
-        Command::Html { selector } => {
-            commands::pageinfo::html(&mut session::connect(cli.timeout)?, selector.as_deref())?
-        }
-        Command::Text { selector } => {
-            commands::pageinfo::text(&mut session::connect(cli.timeout)?, &selector)?
-        }
-        Command::Attr { selector, name } => {
-            commands::pageinfo::attr(&mut session::connect(cli.timeout)?, &selector, &name)?
-        }
-        Command::Pdf { file } => {
-            commands::pageinfo::pdf(&mut session::connect(cli.timeout)?, file.as_deref())?
-        }
+        Command::Url => commands::pageinfo::url(sess!())?,
+        Command::Title => commands::pageinfo::title(sess!())?,
+        Command::Html { selector } => commands::pageinfo::html(sess!(), selector.as_deref())?,
+        Command::Text { selector } => commands::pageinfo::text(sess!(), &selector)?,
+        Command::Attr { selector, name } => commands::pageinfo::attr(sess!(), &selector, &name)?,
+        Command::Pdf { file } => commands::pageinfo::pdf(sess!(), file.as_deref())?,
         Command::Js { expression } => {
             let stdin = std::io::stdin();
             let stdin_is_tty = stdin.is_terminal();
             let expression = resolve_js_expression(expression, stdin, stdin_is_tty)?;
-            commands::interact::js(&mut session::connect(cli.timeout)?, &expression)?
+            commands::interact::js(sess!(), &expression)?
         }
-        Command::Logs(args) => {
-            commands::logs::logs(&mut session::connect(cli.timeout)?, args.follow)?
-        }
+        Command::Logs(args) => commands::logs::logs(sess!(), args.follow)?,
         Command::Viewport(args) => commands::viewport::viewport(
-            &mut session::connect(cli.timeout)?,
+            sess!(),
             args.width,
             args.height,
             args.scale,
             args.mobile,
             args.reset,
         )?,
-        Command::Click { selector } => {
-            commands::interact::click(&mut session::connect(cli.timeout)?, &selector)?
+        Command::Click { selector } => commands::interact::click(sess!(), &selector)?,
+        Command::Input { selector, text } => commands::interact::input(sess!(), &selector, &text)?,
+        Command::Clear { selector } => commands::interact::clear(sess!(), &selector)?,
+        Command::File { selector, path } => commands::interact::file(sess!(), &selector, &path)?,
+        Command::Download { selector, file } => {
+            commands::interact::download(sess!(), &selector, file.as_deref())?
         }
-        Command::Input { selector, text } => {
-            commands::interact::input(&mut session::connect(cli.timeout)?, &selector, &text)?
-        }
-        Command::Clear { selector } => {
-            commands::interact::clear(&mut session::connect(cli.timeout)?, &selector)?
-        }
-        Command::File { selector, path } => {
-            commands::interact::file(&mut session::connect(cli.timeout)?, &selector, &path)?
-        }
-        Command::Download { selector, file } => commands::interact::download(
-            &mut session::connect(cli.timeout)?,
-            &selector,
-            file.as_deref(),
-        )?,
         Command::Select { selector, value } => {
-            commands::interact::select(&mut session::connect(cli.timeout)?, &selector, &value)?
+            commands::interact::select(sess!(), &selector, &value)?
         }
-        Command::Submit { selector } => {
-            commands::interact::submit(&mut session::connect(cli.timeout)?, &selector)?
-        }
-        Command::Hover { selector } => {
-            commands::interact::hover(&mut session::connect(cli.timeout)?, &selector)?
-        }
-        Command::Focus { selector } => {
-            commands::interact::focus(&mut session::connect(cli.timeout)?, &selector)?
-        }
-        Command::Wait { selector } => {
-            commands::wait::wait(&mut session::connect(cli.timeout)?, &selector)?
-        }
-        Command::Waitload => commands::wait::waitload(&mut session::connect(cli.timeout)?)?,
-        Command::Waitstable => commands::wait::waitstable(&mut session::connect(cli.timeout)?)?,
-        Command::Waitidle => commands::wait::waitidle(&mut session::connect(cli.timeout)?)?,
+        Command::Submit { selector } => commands::interact::submit(sess!(), &selector)?,
+        Command::Hover { selector } => commands::interact::hover(sess!(), &selector)?,
+        Command::Focus { selector } => commands::interact::focus(sess!(), &selector)?,
+        Command::Wait { selector } => commands::wait::wait(sess!(), &selector)?,
+        Command::Waitload => commands::wait::waitload(sess!())?,
+        Command::Waitstable => commands::wait::waitstable(sess!())?,
+        Command::Waitidle => commands::wait::waitidle(sess!())?,
         Command::Sleep { seconds } => commands::wait::sleep(seconds)?,
         Command::Screenshot(args) => {
             let state = crate::state::require()?;
             commands::shot::screenshot(
-                &mut session::connect(cli.timeout)?,
+                sess!(),
                 args.width,
                 args.height,
                 args.file.as_deref(),
                 state.viewport.as_ref(),
             )?
         }
-        Command::ScreenshotEl { selector, file } => commands::shot::screenshot_el(
-            &mut session::connect(cli.timeout)?,
-            &selector,
-            file.as_deref(),
-        )?,
+        Command::ScreenshotEl { selector, file } => {
+            commands::shot::screenshot_el(sess!(), &selector, file.as_deref())?
+        }
         Command::Pages => commands::tabs::pages()?,
         Command::Page { index } => commands::tabs::page(index)?,
         Command::Newpage { url } => commands::tabs::newpage(url.as_deref())?,
+        Command::StartVideo => commands::video::start()?,
+        Command::StopVideo { file } => commands::video::stop(sess!(), file.as_deref())?,
+    }
+    if drain_after_dispatch && let Some(session) = page_session.as_mut() {
+        session.drain_events(std::time::Duration::from_millis(300))?;
     }
     Ok(())
 }
@@ -592,6 +576,17 @@ mod tests {
             Command::Waitstable
         ));
         assert!(matches!(parse(&["rdny", "waitidle"]), Command::Waitidle));
+        assert!(matches!(
+            parse(&["rdny", "start-video"]),
+            Command::StartVideo
+        ));
+        assert!(matches!(
+            parse(&["rdny", "stop-video"]),
+            Command::StopVideo { file: None }
+        ));
+        assert!(
+            matches!(parse(&["rdny", "stop-video", "out.mp4"]), Command::StopVideo { file: Some(file) } if file.as_os_str() == "out.mp4")
+        );
         assert!(matches!(
             parse(&["rdny", "logs", "--follow"]),
             Command::Logs(LogsArgs { follow: true })

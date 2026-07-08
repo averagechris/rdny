@@ -97,6 +97,7 @@ pub fn launch(opts: &LaunchOpts, data_root: &Path) -> Result<SessionState> {
         target_id,
         label: opts.label.clone(),
         viewport: None,
+        recording: false,
     })
 }
 
@@ -119,6 +120,7 @@ pub fn connect(host: &str, port: u16) -> Result<SessionState> {
         target_id: first_page_target(host, port),
         label: None,
         viewport: None,
+        recording: false,
     })
 }
 

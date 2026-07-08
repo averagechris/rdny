@@ -162,6 +162,7 @@ mod tests {
             target_id: None,
             label: label.map(str::to_string),
             viewport: None,
+            recording: false,
         }
     }
 

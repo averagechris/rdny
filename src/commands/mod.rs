@@ -8,6 +8,7 @@ pub mod nav;
 pub mod pageinfo;
 pub mod shot;
 pub mod tabs;
+pub mod video;
 pub mod viewport;
 pub mod wait;
 
