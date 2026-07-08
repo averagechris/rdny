@@ -1,30 +1,23 @@
-use clap::Parser;
+// TODO(#76): remove once all command groups land and every module
+// entry point is wired into dispatch.
+#![allow(dead_code)]
 
-#[derive(Debug, serde::Serialize)]
-struct JsonOutput {
-    ok: bool,
-    tool: &'static str,
-}
+mod browser;
+mod cdp;
+mod cli;
+mod hint;
+mod state;
 
-#[derive(Debug, Parser)]
-#[command(name = "rdny", version, about)]
-struct Cli {
-    /// Print output as JSON.
-    #[arg(long)]
-    json: bool,
-}
+use std::process::ExitCode;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    if cli.json {
-        let output = JsonOutput {
-            ok: true,
-            tool: "rdny",
-        };
-        println!("{}", serde_json::to_string(&output)?);
-    } else {
-        println!("rdny: hello from rdny");
+/// Exit codes follow the rodney convention:
+/// 0 success, 1 reserved for check-failures, 2 error.
+fn main() -> ExitCode {
+    match cli::run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("rdny: {err:#}");
+            ExitCode::from(2)
+        }
     }
-    Ok(())
 }
