@@ -4,6 +4,8 @@
 
 ### Added
 
+- Optional config file for third-party binary paths and future named connect
+  targets (~averagechris/projects#110).
 - `rdny start-video` / `rdny stop-video` records video via CDP screencast
   frames (~averagechris/projects#109).
 - Instance labels plus `rdny list` and `rdny cleanup` for discovering and

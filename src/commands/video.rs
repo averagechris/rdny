@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use crate::commands::decode_base64;
+use crate::config;
 use crate::hint::hint_error;
 use crate::{session::PageSession, state};
 
@@ -43,7 +44,9 @@ pub fn stop(session: Option<&mut PageSession>, output: Option<&Path>) -> Result<
     let list_path = frames_dir.join("frames.txt");
     fs::write(&list_path, list).context("writing ffmpeg concat list")?;
 
-    let status = Command::new("ffmpeg")
+    let config = config::load()?;
+    let ffmpeg = config::resolve_ffmpeg(std::env::var_os("RDNY_FFMPEG"), &config);
+    let status = Command::new(&ffmpeg)
         .args([OsStr::new("-loglevel"), OsStr::new("error")])
         .args([OsStr::new("-y"), OsStr::new("-f"), OsStr::new("concat")])
         .args([OsStr::new("-safe"), OsStr::new("0"), OsStr::new("-i")])
@@ -75,9 +78,9 @@ pub fn stop(session: Option<&mut PageSession>, output: Option<&Path>) -> Result<
             None,
         )),
         Err(err) => Err(hint_error(
-            format!("could not run ffmpeg: {err}"),
+            format!("could not run {}: {err}", ffmpeg.display()),
             format!(
-                "install ffmpeg and retry; frames are preserved at {}",
+                "install ffmpeg, set RDNY_FFMPEG, or set binaries.ffmpeg in the rdny config file; frames are preserved at {}",
                 frames_dir.display()
             ),
             None,

@@ -2,6 +2,7 @@ mod browser;
 mod cdp;
 mod cli;
 mod commands;
+mod config;
 mod hint;
 mod session;
 mod state;

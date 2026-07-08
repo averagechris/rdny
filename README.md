@@ -14,9 +14,10 @@ The default `rdny` package does not bundle a browser. At runtime rdny looks for
 Chrome/Chromium in this order:
 
 1. `RDNY_CHROME`, when set.
-2. Well-known macOS and Linux Chrome/Chromium locations.
+2. `binaries.chrome` in the rdny config file.
+3. Well-known macOS and Linux Chrome/Chromium locations.
 3. A clear error with the paths it tried and instructions for setting
-   `RDNY_CHROME`.
+   `RDNY_CHROME` or `binaries.chrome`.
 
 Set `RDNY_CHROME_ARGS` to append extra launch flags when rdny starts Chrome, for
 example:
@@ -52,6 +53,35 @@ browser using `.#rdny-ffmpeg`:
 nix run .#rdny-ffmpeg -- --help
 ```
 
+## Configuration
+
+rdny reads an optional TOML config file from the first configured location:
+
+1. `RDNY_CONFIG`, interpreted as the exact config file path.
+2. `$XDG_CONFIG_HOME/rdny/config.toml`.
+3. `~/.config/rdny/config.toml` on all platforms, including macOS.
+
+All fields are optional, and unknown keys are rejected so typos fail loudly:
+
+```toml
+[binaries]
+chrome = "/Applications/Helium.app/Contents/MacOS/Helium"
+ffmpeg = "/opt/homebrew/bin/ffmpeg"
+
+[connect]
+default = "helium"
+
+[connect.targets]
+helium = "127.0.0.1:9333"
+```
+
+Binary path precedence is environment first, then config, then the built-in
+fallback: Chrome uses `RDNY_CHROME` > `binaries.chrome` > well-known discovery;
+ffmpeg uses `RDNY_FFMPEG` > `binaries.ffmpeg` > `ffmpeg` from `PATH`. The
+`connect` section is parsed now for named targets; command wiring will arrive in
+a follow-up release.
+
+>>>>>>> conflict 1 of 1 ends
 ## Development
 
 ```sh

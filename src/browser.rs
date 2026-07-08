@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use crate::cdp::http;
+use crate::config;
 use crate::hint::hint_error;
 use crate::state::SessionState;
 
@@ -29,11 +30,21 @@ pub struct LaunchOpts {
     pub label: Option<String>,
 }
 
-/// Discover a browser binary: RDNY_CHROME env var, then well-known
-/// locations, else an actionable hint error.
+/// Discover a browser binary: RDNY_CHROME env var, config file, then
+/// well-known locations, else an actionable hint error.
 pub fn discover() -> Result<PathBuf> {
     let env_chrome = std::env::var_os("RDNY_CHROME");
-    discover_from(env_chrome.as_deref(), &well_known_candidates())
+    let config_path = config::config_path()?;
+    let config = config::load_from_path(config_path.clone())?;
+    discover_from(
+        env_chrome.as_deref(),
+        config
+            .binaries
+            .as_ref()
+            .and_then(|binaries| binaries.chrome.as_deref()),
+        Some(config_path.as_path()),
+        &well_known_candidates(),
+    )
 }
 
 /// Launch the browser with a remote debugging port and verify it is
@@ -191,7 +202,12 @@ pub fn status(state: &SessionState) -> Result<BrowserStatus> {
     }
 }
 
-fn discover_from(env_chrome: Option<&OsStr>, candidates: &[PathBuf]) -> Result<PathBuf> {
+fn discover_from(
+    env_chrome: Option<&OsStr>,
+    config_chrome: Option<&Path>,
+    config_path: Option<&Path>,
+    candidates: &[PathBuf],
+) -> Result<PathBuf> {
     if let Some(path) = env_chrome {
         let path = PathBuf::from(path);
         if path.is_file() {
@@ -206,6 +222,24 @@ fn discover_from(env_chrome: Option<&OsStr>, candidates: &[PathBuf]) -> Result<P
             Some("chromium-remote-debugging"),
         ));
     }
+    if let Some(path) = config_chrome {
+        if path.is_file() {
+            return Ok(path.to_path_buf());
+        }
+        let config_source = config_path
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "the rdny config file".to_string());
+        return Err(hint_error(
+            format!(
+                "binaries.chrome in {config_source} is set to {}, which does not exist",
+                path.display()
+            ),
+            format!(
+                "point binaries.chrome in {config_source} at a Chrome/Chromium binary, or set RDNY_CHROME"
+            ),
+            Some("chromium-remote-debugging"),
+        ));
+    }
     candidates
         .iter()
         .find(|p| p.is_file())
@@ -213,7 +247,7 @@ fn discover_from(env_chrome: Option<&OsStr>, candidates: &[PathBuf]) -> Result<P
         .ok_or_else(|| {
             hint_error(
                 "no Chrome or Chromium browser found",
-                "install Google Chrome or set RDNY_CHROME to a Chromium-based binary",
+                "install Google Chrome, set RDNY_CHROME, or set binaries.chrome in the rdny config file to a Chromium-based binary",
                 Some("chromium-remote-debugging"),
             )
         })
@@ -366,15 +400,73 @@ mod tests {
         fs::write(&env, "").unwrap();
         fs::write(&candidate, "").unwrap();
         assert_eq!(
-            discover_from(Some(env.as_os_str()), &[candidate]).unwrap(),
+            discover_from(Some(env.as_os_str()), None, None, &[candidate]).unwrap(),
             env
         );
     }
 
     #[test]
+    fn discover_config_beats_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config-chrome");
+        let candidate = dir.path().join("candidate");
+        fs::write(&config, "").unwrap();
+        fs::write(&candidate, "").unwrap();
+        assert_eq!(
+            discover_from(
+                None,
+                Some(&config),
+                Some(Path::new("/cfg.toml")),
+                &[candidate]
+            )
+            .unwrap(),
+            config
+        );
+    }
+
+    #[test]
     fn discover_env_missing_errors() {
-        let err = discover_from(Some(OsStr::new("/definitely/missing/chrome")), &[]).unwrap_err();
+        let err = discover_from(
+            Some(OsStr::new("/definitely/missing/chrome")),
+            None,
+            None,
+            &[],
+        )
+        .unwrap_err();
         assert!(format!("{err}").contains("RDNY_CHROME"));
+    }
+
+    #[test]
+    fn discover_env_beats_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = dir.path().join("env");
+        let config = dir.path().join("config");
+        fs::write(&env, "").unwrap();
+        fs::write(&config, "").unwrap();
+        assert_eq!(
+            discover_from(
+                Some(env.as_os_str()),
+                Some(&config),
+                Some(Path::new("/cfg.toml")),
+                &[]
+            )
+            .unwrap(),
+            env
+        );
+    }
+
+    #[test]
+    fn discover_config_missing_errors() {
+        let err = discover_from(
+            None,
+            Some(Path::new("/definitely/missing/config-chrome")),
+            Some(Path::new("/tmp/rdny-config.toml")),
+            &[],
+        )
+        .unwrap_err();
+        let text = format!("{err}");
+        assert!(text.contains("binaries.chrome"));
+        assert!(text.contains("/tmp/rdny-config.toml"));
     }
 
     #[test]
@@ -384,16 +476,17 @@ mod tests {
         let second = dir.path().join("second");
         fs::write(&second, "").unwrap();
         assert_eq!(
-            discover_from(None, &[missing, second.clone()]).unwrap(),
+            discover_from(None, None, None, &[missing, second.clone()]).unwrap(),
             second
         );
     }
 
     #[test]
     fn discover_empty_has_hint_and_docs() {
-        let err = discover_from(None, &[]).unwrap_err();
+        let err = discover_from(None, None, None, &[]).unwrap_err();
         let text = format!("{err}");
         assert!(text.contains("RDNY_CHROME"));
+        assert!(text.contains("binaries.chrome"));
         assert!(text.contains("hint:"));
         assert!(text.contains("docs:"));
     }
