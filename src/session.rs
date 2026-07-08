@@ -10,13 +10,12 @@ use serde_json::{Value, json};
 use crate::cdp::client::{CdpClient, Event};
 use crate::cdp::http;
 use crate::hint::hint_error;
-use crate::state::{self, SessionState};
+use crate::state;
 
 /// A live connection to the session's current page target.
 pub struct PageSession {
     client: CdpClient,
     session_id: String,
-    pub state: SessionState,
     /// Overall budget for waiting-style commands (from --timeout).
     pub timeout: Duration,
 }
@@ -62,7 +61,6 @@ pub fn connect(timeout_secs: f64) -> Result<PageSession> {
     Ok(PageSession {
         client,
         session_id,
-        state,
         timeout,
     })
 }
@@ -88,11 +86,6 @@ impl PageSession {
     /// Send a CDP command to the page session.
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value> {
         self.client.call(Some(&self.session_id), method, params)
-    }
-
-    /// Send a CDP command at the browser level.
-    pub fn browser_call(&mut self, method: &str, params: Value) -> Result<Value> {
-        self.client.call(None, method, params)
     }
 
     /// Pull the next buffered/incoming CDP event.

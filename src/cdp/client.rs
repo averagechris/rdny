@@ -18,6 +18,9 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Event {
     pub method: String,
     pub params: Value,
+    /// Session the event belongs to (flat protocol). Only read by tests
+    /// today, but inherent to the protocol and cheap to carry.
+    #[allow(dead_code)]
     pub session_id: Option<String>,
 }
 

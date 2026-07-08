@@ -159,8 +159,6 @@ pub struct TargetInfo {
     pub title: String,
     #[serde(default)]
     pub url: String,
-    #[serde(rename = "webSocketDebuggerUrl", default)]
-    pub ws_url: Option<String>,
 }
 
 /// List all targets; callers typically filter `target_type == "page"`.

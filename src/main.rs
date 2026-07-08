@@ -1,7 +1,3 @@
-// TODO(#76): remove once all command groups land and every module
-// entry point is wired into dispatch.
-#![allow(dead_code)]
-
 mod browser;
 mod cdp;
 mod cli;
