@@ -28,8 +28,8 @@ rdny screenshot https://example.com out.png
 ```
 
 Linux/Nix users can opt into a browser-containing closure with
-`.#rdny-bundled`, which wraps rdny with Nixpkgs `ungoogled-chromium` and sets
-`RDNY_CHROME` only as a default:
+`.#rdny-bundled`, which wraps rdny with Nixpkgs `ungoogled-chromium` and
+`ffmpeg-headless`, setting `RDNY_CHROME` and `RDNY_FFMPEG` only as defaults:
 
 ```sh
 nix run .#rdny-bundled -- --help
@@ -37,6 +37,20 @@ nix run .#rdny-bundled -- --help
 
 `rdny-bundled` is exposed on Linux systems only; Darwin builds use system
 Chrome/Chromium discovery or an explicit `RDNY_CHROME` path.
+
+The `stop-video` command shells out to ffmpeg. By default rdny resolves ffmpeg
+from configuration or `PATH`; set `RDNY_FFMPEG` to force a specific binary:
+
+```sh
+RDNY_FFMPEG=/opt/homebrew/bin/ffmpeg rdny stop-video video.mp4
+```
+
+All Nix systems can opt into an ffmpeg-containing closure without a bundled
+browser using `.#rdny-ffmpeg`:
+
+```sh
+nix run .#rdny-ffmpeg -- --help
+```
 
 ## Development
 

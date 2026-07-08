@@ -49,3 +49,16 @@ network downloads implicit.
   use `.#rdny-bundled`.
 - Darwin users need system Chrome/Chromium today, or an explicit
   `RDNY_CHROME` path.
+
+## Addendum: ffmpeg provisioning
+
+`stop-video` shells out to ffmpeg, but the default package should remain minimal
+and avoid bundling media tooling for commands that do not need it. Runtime
+ffmpeg lookup is explicit and predictable: `RDNY_FFMPEG` overrides all other
+sources, config can provide a binary path, and otherwise rdny falls back to
+`PATH` lookup.
+
+Nix users who want a managed ffmpeg binary can opt into `.#rdny-ffmpeg`, which
+wraps the default CLI and sets `RDNY_FFMPEG` to Nixpkgs `ffmpeg-headless` only as
+a default. The Linux-only `.#rdny-bundled` output now provisions both browser and
+ffmpeg defaults, while `.#rdny` remains browser- and ffmpeg-free.

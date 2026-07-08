@@ -99,17 +99,36 @@
         nativeBuildInputs = [pkgs.makeWrapper];
         postBuild = ''
           wrapProgram "$out/bin/rdny" \
-            --set-default RDNY_CHROME "${pkgs.ungoogled-chromium}/bin/chromium"
+            --set-default RDNY_CHROME "${pkgs.ungoogled-chromium}/bin/chromium" \
+            --set-default RDNY_FFMPEG "${pkgs.ffmpeg-headless}/bin/ffmpeg"
         '';
 
-        meta = app.meta // {
-          description = "${package.description} (with ungoogled-chromium)";
-        };
+        meta =
+          app.meta
+          // {
+            description = "${package.description} (with ungoogled-chromium and ffmpeg)";
+          };
+      };
+      ffmpeg = pkgs.symlinkJoin {
+        name = "rdny-ffmpeg-${package.version}";
+        paths = [app];
+        nativeBuildInputs = [pkgs.makeWrapper];
+        postBuild = ''
+          wrapProgram "$out/bin/rdny" \
+            --set-default RDNY_FFMPEG "${pkgs.ffmpeg-headless}/bin/ffmpeg"
+        '';
+
+        meta =
+          app.meta
+          // {
+            description = "${package.description} (with ffmpeg)";
+          };
       };
     in
       {
         default = app;
         rdny = app;
+        rdny-ffmpeg = ffmpeg;
         ci-audit = ciAudit system;
         ci-deny = ciDeny system;
         ci-machete = ciMachete system;
@@ -130,10 +149,26 @@
           type = "app";
           program = "${self.packages.${system}.rdny}/bin/rdny";
         };
-        ci-audit = {type = "app"; program = "${self.packages.${system}.ci-audit}/bin/ci-audit";};
-        ci-deny = {type = "app"; program = "${self.packages.${system}.ci-deny}/bin/ci-deny";};
-        ci-machete = {type = "app"; program = "${self.packages.${system}.ci-machete}/bin/ci-machete";};
-        ci-sort = {type = "app"; program = "${self.packages.${system}.ci-sort}/bin/ci-sort";};
+        rdny-ffmpeg = {
+          type = "app";
+          program = "${self.packages.${system}.rdny-ffmpeg}/bin/rdny";
+        };
+        ci-audit = {
+          type = "app";
+          program = "${self.packages.${system}.ci-audit}/bin/ci-audit";
+        };
+        ci-deny = {
+          type = "app";
+          program = "${self.packages.${system}.ci-deny}/bin/ci-deny";
+        };
+        ci-machete = {
+          type = "app";
+          program = "${self.packages.${system}.ci-machete}/bin/ci-machete";
+        };
+        ci-sort = {
+          type = "app";
+          program = "${self.packages.${system}.ci-sort}/bin/ci-sort";
+        };
         inherit ((fleetApps system).apps) prepare-release release-tag release ci-fmt ci-clippy static-checks ci-test;
       }
       // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
@@ -151,23 +186,25 @@
       pkgs = pkgsFor system;
     in {
       default = pkgs.mkShell {
-        packages = with pkgs; [
-          alejandra
-          cargo
-          cargo-audit
-          cargo-deny
-          cargo-machete
-          cargo-outdated
-          cargo-sort
-          clippy
-          direnv
-          jujutsu
-          nixd
-          rust-analyzer
-          rustc
-          rustfmt
-          sccache
-        ] ++ [srht.packages.${system}.srht];
+        packages = with pkgs;
+          [
+            alejandra
+            cargo
+            cargo-audit
+            cargo-deny
+            cargo-machete
+            cargo-outdated
+            cargo-sort
+            clippy
+            direnv
+            jujutsu
+            nixd
+            rust-analyzer
+            rustc
+            rustfmt
+            sccache
+          ]
+          ++ [srht.packages.${system}.srht];
       };
     });
 
