@@ -4,6 +4,9 @@
 
 ### Added
 
+- Named `rdny connect` targets plus global `--state-dir` for attaching to
+  personal browsers while keeping isolated agent sessions
+  (~averagechris/projects#112).
 - Optional config file for third-party binary paths and future named connect
   targets (~averagechris/projects#110).
 - `rdny start-video` / `rdny stop-video` records video via CDP screencast

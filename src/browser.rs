@@ -135,20 +135,27 @@ pub fn connect(host: &str, port: u16) -> Result<SessionState> {
     })
 }
 
+/// How a `stop` request was satisfied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// rdny launched this browser and shut it down.
+    Stopped,
+    /// The session was attached to a browser rdny did not launch;
+    /// the browser is left running and only rdny detaches.
+    Detached,
+}
+
 /// Stop the session's browser and report whether it was running.
-pub fn stop(state: &SessionState) -> Result<()> {
+/// Attached sessions (no pid) are never killed: the caller should
+/// clear the session state, leaving the browser running.
+pub fn stop(state: &SessionState) -> Result<StopOutcome> {
     let Some(pid) = state.pid else {
-        // TODO(#76): close attached sessions via CDP Browser.close
-        return Err(hint_error(
-            "this session is attached to a browser rdny did not launch",
-            "close that browser yourself, or run `rdny stop --force` once it exists",
-            None,
-        ));
+        return Ok(StopOutcome::Detached);
     };
     let pid = pid as libc::pid_t;
     reap_if_child(pid);
     if !pid_exists(pid) {
-        return Ok(());
+        return Ok(StopOutcome::Stopped);
     }
     unsafe {
         libc::kill(pid, libc::SIGTERM);
@@ -157,7 +164,7 @@ pub fn stop(state: &SessionState) -> Result<()> {
     while Instant::now() < deadline {
         reap_if_child(pid);
         if !pid_exists(pid) {
-            return Ok(());
+            return Ok(StopOutcome::Stopped);
         }
         thread::sleep(POLL_INTERVAL);
     }
@@ -172,7 +179,7 @@ pub fn stop(state: &SessionState) -> Result<()> {
         }
         thread::sleep(POLL_INTERVAL);
     }
-    Ok(())
+    Ok(StopOutcome::Stopped)
 }
 
 /// Reap the process if it is a zombie child of this process (e.g. when

@@ -77,11 +77,50 @@ helium = "127.0.0.1:9333"
 
 Binary path precedence is environment first, then config, then the built-in
 fallback: Chrome uses `RDNY_CHROME` > `binaries.chrome` > well-known discovery;
-ffmpeg uses `RDNY_FFMPEG` > `binaries.ffmpeg` > `ffmpeg` from `PATH`. The
-`connect` section is parsed now for named targets; command wiring will arrive in
-a follow-up release.
+ffmpeg uses `RDNY_FFMPEG` > `binaries.ffmpeg` > `ffmpeg` from `PATH`.
 
->>>>>>> conflict 1 of 1 ends
+## Driving your own browser
+
+`rdny connect` can attach to a browser you launched yourself, as long as that
+browser was started with Chrome DevTools Protocol remote debugging enabled. CDP
+can only be enabled at browser launch time. On macOS, for example:
+
+```sh
+open -na Helium --args --remote-debugging-port=9333
+open -na "Google Chrome" --args --remote-debugging-port=9333
+```
+
+Chromium 136+ silently ignores `--remote-debugging-port` when using the default
+user data directory, so some browser builds require a separate profile directory:
+
+```sh
+open -na Helium --args --remote-debugging-port=9333 --user-data-dir=/tmp/rdny-helium
+```
+
+Name personal browser targets in the rdny config file:
+
+```toml
+[connect]
+default = "helium"
+
+[connect.targets]
+helium = "127.0.0.1:9333"
+```
+
+Then use `rdny connect helium`, or just `rdny connect` when `default` is set.
+The default rdny state directory can continue to hold an isolated managed
+browser, while a separate state directory tracks your personal browser:
+
+```sh
+rdny start --label agent
+rdny --state-dir ~/.local/state/rdny-personal connect helium
+rdny list
+```
+
+Both sessions coexist because state is separated. Attached sessions record no
+browser pid, so `rdny stop` and `rdny cleanup` never kill your personal browser;
+they only detach rdny from it or clear rdny state.
+
 ## Development
 
 ```sh

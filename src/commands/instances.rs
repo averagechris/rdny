@@ -7,7 +7,42 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::browser;
+use crate::cdp::http;
 use crate::state::{self, SessionState};
+
+/// How an instance relates to a running browser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    /// rdny launched the browser and its pid is alive.
+    Alive,
+    /// No pid (attach session) but the debug port answers.
+    Attached,
+    /// Neither a live pid nor a reachable debug port.
+    Dead,
+}
+
+/// Classify an instance given injectable probes, so tests need
+/// neither real pids nor sockets.
+pub fn classify(
+    state: &SessionState,
+    pid_alive: impl Fn(u32) -> bool,
+    port_reachable: impl Fn(&str, u16) -> bool,
+) -> Liveness {
+    match state.pid {
+        Some(pid) if pid_alive(pid) => Liveness::Alive,
+        Some(_) => Liveness::Dead,
+        None if port_reachable(&state.host, state.port) => Liveness::Attached,
+        None => Liveness::Dead,
+    }
+}
+
+fn probe_liveness(state: &SessionState) -> Liveness {
+    classify(
+        state,
+        |pid| browser::pid_exists(pid as libc::pid_t),
+        |host, port| http::version(host, port).is_ok(),
+    )
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Instance {
@@ -19,22 +54,19 @@ pub struct Instance {
 pub struct InstanceLine {
     pub dir: PathBuf,
     pub pid: Option<u32>,
-    pub alive: bool,
+    pub liveness: Liveness,
     pub label: Option<String>,
 }
 
 pub fn list() -> Result<()> {
     for instance in discover()? {
-        let alive = instance
-            .state
-            .pid
-            .is_some_and(|pid| browser::pid_exists(pid as libc::pid_t));
+        let liveness = probe_liveness(&instance.state);
         println!(
             "{}",
             format_line(&InstanceLine {
                 dir: instance.dir,
                 pid: instance.state.pid,
-                alive,
+                liveness,
                 label: instance.state.label,
             })
         );
@@ -43,9 +75,7 @@ pub fn list() -> Result<()> {
 }
 
 pub fn cleanup(all: bool) -> Result<()> {
-    let cleaned = cleanup_instances(discover()?, all, |pid| {
-        browser::pid_exists(pid as libc::pid_t)
-    })?;
+    let cleaned = cleanup_instances(discover()?, all, probe_liveness)?;
     for instance in cleaned {
         println!(
             "cleaned: {} (pid={} label={})",
@@ -108,7 +138,11 @@ pub fn format_line(line: &InstanceLine) -> String {
         "{}  pid={}  {}  label={}",
         line.dir.display(),
         display_pid(line.pid),
-        if line.alive { "alive" } else { "dead" },
+        match line.liveness {
+            Liveness::Alive => "alive",
+            Liveness::Attached => "attached",
+            Liveness::Dead => "dead",
+        },
         display_label(line.label.as_deref())
     )
 }
@@ -125,18 +159,20 @@ fn display_label(label: Option<&str>) -> String {
 pub fn cleanup_instances(
     instances: Vec<Instance>,
     all: bool,
-    is_alive: impl Fn(u32) -> bool,
+    liveness: impl Fn(&SessionState) -> Liveness,
 ) -> Result<Vec<Instance>> {
     let mut cleaned = Vec::new();
     for instance in instances {
-        let alive = instance.state.pid.is_some_and(&is_alive);
-        if alive && !all {
+        let liveness = liveness(&instance.state);
+        if liveness != Liveness::Dead && !all {
             continue;
         }
-        if alive {
+        if liveness == Liveness::Alive {
             browser::stop(&instance.state)
                 .with_context(|| format!("stopping instance in {}", instance.dir.display()))?;
         }
+        // Attached sessions are only detached: removing state.json
+        // never touches the externally-owned browser.
         let path = instance.dir.join("state.json");
         match fs::remove_file(&path) {
             Ok(()) => cleaned.push(instance),
@@ -187,12 +223,32 @@ mod tests {
     }
 
     #[test]
+    fn classifies_liveness() {
+        assert_eq!(
+            classify(&state(Some(1), None), |_| true, |_, _| false),
+            Liveness::Alive
+        );
+        assert_eq!(
+            classify(&state(Some(1), None), |_| false, |_, _| true),
+            Liveness::Dead
+        );
+        assert_eq!(
+            classify(&state(None, None), |_| true, |_, _| true),
+            Liveness::Attached
+        );
+        assert_eq!(
+            classify(&state(None, None), |_| true, |_, _| false),
+            Liveness::Dead
+        );
+    }
+
+    #[test]
     fn formats_list_lines() {
         assert_eq!(
             format_line(&InstanceLine {
                 dir: "/tmp/rdny-a".into(),
                 pid: Some(7),
-                alive: true,
+                liveness: Liveness::Alive,
                 label: Some("x".into())
             }),
             "/tmp/rdny-a  pid=7  alive  label=x"
@@ -201,22 +257,34 @@ mod tests {
             format_line(&InstanceLine {
                 dir: "/tmp/rdny-b".into(),
                 pid: None,
-                alive: false,
+                liveness: Liveness::Dead,
                 label: None
             }),
             "/tmp/rdny-b  pid=-  dead  label=-"
         );
+        assert_eq!(
+            format_line(&InstanceLine {
+                dir: "/tmp/rdny-c".into(),
+                pid: None,
+                liveness: Liveness::Attached,
+                label: Some("me".into())
+            }),
+            "/tmp/rdny-c  pid=-  attached  label=me"
+        );
     }
 
     #[test]
-    fn cleanup_removes_dead_but_leaves_live_without_all() {
+    fn cleanup_removes_dead_but_leaves_live_and_attached_without_all() {
         let temp = tempfile::tempdir().unwrap();
         let dead = temp.path().join("dead");
         let live = temp.path().join("live");
+        let attached = temp.path().join("attached");
         fs::create_dir_all(&dead).unwrap();
         fs::create_dir_all(&live).unwrap();
+        fs::create_dir_all(&attached).unwrap();
         fs::write(dead.join("state.json"), "{}").unwrap();
         fs::write(live.join("state.json"), "{}").unwrap();
+        fs::write(attached.join("state.json"), "{}").unwrap();
         let cleaned = cleanup_instances(
             vec![
                 Instance {
@@ -227,13 +295,18 @@ mod tests {
                     dir: live.clone(),
                     state: state(Some(2), None),
                 },
+                Instance {
+                    dir: attached.clone(),
+                    state: state(None, None),
+                },
             ],
             false,
-            |pid| pid == 2,
+            |st| classify(st, |pid| pid == 2, |_, _| true),
         )
         .unwrap();
         assert_eq!(cleaned.len(), 1);
         assert!(!dead.join("state.json").exists());
         assert!(live.join("state.json").exists());
+        assert!(attached.join("state.json").exists());
     }
 }

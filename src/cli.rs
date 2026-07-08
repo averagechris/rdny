@@ -6,7 +6,7 @@ use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 
 use crate::browser::{self, BrowserStatus, LaunchOpts};
-use crate::{commands, session};
+use crate::{commands, config, session};
 
 /// Chrome automation from the command line.
 #[derive(Debug, Parser)]
@@ -20,6 +20,10 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = 30.0)]
     pub timeout: f64,
 
+    /// State directory to use, equivalent to RDNY_STATE_DIR and taking precedence over it.
+    #[arg(long, global = true)]
+    pub state_dir: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -29,7 +33,7 @@ pub enum Command {
     /// Start a new browser session.
     Start(StartArgs),
     /// Connect to an existing browser debugger endpoint.
-    Connect { address: String },
+    Connect { address: Option<String> },
     /// Stop the current browser session.
     Stop,
     /// Show current browser session status.
@@ -263,6 +267,11 @@ pub struct ScreenshotArgs {
 /// Parse argv and execute the selected command.
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(state_dir) = &cli.state_dir {
+        // SAFETY: rdny is still single-threaded here, before any command dispatch or
+        // background work, so mutating the process environment cannot race other threads.
+        unsafe { std::env::set_var("RDNY_STATE_DIR", state_dir) };
+    }
     let recording_active = crate::state::load()?.is_some_and(|state| state.recording);
     let drain_after_dispatch =
         recording_active && !matches!(cli.command, Command::StopVideo { .. });
@@ -313,16 +322,20 @@ pub fn run() -> Result<()> {
             println!("started {browser} pid {pid} on port {}", state.port);
         }
         Command::Connect { address } => {
-            let (host, port) = parse_address(&address)?;
+            let config = config::load()?;
+            let (host, port) = resolve_connect_target(address.as_deref(), &config)?;
             let state = browser::connect(&host, port)?;
             crate::state::save(&state)?;
             println!("connected to {host}:{port}");
         }
         Command::Stop => {
             let state = crate::state::require()?;
-            browser::stop(&state)?;
+            let outcome = browser::stop(&state)?;
             crate::state::clear()?;
-            println!("stopped");
+            match outcome {
+                browser::StopOutcome::Stopped => println!("stopped"),
+                browser::StopOutcome::Detached => println!("detached (browser left running)"),
+            }
         }
         Command::Status => match crate::state::load()? {
             None => println!("no session"),
@@ -467,6 +480,62 @@ pub fn parse_address(address: &str) -> Result<(String, u16)> {
     Ok((host.to_string(), port))
 }
 
+pub fn resolve_connect_target(arg: Option<&str>, config: &config::Config) -> Result<(String, u16)> {
+    let Some(target) = arg else {
+        let default = config
+            .connect
+            .as_ref()
+            .and_then(|connect| connect.default.as_deref())
+            .ok_or_else(|| {
+                crate::hint::hint_error(
+                    "missing connect target",
+                    "pass `<host>:<port>` or configure [connect] default in the rdny config file",
+                    None,
+                )
+            })?;
+        return resolve_named_connect_target(default, config, true);
+    };
+
+    if target.contains(':') {
+        parse_address(target)
+    } else {
+        resolve_named_connect_target(target, config, false)
+    }
+}
+
+fn resolve_named_connect_target(
+    name: &str,
+    config: &config::Config,
+    from_default: bool,
+) -> Result<(String, u16)> {
+    if let Some(address) = config
+        .connect
+        .as_ref()
+        .and_then(|connect| connect.targets.as_ref())
+        .and_then(|targets| targets.get(name))
+    {
+        return parse_address(address);
+    }
+
+    let known = config
+        .connect
+        .as_ref()
+        .and_then(|connect| connect.targets.as_ref())
+        .map(|targets| targets.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let hint = if known.is_empty() {
+        "pass `<host>:<port>` or add [connect.targets] entries to the rdny config file".to_string()
+    } else {
+        format!("known connect targets: {}", known.join(", "))
+    };
+    let message = if from_default {
+        format!("default connect target `{name}` is not configured")
+    } else {
+        format!("unknown connect target `{name}`")
+    };
+    Err(crate::hint::hint_error(message, hint, None))
+}
+
 fn resolve_js_expression(
     expression: Option<String>,
     reader: impl Read,
@@ -491,9 +560,14 @@ fn read_js_expression_from_stdin(reader: impl Read) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn parse(args: &[&str]) -> Command {
         Cli::try_parse_from(args).unwrap().command
+    }
+
+    fn parse_cli(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).unwrap()
     }
 
     #[test]
@@ -548,8 +622,15 @@ mod tests {
 
     #[test]
     fn parses_required_commands() {
+        assert!(matches!(
+            parse(&["rdny", "connect"]),
+            Command::Connect { address: None }
+        ));
         assert!(
-            matches!(parse(&["rdny", "connect", "127.0.0.1:9222"]), Command::Connect { address } if address == "127.0.0.1:9222")
+            matches!(parse(&["rdny", "connect", "helium"]), Command::Connect { address: Some(address) } if address == "helium")
+        );
+        assert!(
+            matches!(parse(&["rdny", "connect", "127.0.0.1:9222"]), Command::Connect { address: Some(address) } if address == "127.0.0.1:9222")
         );
         assert!(
             matches!(parse(&["rdny", "sleep", "1.5"]), Command::Sleep { seconds } if seconds == 1.5)
@@ -763,6 +844,76 @@ mod tests {
         );
         assert!(parse_address("9222").is_err());
         assert!(parse_address("foo:bar").is_err());
+    }
+
+    #[test]
+    fn parses_global_state_dir() {
+        let cli = parse_cli(&["rdny", "--state-dir", "/tmp/x", "connect", "foo"]);
+        assert_eq!(cli.state_dir, Some(PathBuf::from("/tmp/x")));
+        assert!(
+            matches!(cli.command, Command::Connect { address: Some(address) } if address == "foo")
+        );
+    }
+
+    fn connect_config(default: Option<&str>, targets: &[(&str, &str)]) -> config::Config {
+        config::Config {
+            binaries: None,
+            connect: Some(config::Connect {
+                default: default.map(str::to_string),
+                targets: Some(
+                    targets
+                        .iter()
+                        .map(|(name, address)| (name.to_string(), address.to_string()))
+                        .collect::<BTreeMap<_, _>>(),
+                ),
+            }),
+        }
+    }
+
+    #[test]
+    fn resolves_connect_target_explicit_address() {
+        assert_eq!(
+            resolve_connect_target(Some("127.0.0.1:9333"), &config::Config::default()).unwrap(),
+            ("127.0.0.1".to_string(), 9333)
+        );
+    }
+
+    #[test]
+    fn resolves_connect_target_named_hit() {
+        let config = connect_config(None, &[("helium", "127.0.0.1:9333")]);
+        assert_eq!(
+            resolve_connect_target(Some("helium"), &config).unwrap(),
+            ("127.0.0.1".to_string(), 9333)
+        );
+    }
+
+    #[test]
+    fn resolves_connect_target_named_miss_lists_known_names() {
+        let config = connect_config(None, &[("helium", "127.0.0.1:9333")]);
+        let err = resolve_connect_target(Some("chrome"), &config).unwrap_err();
+        assert!(format!("{err}").contains("helium"));
+    }
+
+    #[test]
+    fn resolves_connect_target_default() {
+        let config = connect_config(Some("helium"), &[("helium", "127.0.0.1:9333")]);
+        assert_eq!(
+            resolve_connect_target(None, &config).unwrap(),
+            ("127.0.0.1".to_string(), 9333)
+        );
+    }
+
+    #[test]
+    fn rejects_connect_target_without_default() {
+        let err = resolve_connect_target(None, &config::Config::default()).unwrap_err();
+        assert!(format!("{err}").contains("default"));
+    }
+
+    #[test]
+    fn rejects_connect_default_pointing_at_missing_target() {
+        let config = connect_config(Some("helium"), &[]);
+        let err = resolve_connect_target(None, &config).unwrap_err();
+        assert!(format!("{err}").contains("default connect target `helium`"));
     }
 
     #[test]
