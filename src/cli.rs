@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use crate::browser::{self, BrowserStatus, LaunchOpts};
+use crate::{commands, session};
 
 /// Chrome automation from the command line.
 #[derive(Debug, Parser)]
@@ -204,37 +205,80 @@ pub fn run() -> Result<()> {
                 }
             },
         },
-        Command::Open { .. } => anyhow::bail!("open: not implemented yet"),
-        Command::Back => anyhow::bail!("back: not implemented yet"),
-        Command::Forward => anyhow::bail!("forward: not implemented yet"),
-        Command::Reload(_) => anyhow::bail!("reload: not implemented yet"),
-        Command::ClearCache => anyhow::bail!("clear-cache: not implemented yet"),
-        Command::Url => anyhow::bail!("url: not implemented yet"),
-        Command::Title => anyhow::bail!("title: not implemented yet"),
-        Command::Html { .. } => anyhow::bail!("html: not implemented yet"),
-        Command::Text { .. } => anyhow::bail!("text: not implemented yet"),
-        Command::Attr { .. } => anyhow::bail!("attr: not implemented yet"),
-        Command::Pdf { .. } => anyhow::bail!("pdf: not implemented yet"),
-        Command::Js { .. } => anyhow::bail!("js: not implemented yet"),
-        Command::Click { .. } => anyhow::bail!("click: not implemented yet"),
-        Command::Input { .. } => anyhow::bail!("input: not implemented yet"),
-        Command::Clear { .. } => anyhow::bail!("clear: not implemented yet"),
-        Command::File { .. } => anyhow::bail!("file: not implemented yet"),
-        Command::Download { .. } => anyhow::bail!("download: not implemented yet"),
-        Command::Select { .. } => anyhow::bail!("select: not implemented yet"),
-        Command::Submit { .. } => anyhow::bail!("submit: not implemented yet"),
-        Command::Hover { .. } => anyhow::bail!("hover: not implemented yet"),
-        Command::Focus { .. } => anyhow::bail!("focus: not implemented yet"),
-        Command::Wait { .. } => anyhow::bail!("wait: not implemented yet"),
-        Command::Waitload => anyhow::bail!("waitload: not implemented yet"),
-        Command::Waitstable => anyhow::bail!("waitstable: not implemented yet"),
-        Command::Waitidle => anyhow::bail!("waitidle: not implemented yet"),
-        Command::Sleep { .. } => anyhow::bail!("sleep: not implemented yet"),
-        Command::Screenshot(_) => anyhow::bail!("screenshot: not implemented yet"),
-        Command::ScreenshotEl { .. } => anyhow::bail!("screenshot-el: not implemented yet"),
-        Command::Pages => anyhow::bail!("pages: not implemented yet"),
-        Command::Page { .. } => anyhow::bail!("page: not implemented yet"),
-        Command::Newpage { .. } => anyhow::bail!("newpage: not implemented yet"),
+        Command::Open { url } => commands::nav::open(&mut session::connect(cli.timeout)?, &url)?,
+        Command::Back => commands::nav::back(&mut session::connect(cli.timeout)?)?,
+        Command::Forward => commands::nav::forward(&mut session::connect(cli.timeout)?)?,
+        Command::Reload(args) => {
+            commands::nav::reload(&mut session::connect(cli.timeout)?, args.hard)?
+        }
+        Command::ClearCache => commands::nav::clear_cache(&mut session::connect(cli.timeout)?)?,
+        Command::Url => commands::pageinfo::url(&mut session::connect(cli.timeout)?)?,
+        Command::Title => commands::pageinfo::title(&mut session::connect(cli.timeout)?)?,
+        Command::Html { selector } => {
+            commands::pageinfo::html(&mut session::connect(cli.timeout)?, selector.as_deref())?
+        }
+        Command::Text { selector } => {
+            commands::pageinfo::text(&mut session::connect(cli.timeout)?, &selector)?
+        }
+        Command::Attr { selector, name } => {
+            commands::pageinfo::attr(&mut session::connect(cli.timeout)?, &selector, &name)?
+        }
+        Command::Pdf { file } => {
+            commands::pageinfo::pdf(&mut session::connect(cli.timeout)?, file.as_deref())?
+        }
+        Command::Js { expression } => {
+            commands::interact::js(&mut session::connect(cli.timeout)?, &expression)?
+        }
+        Command::Click { selector } => {
+            commands::interact::click(&mut session::connect(cli.timeout)?, &selector)?
+        }
+        Command::Input { selector, text } => {
+            commands::interact::input(&mut session::connect(cli.timeout)?, &selector, &text)?
+        }
+        Command::Clear { selector } => {
+            commands::interact::clear(&mut session::connect(cli.timeout)?, &selector)?
+        }
+        Command::File { selector, path } => {
+            commands::interact::file(&mut session::connect(cli.timeout)?, &selector, &path)?
+        }
+        Command::Download { selector, file } => commands::interact::download(
+            &mut session::connect(cli.timeout)?,
+            &selector,
+            file.as_deref(),
+        )?,
+        Command::Select { selector, value } => {
+            commands::interact::select(&mut session::connect(cli.timeout)?, &selector, &value)?
+        }
+        Command::Submit { selector } => {
+            commands::interact::submit(&mut session::connect(cli.timeout)?, &selector)?
+        }
+        Command::Hover { selector } => {
+            commands::interact::hover(&mut session::connect(cli.timeout)?, &selector)?
+        }
+        Command::Focus { selector } => {
+            commands::interact::focus(&mut session::connect(cli.timeout)?, &selector)?
+        }
+        Command::Wait { selector } => {
+            commands::wait::wait(&mut session::connect(cli.timeout)?, &selector)?
+        }
+        Command::Waitload => commands::wait::waitload(&mut session::connect(cli.timeout)?)?,
+        Command::Waitstable => commands::wait::waitstable(&mut session::connect(cli.timeout)?)?,
+        Command::Waitidle => commands::wait::waitidle(&mut session::connect(cli.timeout)?)?,
+        Command::Sleep { seconds } => commands::wait::sleep(seconds)?,
+        Command::Screenshot(args) => commands::shot::screenshot(
+            &mut session::connect(cli.timeout)?,
+            args.width,
+            args.height,
+            args.file.as_deref(),
+        )?,
+        Command::ScreenshotEl { selector, file } => commands::shot::screenshot_el(
+            &mut session::connect(cli.timeout)?,
+            &selector,
+            file.as_deref(),
+        )?,
+        Command::Pages => commands::tabs::pages()?,
+        Command::Page { index } => commands::tabs::page(index)?,
+        Command::Newpage { url } => commands::tabs::newpage(url.as_deref())?,
     }
     Ok(())
 }

@@ -5,7 +5,9 @@
 mod browser;
 mod cdp;
 mod cli;
+mod commands;
 mod hint;
+mod session;
 mod state;
 
 use std::process::ExitCode;
