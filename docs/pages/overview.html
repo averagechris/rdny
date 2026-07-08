@@ -23,5 +23,9 @@
       <li>See command shapes in <a href="examples.html">examples</a>.</li>
     </ul>
 
+    <h2>Browser provisioning</h2>
+    <p>The default rdny package does not bundle Chrome. At runtime rdny uses <code>RDNY_CHROME</code> when set, then checks well-known macOS and Linux Chrome/Chromium locations, then reports a clear error explaining how to provide a browser path. Use <code>RDNY_CHROME_ARGS</code> to append launch flags.</p>
+    <p>Linux/Nix users can opt into a browser-containing closure with <code>nix run .#rdny-bundled</code>. That package wraps rdny with Nixpkgs <code>ungoogled-chromium</code> and sets <code>RDNY_CHROME</code> only as a default. The bundled output is Linux-only; Darwin relies on system Chrome/Chromium discovery or an explicit <code>RDNY_CHROME</code>.</p>
+
 </body>
 </html>

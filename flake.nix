@@ -93,28 +93,55 @@
           mainProgram = "rdny";
         };
       };
-    in {
-      default = app;
-      rdny = app;
-      ci-audit = ciAudit system;
-      ci-deny = ciDeny system;
-      ci-machete = ciMachete system;
-      ci-sort = ciSort system;
-      release-artifact = (fleetApps system).releaseArtifact system;
-    });
+      bundled = pkgs.symlinkJoin {
+        name = "rdny-bundled-${package.version}";
+        paths = [app];
+        nativeBuildInputs = [pkgs.makeWrapper];
+        postBuild = ''
+          wrapProgram "$out/bin/rdny" \
+            --set-default RDNY_CHROME "${pkgs.ungoogled-chromium}/bin/chromium"
+        '';
 
-    apps = forAllSystems (system: {
-      default = self.apps.${system}.rdny;
-      rdny = {
-        type = "app";
-        program = "${self.packages.${system}.rdny}/bin/rdny";
+        meta = app.meta // {
+          description = "${package.description} (with ungoogled-chromium)";
+        };
       };
-      ci-audit = {type = "app"; program = "${self.packages.${system}.ci-audit}/bin/ci-audit";};
-      ci-deny = {type = "app"; program = "${self.packages.${system}.ci-deny}/bin/ci-deny";};
-      ci-machete = {type = "app"; program = "${self.packages.${system}.ci-machete}/bin/ci-machete";};
-      ci-sort = {type = "app"; program = "${self.packages.${system}.ci-sort}/bin/ci-sort";};
-      inherit ((fleetApps system).apps) prepare-release release-tag release ci-fmt ci-clippy static-checks ci-test;
-    });
+    in
+      {
+        default = app;
+        rdny = app;
+        ci-audit = ciAudit system;
+        ci-deny = ciDeny system;
+        ci-machete = ciMachete system;
+        ci-sort = ciSort system;
+        release-artifact = (fleetApps system).releaseArtifact system;
+      }
+      // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+        rdny-bundled = bundled;
+      });
+
+    apps = forAllSystems (system: let
+      pkgs = pkgsFor system;
+      lib = pkgs.lib;
+    in
+      {
+        default = self.apps.${system}.rdny;
+        rdny = {
+          type = "app";
+          program = "${self.packages.${system}.rdny}/bin/rdny";
+        };
+        ci-audit = {type = "app"; program = "${self.packages.${system}.ci-audit}/bin/ci-audit";};
+        ci-deny = {type = "app"; program = "${self.packages.${system}.ci-deny}/bin/ci-deny";};
+        ci-machete = {type = "app"; program = "${self.packages.${system}.ci-machete}/bin/ci-machete";};
+        ci-sort = {type = "app"; program = "${self.packages.${system}.ci-sort}/bin/ci-sort";};
+        inherit ((fleetApps system).apps) prepare-release release-tag release ci-fmt ci-clippy static-checks ci-test;
+      }
+      // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+        rdny-bundled = {
+          type = "app";
+          program = "${self.packages.${system}.rdny-bundled}/bin/rdny";
+        };
+      });
 
     checks = forAllSystems (system: {
       inherit (self.packages.${system}) rdny release-artifact;
