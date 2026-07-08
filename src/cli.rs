@@ -429,7 +429,12 @@ pub fn run() -> Result<()> {
         Command::Page { index } => commands::tabs::page(index)?,
         Command::Newpage { url } => commands::tabs::newpage(url.as_deref())?,
         Command::StartVideo => commands::video::start()?,
-        Command::StopVideo { file } => commands::video::stop(sess!(), file.as_deref())?,
+        Command::StopVideo { file } => {
+            // Assemble even when the browser is gone: frames on disk
+            // should never be stranded behind a dead session.
+            let mut live = session::connect(cli.timeout).ok();
+            commands::video::stop(live.as_mut(), file.as_deref())?
+        }
     }
     if drain_after_dispatch && let Some(session) = page_session.as_mut() {
         session.drain_events(std::time::Duration::from_millis(300))?;

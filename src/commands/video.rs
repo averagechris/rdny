@@ -22,9 +22,11 @@ pub fn start() -> Result<()> {
     state::save(&state)
 }
 
-pub fn stop(session: &mut PageSession, output: Option<&Path>) -> Result<()> {
-    let _ = session.call("Page.stopScreencast", serde_json::json!({}));
-    session.drain_events(std::time::Duration::from_millis(300))?;
+pub fn stop(session: Option<&mut PageSession>, output: Option<&Path>) -> Result<()> {
+    if let Some(session) = session {
+        let _ = session.call("Page.stopScreencast", serde_json::json!({}));
+        session.drain_events(std::time::Duration::from_millis(300))?;
+    }
 
     let frames_dir = state::frames_dir()?;
     let frames = read_frames(&frames_dir)?;
@@ -42,6 +44,7 @@ pub fn stop(session: &mut PageSession, output: Option<&Path>) -> Result<()> {
     fs::write(&list_path, list).context("writing ffmpeg concat list")?;
 
     let status = Command::new("ffmpeg")
+        .args([OsStr::new("-loglevel"), OsStr::new("error")])
         .args([OsStr::new("-y"), OsStr::new("-f"), OsStr::new("concat")])
         .args([OsStr::new("-safe"), OsStr::new("0"), OsStr::new("-i")])
         .arg(&list_path)
@@ -56,9 +59,10 @@ pub fn stop(session: &mut PageSession, output: Option<&Path>) -> Result<()> {
     match status {
         Ok(status) if status.success() => {
             fs::remove_dir_all(&frames_dir).context("removing video frames directory")?;
-            let mut state = state::require()?;
-            state.recording = false;
-            state::save(&state)?;
+            if let Some(mut state) = state::load()? {
+                state.recording = false;
+                state::save(&state)?;
+            }
             println!("{}", output.display());
             Ok(())
         }
