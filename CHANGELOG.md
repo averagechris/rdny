@@ -4,6 +4,16 @@
 
 ### Added
 
+- `rdny logs` captures console messages, thrown exceptions, and browser
+  log entries; `--follow` streams until interrupted, otherwise events
+  drain for the global `--timeout` window (~averagechris/projects#95).
+- `rdny js -` (or `rdny js` with piped stdin) reads the JavaScript
+  expression from stdin, so multi-line programs pipe cleanly
+  (~averagechris/projects#94).
+- Optional Linux-only `.#rdny-bundled` flake output wrapping rdny with
+  ungoogled-chromium via a default `RDNY_CHROME`; browser provisioning
+  decision recorded in `docs/decisions/0002-browser-provisioning.md`
+  (~averagechris/projects#77).
 - Core rodney command parity over CDP (~averagechris/projects#76):
   - lifecycle: `start` (headless by default, `--show`, `--insecure`/`-k`),
     `connect <host:port>`, `stop`, `status`, with session state persisted
