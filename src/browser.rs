@@ -25,6 +25,8 @@ pub struct LaunchOpts {
     pub insecure: bool,
     /// Extra Chrome args (from RDNY_CHROME_ARGS), already split.
     pub extra_args: Vec<String>,
+    /// Human-readable label to persist for this instance.
+    pub label: Option<String>,
 }
 
 /// Discover a browser binary: RDNY_CHROME env var, then well-known
@@ -93,6 +95,7 @@ pub fn launch(opts: &LaunchOpts, data_root: &Path) -> Result<SessionState> {
         user_data_dir: Some(profile_dir),
         browser_path: Some(binary),
         target_id,
+        label: opts.label.clone(),
         viewport: None,
     })
 }
@@ -114,6 +117,7 @@ pub fn connect(host: &str, port: u16) -> Result<SessionState> {
         user_data_dir: None,
         browser_path: None,
         target_id: first_page_target(host, port),
+        label: None,
         viewport: None,
     })
 }
@@ -337,7 +341,7 @@ fn first_page_target(host: &str, port: u16) -> Option<String> {
     })
 }
 
-fn pid_exists(pid: libc::pid_t) -> bool {
+pub fn pid_exists(pid: libc::pid_t) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
@@ -405,6 +409,7 @@ mod tests {
             show: true,
             insecure: true,
             extra_args: Vec::new(),
+            label: None,
         };
         let args = build_args(&opts, Path::new("/tmp/profile"), &[], false);
         assert!(!args.contains(&"--headless=new".to_string()));

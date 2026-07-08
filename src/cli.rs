@@ -34,6 +34,10 @@ pub enum Command {
     Stop,
     /// Show current browser session status.
     Status,
+    /// List discovered rdny instances.
+    List,
+    /// Clean up stale instance state files.
+    Cleanup(CleanupArgs),
     /// Open a URL in the current page.
     Open { url: String },
     /// Go back in page history.
@@ -121,6 +125,16 @@ pub struct StartArgs {
     /// Ignore TLS certificate errors.
     #[arg(short = 'k', long)]
     pub insecure: bool,
+    /// Human-readable label for this instance.
+    #[arg(long)]
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+pub struct CleanupArgs {
+    /// Stop live instances before removing their state files.
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -267,6 +281,7 @@ pub fn run() -> Result<()> {
                 show: args.show,
                 insecure: args.insecure,
                 extra_args: vec![],
+                label: args.label,
             };
             let state = browser::launch(&opts, &crate::state::state_dir()?)?;
             crate::state::save(&state)?;
@@ -301,8 +316,13 @@ pub fn run() -> Result<()> {
                         .pid
                         .map(|pid| pid.to_string())
                         .unwrap_or_else(|| "attached".to_string());
+                    let label = state
+                        .label
+                        .as_deref()
+                        .map(|label| format!(" label={label}"))
+                        .unwrap_or_default();
                     println!(
-                        "running: {browser} on {}:{} (pid {pid})",
+                        "running: {browser} on {}:{} (pid {pid}){label}",
                         state.host, state.port
                     );
                 }
@@ -311,6 +331,8 @@ pub fn run() -> Result<()> {
                 }
             },
         },
+        Command::List => commands::instances::list()?,
+        Command::Cleanup(args) => commands::instances::cleanup(args.all)?,
         Command::Open { url } => commands::nav::open(&mut session::connect(cli.timeout)?, &url)?,
         Command::Back => commands::nav::back(&mut session::connect(cli.timeout)?)?,
         Command::Forward => commands::nav::forward(&mut session::connect(cli.timeout)?)?,
@@ -491,24 +513,48 @@ mod tests {
             parse(&["rdny", "start", "--show"]),
             Command::Start(StartArgs {
                 show: true,
-                insecure: false
+                insecure: false,
+                label: None
             })
         ));
         assert!(matches!(
             parse(&["rdny", "start", "-k"]),
             Command::Start(StartArgs {
                 show: false,
-                insecure: true
+                insecure: true,
+                label: None
             })
         ));
         assert!(matches!(
             parse(&["rdny", "start", "--show", "--insecure"]),
             Command::Start(StartArgs {
                 show: true,
-                insecure: true
+                insecure: true,
+                label: None
             })
         ));
+        assert!(matches!(
+            parse(&["rdny", "start", "--label", "work"]),
+            Command::Start(StartArgs {
+                show: false,
+                insecure: false,
+                label: Some(label)
+            }) if label == "work"
+        ));
         assert!(Cli::try_parse_from(["rdny", "start", "--bogus"]).is_err());
+    }
+
+    #[test]
+    fn parses_instance_commands() {
+        assert!(matches!(parse(&["rdny", "list"]), Command::List));
+        assert!(matches!(
+            parse(&["rdny", "cleanup"]),
+            Command::Cleanup(CleanupArgs { all: false })
+        ));
+        assert!(matches!(
+            parse(&["rdny", "cleanup", "--all"]),
+            Command::Cleanup(CleanupArgs { all: true })
+        ));
     }
 
     #[test]

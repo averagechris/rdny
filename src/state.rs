@@ -51,6 +51,9 @@ pub struct SessionState {
     pub browser_path: Option<PathBuf>,
     /// Current page target id (set at start, updated by `rdny page`).
     pub target_id: Option<String>,
+    /// Human-readable instance label, set by `rdny start --label`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     /// Optional persisted viewport/mobile emulation override.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub viewport: Option<ViewportOverride>,
@@ -58,26 +61,51 @@ pub struct SessionState {
 
 /// Resolve the rdny state directory (created if missing).
 pub fn state_dir() -> Result<PathBuf> {
-    let dir = if let Ok(dir) = env::var("RDNY_STATE_DIR") {
-        PathBuf::from(dir)
-    } else if let Ok(xdg) = env::var("XDG_STATE_HOME") {
-        PathBuf::from(xdg).join("rdny")
-    } else {
-        let home = env::var("HOME").context("HOME is not set; cannot resolve rdny state dir")?;
-        if cfg!(target_os = "macos") {
-            PathBuf::from(home)
-                .join("Library")
-                .join("Application Support")
-                .join("rdny")
-        } else {
-            PathBuf::from(home)
-                .join(".local")
-                .join("state")
-                .join("rdny")
-        }
-    };
+    let dir = resolve_state_dir(
+        env::var_os("RDNY_STATE_DIR"),
+        env::var_os("XDG_STATE_HOME"),
+        env::var_os("HOME"),
+    )?;
     fs::create_dir_all(&dir).with_context(|| format!("creating state dir {}", dir.display()))?;
     Ok(dir)
+}
+
+/// Resolve the default rdny state directory, deliberately ignoring RDNY_STATE_DIR.
+pub fn default_state_dir() -> Result<PathBuf> {
+    resolve_default_state_dir(env::var_os("XDG_STATE_HOME"), env::var_os("HOME"))
+}
+
+pub fn resolve_state_dir(
+    rdny_state_dir: Option<impl Into<PathBuf>>,
+    xdg_state_home: Option<impl Into<PathBuf>>,
+    home: Option<impl Into<PathBuf>>,
+) -> Result<PathBuf> {
+    if let Some(dir) = rdny_state_dir {
+        Ok(dir.into())
+    } else {
+        resolve_default_state_dir(xdg_state_home, home)
+    }
+}
+
+pub fn resolve_default_state_dir(
+    xdg_state_home: Option<impl Into<PathBuf>>,
+    home: Option<impl Into<PathBuf>>,
+) -> Result<PathBuf> {
+    if let Some(xdg) = xdg_state_home {
+        Ok(xdg.into().join("rdny"))
+    } else {
+        let home = home
+            .map(Into::into)
+            .context("HOME is not set; cannot resolve rdny state dir")?;
+        if cfg!(target_os = "macos") {
+            Ok(home
+                .join("Library")
+                .join("Application Support")
+                .join("rdny"))
+        } else {
+            Ok(home.join(".local").join("state").join("rdny"))
+        }
+    }
 }
 
 /// Load the session state, Ok(None) when no state file exists.
@@ -147,8 +175,18 @@ mod tests {
             user_data_dir: Some(PathBuf::from("/tmp/rdny-profile")),
             browser_path: Some(PathBuf::from("/Applications/Google Chrome.app")),
             target_id: Some("target-1".to_string()),
+            label: None,
             viewport: None,
         }
+    }
+
+    #[test]
+    fn label_round_trips_in_state_json() {
+        let mut state = sample_state();
+        state.label = Some("work".to_string());
+        let raw = serde_json::to_string(&state).unwrap();
+        assert!(raw.contains("label"));
+        assert_eq!(serde_json::from_str::<SessionState>(&raw).unwrap(), state);
     }
 
     #[test]
@@ -180,6 +218,7 @@ mod tests {
 
         let state = serde_json::from_str::<SessionState>(raw).unwrap();
         assert_eq!(state.viewport, None);
+        assert_eq!(state.label, None);
     }
 
     #[test]
