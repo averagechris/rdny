@@ -57,6 +57,8 @@ pub enum Command {
     Pdf { file: Option<PathBuf> },
     /// Evaluate JavaScript in the current page.
     Js { expression: String },
+    /// Capture console and browser logs.
+    Logs(LogsArgs),
     /// Click an element.
     Click { selector: String },
     /// Type text into an element.
@@ -118,6 +120,13 @@ pub struct ReloadArgs {
     /// Bypass cache while reloading.
     #[arg(long)]
     pub hard: bool,
+}
+
+#[derive(Debug, Parser)]
+pub struct LogsArgs {
+    /// Keep streaming log events until interrupted.
+    #[arg(long)]
+    pub follow: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -228,6 +237,9 @@ pub fn run() -> Result<()> {
         }
         Command::Js { expression } => {
             commands::interact::js(&mut session::connect(cli.timeout)?, &expression)?
+        }
+        Command::Logs(args) => {
+            commands::logs::logs(&mut session::connect(cli.timeout)?, args.follow)?
         }
         Command::Click { selector } => {
             commands::interact::click(&mut session::connect(cli.timeout)?, &selector)?
@@ -370,6 +382,10 @@ mod tests {
             Command::Waitstable
         ));
         assert!(matches!(parse(&["rdny", "waitidle"]), Command::Waitidle));
+        assert!(matches!(
+            parse(&["rdny", "logs", "--follow"]),
+            Command::Logs(LogsArgs { follow: true })
+        ));
         assert!(matches!(
             parse(&["rdny", "page", "2"]),
             Command::Page { index: 2 }

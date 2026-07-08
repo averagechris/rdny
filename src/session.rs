@@ -93,6 +93,11 @@ impl PageSession {
         self.client.next_event(timeout)
     }
 
+    /// Flat-protocol session id for this attached page target.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     /// Evaluate a JavaScript expression, returning its value by value.
     /// Promises are awaited; page exceptions become errors.
     pub fn eval(&mut self, expression: &str) -> Result<Value> {
