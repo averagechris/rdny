@@ -1,7 +1,8 @@
 //! Command-line surface and dispatch.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 
 use crate::browser::{self, BrowserStatus, LaunchOpts};
@@ -55,8 +56,11 @@ pub enum Command {
     Attr { selector: String, name: String },
     /// Save the current page as PDF.
     Pdf { file: Option<PathBuf> },
-    /// Evaluate JavaScript in the current page.
-    Js { expression: String },
+    /// Evaluate JavaScript in the current page. Pass `-` or omit EXPRESSION to read stdin.
+    Js {
+        /// JavaScript expression to evaluate.
+        expression: Option<String>,
+    },
     /// Capture console and browser logs.
     Logs(LogsArgs),
     /// Click an element.
@@ -236,6 +240,9 @@ pub fn run() -> Result<()> {
             commands::pageinfo::pdf(&mut session::connect(cli.timeout)?, file.as_deref())?
         }
         Command::Js { expression } => {
+            let stdin = std::io::stdin();
+            let stdin_is_tty = stdin.is_terminal();
+            let expression = resolve_js_expression(expression, stdin, stdin_is_tty)?;
             commands::interact::js(&mut session::connect(cli.timeout)?, &expression)?
         }
         Command::Logs(args) => {
@@ -320,6 +327,27 @@ pub fn parse_address(address: &str) -> Result<(String, u16)> {
     Ok((host.to_string(), port))
 }
 
+fn resolve_js_expression(
+    expression: Option<String>,
+    reader: impl Read,
+    stdin_is_tty: bool,
+) -> Result<String> {
+    match expression {
+        Some(expression) if expression == "-" => read_js_expression_from_stdin(reader),
+        Some(expression) => Ok(expression),
+        None if stdin_is_tty => Err(crate::hint::hint_error(
+            "missing JavaScript expression",
+            "pass an expression or pipe one on stdin",
+            None,
+        )),
+        None => read_js_expression_from_stdin(reader),
+    }
+}
+
+fn read_js_expression_from_stdin(reader: impl Read) -> Result<String> {
+    std::io::read_to_string(reader).context("failed to read JavaScript expression from stdin")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,6 +401,13 @@ mod tests {
             parse(&["rdny", "html"]),
             Command::Html { selector: None }
         ));
+        assert!(matches!(
+            parse(&["rdny", "js"]),
+            Command::Js { expression: None }
+        ));
+        assert!(
+            matches!(parse(&["rdny", "js", "1 + 1"]), Command::Js { expression: Some(expression) } if expression == "1 + 1")
+        );
         assert!(
             matches!(parse(&["rdny", "html", "div"]), Command::Html { selector: Some(selector) } if selector == "div")
         );
@@ -419,5 +454,40 @@ mod tests {
         );
         assert!(parse_address("9222").is_err());
         assert!(parse_address("foo:bar").is_err());
+    }
+
+    #[test]
+    fn resolves_js_expression_from_argument() {
+        let expression = resolve_js_expression(
+            Some("document.title".to_string()),
+            "ignored".as_bytes(),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(expression, "document.title");
+    }
+
+    #[test]
+    fn resolves_js_expression_from_dash_stdin() {
+        let expression =
+            resolve_js_expression(Some("-".to_string()), "a\nb\n".as_bytes(), true).unwrap();
+
+        assert_eq!(expression, "a\nb\n");
+    }
+
+    #[test]
+    fn resolves_js_expression_from_omitted_non_tty_stdin() {
+        let expression =
+            resolve_js_expression(None, "(() => {\n  return 42;\n})()".as_bytes(), false).unwrap();
+
+        assert_eq!(expression, "(() => {\n  return 42;\n})()");
+    }
+
+    #[test]
+    fn rejects_omitted_js_expression_on_tty() {
+        let err = resolve_js_expression(None, "ignored".as_bytes(), true).unwrap_err();
+
+        assert!(format!("{err}").contains("pass an expression or pipe one on stdin"));
     }
 }
