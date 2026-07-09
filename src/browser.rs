@@ -110,6 +110,10 @@ pub fn launch(opts: &LaunchOpts, storage: BrowserStorage) -> Result<SessionState
         label: opts.label.clone(),
         viewport: None,
         recording: false,
+        recording_id: None,
+        recording_frames_dir: None,
+        recoverable_recording: None,
+        recoverable_recordings: Vec::new(),
     })
 }
 
@@ -136,6 +140,10 @@ pub fn connect(host: &str, port: u16) -> Result<SessionState> {
         label: None,
         viewport: None,
         recording: false,
+        recording_id: None,
+        recording_frames_dir: None,
+        recoverable_recording: None,
+        recoverable_recordings: Vec::new(),
     })
 }
 

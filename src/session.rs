@@ -69,7 +69,8 @@ pub fn connect(timeout_secs: f64) -> Result<PageSession> {
         )?;
     }
     let frames_dir = if state.recording {
-        let frames_dir = state::frames_dir()?;
+        let frames_dir = state::recording_frames_dir(&state)?;
+        frames_dir.validate_external_path()?;
         client.call(
             Some(&session_id),
             "Page.startScreencast",
