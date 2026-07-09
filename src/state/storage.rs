@@ -71,6 +71,8 @@ pub(crate) struct SecureDir {
     dir: File,
 }
 
+pub(crate) struct AdvisoryLock(File);
+
 impl SecureDir {
     pub(crate) fn path(&self) -> &Path {
         &self.path
@@ -81,6 +83,74 @@ impl SecureDir {
     /// this policy; lifecycle serialization remains #130/#131 work.
     pub(crate) fn validate_external_path(&self) -> Result<()> {
         validate_external_dir_path(&self.state_root, &self.path)
+    }
+
+    pub(crate) fn subdir(&self, name: &str) -> Result<SecureDir> {
+        validate_name(name)?;
+        let dir = open_or_create_dir(self.dir.as_raw_fd(), name)?;
+        Ok(SecureDir {
+            state_root: self.state_root.clone(),
+            path: self.path.join(name),
+            dir,
+        })
+    }
+
+    pub(crate) fn create_subdir_exclusive(&self, name: &str) -> Result<Option<SecureDir>> {
+        validate_name(name)?;
+        match mkdirat(self.dir.as_raw_fd(), name, 0o700) {
+            Ok(()) => {
+                let dir = file_from_openat(
+                    self.dir.as_raw_fd(),
+                    name,
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+                    0,
+                )?;
+                validate_owned_directory(&dir)?;
+                self.dir.sync_all()?;
+                Ok(Some(SecureDir {
+                    state_root: self.state_root.clone(),
+                    path: self.path.join(name),
+                    dir,
+                }))
+            }
+            Err(err) if err.raw_os_error() == Some(libc::EEXIST) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    pub(crate) fn remove_flat_subdir(&self, name: &str) -> Result<()> {
+        validate_name(name)?;
+        let dir = match file_from_openat(
+            self.dir.as_raw_fd(),
+            name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            0,
+        ) {
+            Ok(v) => v,
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        validate_owned_directory(&dir)?;
+        let child = SecureDir {
+            state_root: self.state_root.clone(),
+            path: self.path.join(name),
+            dir,
+        };
+        for entry in child.names()? {
+            let file = file_from_openat(
+                child.dir.as_raw_fd(),
+                &entry,
+                libc::O_RDONLY | libc::O_NOFOLLOW,
+                0,
+            )?;
+            validate_regular(&file, 0o600)?;
+            drop(file);
+            unlinkat(child.dir.as_raw_fd(), &entry, 0)?;
+        }
+        drop(child);
+        unlinkat(self.dir.as_raw_fd(), name, libc::AT_REMOVEDIR)?;
+        self.dir.sync_all()?;
+        Ok(())
     }
 
     pub(crate) fn create_file(&self, name: &str, truncate: bool) -> Result<File> {
@@ -127,6 +197,27 @@ impl SecureDir {
             Ok(()) => Ok(()),
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    pub(crate) fn try_advisory_lock(&self, name: &str) -> Result<Option<AdvisoryLock>> {
+        validate_name(name)?;
+        let file = file_from_openat(
+            self.dir.as_raw_fd(),
+            name,
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW,
+            0o600,
+        )?;
+        validate_regular(&file, 0o600)?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            Ok(Some(AdvisoryLock(file)))
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                Ok(None)
+            } else {
+                Err(err.into())
+            }
         }
     }
 
@@ -178,6 +269,14 @@ impl SecureDir {
             }
         }
         Ok(names)
+    }
+}
+
+impl Drop for AdvisoryLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
     }
 }
 

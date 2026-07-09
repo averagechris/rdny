@@ -134,6 +134,18 @@ with owner-only permissions, keeps it until Chrome accepts the upload, and then
 removes it on success or normal error. Stdin uploads are limited to 64 MiB; pass
 a real file path for larger payloads.
 
+Each `start-video` creates a recording id and writes frames under a dedicated
+state subdirectory (`recordings/<id>/frames`). A second `start-video` is rejected
+while a recording is active. `stop-video` marks the active recording inactive and
+adds it to recoverable state before assembly, so browser disconnects, empty
+captures, and ffmpeg failures do not mix frame sets or block a new recording. If
+several recordings are recoverable, `stop-video` retries the oldest recoverable
+recording first; the error text prints the selected id and frame directory.
+Successful assembly clears that id from state before best-effort frame deletion,
+so a deletion warning leaves an explicit manual cleanup path without state
+pointing at deleted frames. Older state using the legacy singular
+`recoverable_recording` field or `frames/` directory is still readable.
+
 All Nix systems can opt into an ffmpeg-containing closure without a bundled
 browser using `.#rdny-ffmpeg`:
 

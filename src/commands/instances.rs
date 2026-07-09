@@ -223,6 +223,10 @@ mod tests {
             label: label.map(str::to_string),
             viewport: None,
             recording: false,
+            recording_id: None,
+            recording_frames_dir: None,
+            recoverable_recording: None,
+            recoverable_recordings: Vec::new(),
         }
     }
 

@@ -21,10 +21,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use storage::StateStore;
-pub(crate) use storage::{Generation, Inspection, SecureDir};
+pub(crate) use storage::{AdvisoryLock, Generation, Inspection, SecureDir};
 
 const STATE_FILE: &str = "state.json";
 
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Persisted viewport/mobile emulation override.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ViewportOverride {
@@ -74,6 +76,35 @@ pub struct SessionState {
     /// Whether commands should collect CDP screencast frames.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub recording: bool,
+    /// Current recording id. Missing in older state; when `recording` is true
+    /// without this field, frames live in the legacy `frames/` directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_id: Option<String>,
+    /// Current recording frame directory, absolute or relative to the state dir.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_frames_dir: Option<PathBuf>,
+    /// Last failed/incomplete recording kept for explicit `stop-video` retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recoverable_recording: Option<RecoverableRecording>,
+    /// Failed/incomplete recordings kept for explicit deterministic retry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recoverable_recordings: Vec<RecoverableRecording>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecoverableRecording {
+    pub id: String,
+    pub frames_dir: PathBuf,
+    #[serde(default)]
+    pub status: RecordingStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingStatus {
+    #[default]
+    Recoverable,
+    Assembling,
 }
 
 /// Directory where video frames are accumulated while recording.
@@ -83,6 +114,24 @@ pub(crate) fn frames_dir() -> Result<SecureDir> {
 
 pub(crate) fn remove_frames_dir() -> Result<()> {
     open_store()?.remove_subdir("frames")
+}
+
+pub(crate) fn recordings_dir() -> Result<SecureDir> {
+    open_store()?.subdir("recordings")
+}
+
+pub(crate) fn create_recording_frames_dir(id: &str) -> Result<Option<SecureDir>> {
+    let recordings = recordings_dir()?;
+    let Some(recording) = recordings.create_subdir_exclusive(id)? else {
+        return Ok(None);
+    };
+    Ok(Some(recording.subdir("frames")?))
+}
+
+pub(crate) fn remove_recording_dir(id: &str) -> Result<()> {
+    let recordings = recordings_dir()?;
+    recordings.subdir(id)?.remove_flat_subdir("frames")?;
+    recordings.remove_flat_subdir(id)
 }
 
 pub(crate) struct BrowserStorage {
@@ -105,6 +154,52 @@ pub(crate) fn browser_storage_at(path: &Path) -> Result<BrowserStorage> {
         profile,
         log,
     })
+}
+
+pub(crate) fn recording_frames_dir(state: &SessionState) -> Result<SecureDir> {
+    if let Some(dir) = &state.recording_frames_dir {
+        open_frames_dir_from_path(dir)
+    } else {
+        frames_dir()
+    }
+}
+
+pub(crate) fn open_frames_dir_from_path(path: &Path) -> Result<SecureDir> {
+    let root = state_dir()?;
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let relative = absolute.strip_prefix(&root).with_context(|| {
+        format!(
+            "recording frames path {} is outside state dir",
+            absolute.display()
+        )
+    })?;
+    if relative == Path::new("frames") {
+        return frames_dir();
+    }
+    let components: Vec<_> = relative.components().collect();
+    if components.len() == 3
+        && components[0].as_os_str() == "recordings"
+        && components[2].as_os_str() == "frames"
+    {
+        let id = components[1].as_os_str().to_string_lossy();
+        return recordings_dir()?.subdir(&id)?.subdir("frames");
+    }
+    anyhow::bail!("unsupported recording frames path {}", absolute.display())
+}
+
+pub(crate) struct RecordingLease {
+    _lock: AdvisoryLock,
+}
+
+pub(crate) fn try_recording_lease(frames_path: &Path) -> Result<Option<RecordingLease>> {
+    let frames = open_frames_dir_from_path(frames_path)?;
+    Ok(frames
+        .try_advisory_lock(".assembling.lock")?
+        .map(|lock| RecordingLease { _lock: lock }))
 }
 
 /// Resolve the rdny state directory (created if missing).
@@ -184,7 +279,7 @@ pub(crate) fn capture_initial_cwd() -> Result<()> {
 pub fn load() -> Result<Option<SessionState>> {
     match inspect()? {
         StateInspection::Missing => Ok(None),
-        StateInspection::Valid(state) => Ok(Some(state)),
+        StateInspection::Valid(state) => Ok(Some(*state)),
         StateInspection::Malformed(message) => {
             anyhow::bail!("state file contains malformed JSON: {message}")
         }
@@ -255,6 +350,10 @@ fn merge_state(current: Option<Value>, state: &SessionState) -> Result<Value> {
             "label",
             "viewport",
             "recording",
+            "recording_id",
+            "recording_frames_dir",
+            "recoverable_recording",
+            "recoverable_recordings",
         ] {
             dst.remove(key);
         }
@@ -273,7 +372,7 @@ pub fn clear() -> Result<()> {
 #[derive(Debug)]
 enum StateInspection {
     Missing,
-    Valid(SessionState),
+    Valid(Box<SessionState>),
     Malformed(String),
     Incompatible(String),
 }
@@ -293,7 +392,7 @@ fn inspect() -> Result<StateInspection> {
     };
     Ok(match store.inspect(STATE_FILE)? {
         Inspection::Missing => StateInspection::Missing,
-        Inspection::Valid(v, _) => StateInspection::Valid(v),
+        Inspection::Valid(v, _) => StateInspection::Valid(Box::new(v)),
         Inspection::Malformed(v) => StateInspection::Malformed(v.message().to_owned()),
         Inspection::Incompatible(e, _) => StateInspection::Incompatible(e),
     })
@@ -327,10 +426,7 @@ pub fn require() -> Result<SessionState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{process::Command, sync::Mutex};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
+    use std::process::Command;
     fn sample_state() -> SessionState {
         SessionState {
             ws_url: "ws://127.0.0.1:9222/devtools/browser/abc".to_string(),
@@ -343,6 +439,10 @@ mod tests {
             label: None,
             viewport: None,
             recording: false,
+            recording_id: None,
+            recording_frames_dir: None,
+            recoverable_recording: None,
+            recoverable_recordings: Vec::new(),
         }
     }
 
@@ -409,6 +509,10 @@ mod tests {
         assert_eq!(state.viewport, None);
         assert_eq!(state.label, None);
         assert!(!state.recording);
+        assert_eq!(state.recording_id, None);
+        assert_eq!(state.recording_frames_dir, None);
+        assert_eq!(state.recoverable_recording, None);
+        assert!(state.recoverable_recordings.is_empty());
     }
 
     #[test]
@@ -426,7 +530,7 @@ mod tests {
 
     #[test]
     fn round_trip_state_with_env_override() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let previous = env::var("RDNY_STATE_DIR").ok();
         let temp = tempfile::tempdir_in(".").unwrap();
         unsafe { env::set_var("RDNY_STATE_DIR", temp.path()) };
@@ -450,7 +554,7 @@ mod tests {
 
     #[test]
     fn save_preserves_unknown_fields_but_clears_omitted_known_fields() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let previous = env::var_os("RDNY_STATE_DIR");
         let temp = tempfile::tempdir_in(".").unwrap();
         unsafe { env::set_var("RDNY_STATE_DIR", temp.path()) };
