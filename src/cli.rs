@@ -33,7 +33,18 @@ pub enum Command {
     /// Start a new browser session.
     Start(StartArgs),
     /// Connect to an existing browser debugger endpoint.
-    Connect { address: Option<String> },
+    ///
+    /// ADDRESS is `<host>:<port>`, or a named target from
+    /// `[connect.targets]` in the rdny config file. Omit it to use the
+    /// `[connect] default` target. The browser must have been launched
+    /// with `--remote-debugging-port=<port>`; on macOS, for example:
+    /// `open -na Helium --args --remote-debugging-port=9333`. See the
+    /// README section "Driving your own browser".
+    Connect {
+        /// `<host>:<port>`, or a named `[connect.targets]` entry;
+        /// omitted: the configured `[connect] default`
+        address: Option<String>,
+    },
     /// Stop the current browser session.
     Stop,
     /// Show current browser session status.

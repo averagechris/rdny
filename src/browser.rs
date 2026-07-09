@@ -115,9 +115,14 @@ pub fn launch(opts: &LaunchOpts, data_root: &Path) -> Result<SessionState> {
 /// Attach to an already-running browser at host:port.
 pub fn connect(host: &str, port: u16) -> Result<SessionState> {
     let version = http::version(host, port).map_err(|_| {
+        let relaunch = if cfg!(target_os = "macos") {
+            format!("relaunch it like `open -na Helium --args --remote-debugging-port={port}`")
+        } else {
+            format!("relaunch it like `chromium --remote-debugging-port={port}`")
+        };
         hint_error(
-            format!("could not reach Chrome DevTools at {host}:{port}"),
-            format!("start the browser with --remote-debugging-port={port} AND a non-default --user-data-dir (Chromium 136+ silently ignores the debug port on the default profile)"),
+            format!("could not reach Chrome DevTools at {host}:{port} (the debug port only exists when the browser was launched with it)"),
+            format!("{relaunch}; if it is still unreachable add a non-default --user-data-dir (Chromium 136+ silently ignores the debug port on the default profile)"),
             Some("chromium-remote-debugging"),
         )
     })?;
