@@ -15,15 +15,18 @@ pub fn viewport(
     reset: bool,
 ) -> Result<()> {
     if reset {
+        let tx = state::transaction()?;
+        let mut state = tx.require()?;
         sess.call("Emulation.clearDeviceMetricsOverride", json!({}))?;
-        let mut state = state::require()?;
         state.viewport = None;
-        state::save(&state)?;
+        tx.save(&state)?;
         return Ok(());
     }
 
     match (width, height) {
         (Some(width), Some(height)) => {
+            let tx = state::transaction()?;
+            let mut state = tx.require()?;
             let override_ = ViewportOverride {
                 width,
                 height,
@@ -31,9 +34,8 @@ pub fn viewport(
                 mobile,
             };
             sess.call("Emulation.setDeviceMetricsOverride", override_.cdp_params())?;
-            let mut state = state::require()?;
             state.viewport = Some(override_);
-            state::save(&state)?;
+            tx.save(&state)?;
         }
         (None, None) => {
             if let Some(override_) = state::require()?.viewport {

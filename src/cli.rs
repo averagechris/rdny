@@ -277,13 +277,31 @@ pub struct ScreenshotArgs {
 
 /// Parse argv and execute the selected command.
 pub fn run() -> Result<()> {
+    if std::env::var_os("RDNY_TEST_HELPER").is_some() {
+        return test_helper();
+    }
     let cli = Cli::parse();
     if let Some(state_dir) = &cli.state_dir {
         // SAFETY: rdny is still single-threaded here, before any command dispatch or
         // background work, so mutating the process environment cannot race other threads.
         unsafe { std::env::set_var("RDNY_STATE_DIR", state_dir) };
     }
-    let recording_active = crate::state::load()?.is_some_and(|state| state.recording);
+    // Commands that do not use a browser (especially sleep) must not eagerly
+    // parse session state. Status/list/cleanup have their own corruption-aware paths.
+    let recording_active = if matches!(
+        &cli.command,
+        Command::Sleep { .. }
+            | Command::Start(_)
+            | Command::Connect { .. }
+            | Command::Stop
+            | Command::Status
+            | Command::List
+            | Command::Cleanup(_)
+    ) {
+        false
+    } else {
+        crate::state::load()?.is_some_and(|state| state.recording)
+    };
     let drain_after_dispatch =
         recording_active && !matches!(cli.command, Command::StopVideo { .. });
     let mut page_session = None;
@@ -297,21 +315,31 @@ pub fn run() -> Result<()> {
     }
     match cli.command {
         Command::Start(args) => {
-            if let Some(state) = crate::state::load()?
-                && let Ok(BrowserStatus::Running { .. }) = browser::status(&state)
-            {
-                let pid = state
-                    .pid
-                    .map(|pid| pid.to_string())
-                    .unwrap_or_else(|| "attached".to_string());
-                return Err(crate::hint::hint_error(
-                    format!(
-                        "a browser session is already running (pid {pid}/port {})",
-                        state.port
-                    ),
-                    "run `rdny stop` first",
-                    None,
-                ));
+            let tx = crate::state::transaction()?;
+            if let Some(state) = tx.load()? {
+                let live_managed = match state.pid {
+                    Some(pid) if pid > 0 && pid <= libc::pid_t::MAX as u32 => {
+                        browser::pid_is_alive(pid as libc::pid_t)?
+                    }
+                    _ => false,
+                };
+                let live_attached = state.pid.is_none()
+                    && matches!(browser::status(&state), Ok(BrowserStatus::Running { .. }));
+                if live_managed || live_attached {
+                    let kind = if state.pid.is_some() {
+                        "managed"
+                    } else {
+                        "attached"
+                    };
+                    return Err(crate::hint::hint_error(
+                        format!(
+                            "a live {kind} session already occupies this state directory (port {})",
+                            state.port
+                        ),
+                        "run `rdny stop` first",
+                        None,
+                    ));
+                }
             }
             let opts = LaunchOpts {
                 show: args.show,
@@ -319,8 +347,18 @@ pub fn run() -> Result<()> {
                 extra_args: vec![],
                 label: args.label,
             };
-            let state = browser::launch(&opts, &crate::state::state_dir()?)?;
-            crate::state::save(&state)?;
+            let launch = browser::launch(&opts, tx.dir())?;
+            if let Err(persist_err) = tx.save_and_register(launch.state()) {
+                return match launch.rollback() {
+                    Ok(()) => Err(anyhow::anyhow!(
+                        "could not persist launched browser; launch was killed and reaped: {persist_err:#}"
+                    )),
+                    Err(cleanup_err) => Err(anyhow::anyhow!(
+                        "could not persist launched browser: {persist_err:#}; additionally failed to kill/reap it: {cleanup_err:#}"
+                    )),
+                };
+            }
+            let state = launch.commit();
             let browser = state
                 .browser_path
                 .as_ref()
@@ -333,24 +371,57 @@ pub fn run() -> Result<()> {
             println!("started {browser} pid {pid} on port {}", state.port);
         }
         Command::Connect { address } => {
+            let tx = crate::state::transaction()?;
+            if let Some(existing) = tx.load()? {
+                let live_managed = match existing.pid {
+                    Some(pid) if pid > 0 && pid <= libc::pid_t::MAX as u32 => {
+                        browser::pid_is_alive(pid as libc::pid_t)?
+                    }
+                    _ => false,
+                };
+                let live_attached = existing.pid.is_none()
+                    && matches!(
+                        browser::status(&existing),
+                        Ok(BrowserStatus::Running { .. })
+                    );
+                if live_managed || live_attached {
+                    let kind = if existing.pid.is_some() {
+                        "managed"
+                    } else {
+                        "attached"
+                    };
+                    return Err(crate::hint::hint_error(
+                        format!(
+                            "a live {kind} session already occupies this state directory (port {})",
+                            existing.port
+                        ),
+                        "run `rdny stop` first",
+                        None,
+                    ));
+                }
+            }
             let config = config::load()?;
             let (host, port) = resolve_connect_target(address.as_deref(), &config)?;
             let state = browser::connect(&host, port)?;
-            crate::state::save(&state)?;
+            tx.save_and_register(&state)?;
             println!("connected to {host}:{port}");
         }
         Command::Stop => {
-            let state = crate::state::require()?;
+            let tx = crate::state::transaction()?;
+            let state = tx.require()?;
             let outcome = browser::stop(&state)?;
-            crate::state::clear()?;
+            tx.clear()?;
             match outcome {
                 browser::StopOutcome::Stopped => println!("stopped"),
                 browser::StopOutcome::Detached => println!("detached (browser left running)"),
             }
         }
-        Command::Status => match crate::state::load()? {
-            None => println!("no session"),
-            Some(state) => match browser::status(&state)? {
+        Command::Status => match crate::state::inspect()? {
+            crate::state::StateFile::Missing => println!("no session"),
+            crate::state::StateFile::Corrupt(reason) => {
+                println!("corrupt: {reason}; run `rdny cleanup` to quarantine it")
+            }
+            crate::state::StateFile::Valid(state) => match browser::status(&state)? {
                 BrowserStatus::Running { browser } => {
                     let pid = state
                         .pid
@@ -464,6 +535,50 @@ pub fn run() -> Result<()> {
         session.drain_events(std::time::Duration::from_millis(300))?;
     }
     Ok(())
+}
+
+fn test_helper() -> Result<()> {
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        Some("register-sample") => {
+            let tx = crate::state::transaction()?;
+            tx.save_and_register(&browser::connect("127.0.0.1", 9).unwrap_or_else(|_| {
+                crate::state::SessionState {
+                    ws_url: "ws://127.0.0.1:9/devtools/browser/test".into(),
+                    host: "127.0.0.1".into(),
+                    port: 9,
+                    pid: None,
+                    process_identity: None,
+                    user_data_dir: None,
+                    browser_path: None,
+                    target_id: None,
+                    label: Some("helper".into()),
+                    viewport: None,
+                    recording: false,
+                }
+            }))
+        }
+        Some("replace-sample") => {
+            let tx = crate::state::transaction()?;
+            let mut state = tx.load()?.unwrap_or(crate::state::SessionState {
+                ws_url: "ws://127.0.0.1:9/devtools/browser/test".into(),
+                host: "127.0.0.1".into(),
+                port: 9,
+                pid: None,
+                process_identity: None,
+                user_data_dir: None,
+                browser_path: None,
+                target_id: None,
+                label: None,
+                viewport: None,
+                recording: false,
+            });
+            state.label = Some("replacement".into());
+            tx.save_and_register(&state)
+        }
+        Some("cleanup") => commands::instances::cleanup(false),
+        _ => anyhow::bail!("unknown RDNY_TEST_HELPER command"),
+    }
 }
 
 pub fn parse_address(address: &str) -> Result<(String, u16)> {

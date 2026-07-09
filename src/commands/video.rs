@@ -3,6 +3,7 @@
 use std::cmp::Ordering;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -17,10 +18,11 @@ use crate::{session::PageSession, state};
 const LAST_FRAME_DURATION: f64 = 0.1;
 
 pub fn start() -> Result<()> {
-    let mut state = state::require()?;
+    let tx = state::transaction()?;
+    let mut state = tx.require()?;
     fs::create_dir_all(state::frames_dir()?).context("creating video frames directory")?;
     state.recording = true;
-    state::save(&state)
+    tx.save(&state)
 }
 
 pub fn stop(session: Option<&mut PageSession>, output: Option<&Path>) -> Result<()> {
@@ -42,7 +44,12 @@ pub fn stop(session: Option<&mut PageSession>, output: Option<&Path>) -> Result<
     let output = output.unwrap_or_else(|| Path::new("recording.mp4"));
     let list = concat_list(&frames);
     let list_path = frames_dir.join("frames.txt");
-    fs::write(&list_path, list).context("writing ffmpeg concat list")?;
+    let mut list_file =
+        state::secure_output(&list_path, true).context("opening ffmpeg concat list")?;
+    list_file
+        .write_all(list.as_bytes())
+        .context("writing ffmpeg concat list")?;
+    list_file.sync_all().context("syncing ffmpeg concat list")?;
 
     let config = config::load()?;
     let ffmpeg = config::resolve_ffmpeg(std::env::var_os("RDNY_FFMPEG"), &config);
@@ -62,9 +69,10 @@ pub fn stop(session: Option<&mut PageSession>, output: Option<&Path>) -> Result<
     match status {
         Ok(status) if status.success() => {
             fs::remove_dir_all(&frames_dir).context("removing video frames directory")?;
-            if let Some(mut state) = state::load()? {
-                state.recording = false;
-                state::save(&state)?;
+            let tx = state::transaction()?;
+            if let Some(mut current) = tx.load()? {
+                current.recording = false;
+                tx.save(&current)?;
             }
             println!("{}", output.display());
             Ok(())
@@ -100,8 +108,11 @@ pub fn handle_screencast_frame(params: &Value, frames_dir: &Path) -> Result<Opti
         return Ok(None);
     };
     let bytes = decode_base64(data)?;
-    fs::create_dir_all(frames_dir).context("creating video frames directory")?;
-    fs::write(frames_dir.join(format!("{timestamp:.6}.jpg")), bytes)
+    state::secure_dir(frames_dir).context("creating video frames directory")?;
+    let path = frames_dir.join(format!("{timestamp:.6}.jpg"));
+    let mut frame = state::secure_output(&path, true).context("opening screencast frame")?;
+    frame
+        .write_all(&bytes)
         .context("writing screencast frame")?;
     Ok(params
         .get("sessionId")
@@ -143,6 +154,8 @@ fn read_frames(frames_dir: &Path) -> Result<Vec<(f64, PathBuf)>> {
         if path.extension().and_then(OsStr::to_str) != Some("jpg") {
             continue;
         }
+        let _validated = state::secure_input(&path)
+            .with_context(|| format!("validating video frame {}", path.display()))?;
         let Some(stem) = path.file_stem().and_then(OsStr::to_str) else {
             continue;
         };
@@ -165,6 +178,7 @@ mod tests {
     #[test]
     fn handles_screencast_frame() {
         let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let params = serde_json::json!({
             "data": "/9j/2Q==",
             "metadata": {"timestamp": 123.4567894},
@@ -177,6 +191,8 @@ mod tests {
             vec![0xff, 0xd8, 0xff, 0xd9]
         );
     }
+
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn concat_list_sorts_and_uses_durations() {

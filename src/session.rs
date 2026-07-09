@@ -26,7 +26,8 @@ pub struct PageSession {
 /// If the recorded target is gone, falls back to the first open page
 /// (and persists the switch).
 pub fn connect(timeout_secs: f64) -> Result<PageSession> {
-    let mut state = state::require()?;
+    let tx = state::transaction()?;
+    let mut state = tx.require()?;
     let targets = http::list_targets(&state.host, state.port).map_err(|_| {
         hint_error(
             format!(
@@ -53,8 +54,9 @@ pub fn connect(timeout_secs: f64) -> Result<PageSession> {
     let target_id = target.id.clone();
     if state.target_id.as_deref() != Some(target_id.as_str()) {
         state.target_id = Some(target_id.clone());
-        state::save(&state)?;
+        tx.save(&state)?;
     }
+    drop(tx);
     let timeout = Duration::from_secs_f64(timeout_secs.max(0.001));
     let mut client = CdpClient::connect(&state.ws_url)
         .with_context(|| format!("connecting to browser websocket {}", state.ws_url))?;

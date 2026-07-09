@@ -22,24 +22,26 @@ pub fn pages() -> Result<()> {
 
 /// Switch the session's current page by index (as printed by `pages`).
 pub fn page(index: usize) -> Result<()> {
-    let mut state = crate::state::require()?;
+    let tx = crate::state::transaction()?;
+    let mut state = tx.require()?;
     let pages = page_targets(&state.host, state.port)?;
     let target = pages
         .get(index)
         .ok_or_else(|| anyhow::anyhow!("no page at index {index} (see `rdny pages`)"))?;
     state.target_id = Some(target.id.clone());
-    crate::state::save(&state)?;
+    tx.save(&state)?;
     println!("switched to {index}: {}", target.url);
     Ok(())
 }
 
 /// Open a new page/tab, optionally at a URL, and make it current.
 pub fn newpage(url: Option<&str>) -> Result<()> {
-    let mut state = crate::state::require()?;
+    let tx = crate::state::transaction()?;
+    let mut state = tx.require()?;
     let normalized = url.map(crate::commands::nav::normalize_url);
     let target = http::new_tab(&state.host, state.port, normalized.as_deref())?;
     state.target_id = Some(target.id.clone());
-    crate::state::save(&state)?;
+    tx.save(&state)?;
     let opened = if target.url.is_empty() {
         target.id.as_str()
     } else {

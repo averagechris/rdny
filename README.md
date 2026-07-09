@@ -121,6 +121,40 @@ Both sessions coexist because state is separated. Attached sessions record no
 browser pid, so `rdny stop` and `rdny cleanup` never kill your personal browser;
 they only detach rdny from it or clear rdny state.
 
+### State, discovery, and lifecycle safety
+
+Every state directory successfully used by `start` or `connect` is recorded in
+an owner-private persistent registry below the default rdny state directory.
+Consequently `rdny list` and `rdny cleanup` discover arbitrary custom
+`--state-dir` sessions after the shell that created them exits; they do not scan
+`/tmp`. For example, the custom session above can later be managed with:
+
+```sh
+rdny list
+rdny --state-dir ~/.local/state/rdny-personal status
+rdny --state-dir ~/.local/state/rdny-personal stop
+```
+
+State and registry updates use bounded interprocess locks and atomic, synced
+owner-only files. State, profile, log, and frame directories must be owned by
+the effective user, must not be symlinks, and must not grant group or other
+permissions. rdny rejects unsafe pre-existing paths rather than weakening
+their permissions. New directories and files use modes `0700` and `0600`.
+
+`status` and `list` report malformed or truncated state instead of hiding it.
+`cleanup` moves malformed `state.json` files to a unique
+`state.corrupt-*` file in the same directory and prunes missing, malformed, or
+unsafe registry entries. `start` and `connect` refuse corrupt state until it is
+cleaned, and refuse to replace either a live rdny-managed browser or a live
+attached browser; run `rdny stop` first.
+
+New managed-session state records a process birth token plus executable/profile
+correlation. rdny validates all of these immediately before sending a signal.
+For compatibility, old state without this identity still loads: if its PID is
+dead, cleanup can remove it, but if that PID is live `rdny stop` refuses to
+signal it and preserves state. Stop that browser manually, then run
+`rdny cleanup`.
+
 ## Development
 
 ```sh

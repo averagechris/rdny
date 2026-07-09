@@ -1,9 +1,10 @@
 //! Browser discovery, launch, and lifecycle (start/connect/stop/status).
 
 use std::ffi::OsStr;
-use std::fs::{self, OpenOptions};
+use std::fs;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -12,7 +13,7 @@ use anyhow::{Context, Result, bail};
 use crate::cdp::http;
 use crate::config;
 use crate::hint::hint_error;
-use crate::state::SessionState;
+use crate::state::{ProcessIdentity, SessionState};
 
 const DEVTOOLS_TIMEOUT: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -51,12 +52,44 @@ pub fn discover() -> Result<PathBuf> {
 /// reachable (probe /json/version). `data_root` is the rdny state dir
 /// (from `state::state_dir()`); the profile dir and chrome.log live
 /// under it. Returns the session to persist.
-pub fn launch(opts: &LaunchOpts, data_root: &Path) -> Result<SessionState> {
+pub struct LaunchGuard {
+    state: SessionState,
+    child: Option<Child>,
+}
+
+impl LaunchGuard {
+    pub fn state(&self) -> &SessionState {
+        &self.state
+    }
+
+    /// Disarm rollback only after durable state and registry persistence.
+    pub fn commit(mut self) -> SessionState {
+        self.child.take();
+        self.state.clone()
+    }
+
+    pub fn rollback(mut self) -> Result<()> {
+        if let Some(mut child) = self.child.take() {
+            kill_child_result(&mut child)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for LaunchGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            kill_child(child);
+        }
+    }
+}
+
+pub fn launch(opts: &LaunchOpts, data_root: &Path) -> Result<LaunchGuard> {
     let binary = discover()?;
-    fs::create_dir_all(data_root).with_context(|| format!("creating {}", data_root.display()))?;
+    crate::state::secure_dir(data_root)?;
     let profile_dir = data_root.join("chrome-profile");
-    fs::create_dir_all(&profile_dir)
-        .with_context(|| format!("creating {}", profile_dir.display()))?;
+    crate::state::secure_dir(&profile_dir)?;
     let active_port_path = profile_dir.join("DevToolsActivePort");
     let _ = fs::remove_file(&active_port_path);
 
@@ -67,18 +100,23 @@ pub fn launch(opts: &LaunchOpts, data_root: &Path) -> Result<SessionState> {
     }
     let args = build_args(opts, &profile_dir, &user_args, cfg!(target_os = "macos"));
 
-    let log = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(data_root.join("chrome.log"))
+    let log = crate::state::secure_output(&data_root.join("chrome.log"), true)
         .with_context(|| format!("opening {}/chrome.log", data_root.display()))?;
     let log_err = log.try_clone().context("cloning chrome log handle")?;
-    let mut child = Command::new(&binary)
+    let mut command = Command::new(&binary);
+    command
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err))
+        .stderr(Stdio::from(log_err));
+    // SAFETY: umask is async-signal-safe and this closure performs no allocation.
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0o077);
+            Ok(())
+        });
+    }
+    let mut child = command
         .spawn()
         .with_context(|| format!("launching {}", binary.display()))?;
 
@@ -98,17 +136,34 @@ pub fn launch(opts: &LaunchOpts, data_root: &Path) -> Result<SessionState> {
     };
     let target_id = first_page_target("127.0.0.1", port);
 
-    Ok(SessionState {
-        ws_url: version.ws_url,
-        host: "127.0.0.1".into(),
-        port,
-        pid: Some(child.id()),
-        user_data_dir: Some(profile_dir),
-        browser_path: Some(binary),
-        target_id,
-        label: opts.label.clone(),
-        viewport: None,
-        recording: false,
+    let identity = match process_identity(child.id(), &binary, &profile_dir).context(
+        "recording browser process identity; refusing to persist a session that cannot be safely stopped",
+    ) {
+        Ok(identity) => identity,
+        Err(identity_err) => {
+            return match kill_child_result(&mut child) {
+                Ok(()) => Err(identity_err),
+                Err(cleanup_err) => Err(anyhow::anyhow!(
+                    "{identity_err:#}; additionally failed to kill/reap the untracked browser: {cleanup_err:#}"
+                )),
+            };
+        }
+    };
+    Ok(LaunchGuard {
+        state: SessionState {
+            ws_url: version.ws_url,
+            host: "127.0.0.1".into(),
+            port,
+            pid: Some(child.id()),
+            process_identity: Some(identity),
+            user_data_dir: Some(profile_dir),
+            browser_path: Some(binary),
+            target_id,
+            label: opts.label.clone(),
+            viewport: None,
+            recording: false,
+        },
+        child: Some(child),
     })
 }
 
@@ -127,6 +182,7 @@ pub fn connect(host: &str, port: u16) -> Result<SessionState> {
         host: host.into(),
         port,
         pid: None,
+        process_identity: None,
         user_data_dir: None,
         browser_path: None,
         target_id: first_page_target(host, port),
@@ -153,34 +209,156 @@ pub fn stop(state: &SessionState) -> Result<StopOutcome> {
     let Some(pid) = state.pid else {
         return Ok(StopOutcome::Detached);
     };
+    if pid == 0 || pid > libc::pid_t::MAX as u32 {
+        bail!("refusing to signal invalid recorded browser pid {pid}; state was preserved");
+    }
     let pid = pid as libc::pid_t;
     reap_if_child(pid);
-    if !pid_exists(pid) {
+    if !pid_is_alive(pid)? {
         return Ok(StopOutcome::Stopped);
     }
-    unsafe {
-        libc::kill(pid, libc::SIGTERM);
-    }
+    let recorded = state.process_identity.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "live browser pid {pid} has legacy state without process identity; refusing to signal it and preserving state (stop it manually, then run `rdny cleanup`)"
+        )
+    })?;
+    validate_process_identity(pid as u32, recorded)?;
+    send_signal(pid, libc::SIGTERM)?;
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         reap_if_child(pid);
-        if !pid_exists(pid) {
+        if !pid_is_alive(pid)? {
             return Ok(StopOutcome::Stopped);
         }
         thread::sleep(POLL_INTERVAL);
     }
-    unsafe {
-        libc::kill(pid, libc::SIGKILL);
-    }
+    // Validate again immediately before escalating, guarding against PID reuse.
+    validate_process_identity(pid as u32, recorded)?;
+    send_signal(pid, libc::SIGKILL)?;
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         reap_if_child(pid);
-        if !pid_exists(pid) {
-            break;
+        if !pid_is_alive(pid)? {
+            return Ok(StopOutcome::Stopped);
         }
         thread::sleep(POLL_INTERVAL);
     }
-    Ok(StopOutcome::Stopped)
+    bail!(
+        "browser pid {pid} survived SIGTERM and SIGKILL; shutdown is unconfirmed and state was preserved"
+    )
+}
+
+fn send_signal(pid: libc::pid_t, signal: libc::c_int) -> Result<()> {
+    if unsafe { libc::kill(pid, signal) } == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    Err(err).with_context(|| {
+        format!("sending signal {signal} to browser pid {pid}; state was preserved")
+    })
+}
+
+fn process_identity(pid: u32, executable: &Path, profile: &Path) -> Result<ProcessIdentity> {
+    let snapshot = process_snapshot(pid)?;
+    if !snapshot.matches(executable, profile) {
+        bail!("launched process command does not correlate with browser executable and profile")
+    }
+    Ok(ProcessIdentity {
+        birth_token: snapshot.birth_token,
+        executable: executable.to_path_buf(),
+        profile: profile.to_path_buf(),
+    })
+}
+
+fn validate_process_identity(pid: u32, expected: &ProcessIdentity) -> Result<()> {
+    let snapshot = process_snapshot(pid).with_context(|| {
+        format!("validating browser pid {pid}; refusing to signal and preserving state")
+    })?;
+    if snapshot.birth_token != expected.birth_token {
+        bail!(
+            "browser pid {pid} birth token does not match recorded identity; refusing to signal and preserving state"
+        );
+    }
+    if !snapshot.matches(&expected.executable, &expected.profile) {
+        bail!(
+            "browser pid {pid} command does not match recorded executable/profile; refusing to signal and preserving state"
+        );
+    }
+    Ok(())
+}
+
+struct ProcessSnapshot {
+    birth_token: String,
+    executable: Option<PathBuf>,
+    argv: Vec<String>,
+}
+
+impl ProcessSnapshot {
+    fn matches(&self, executable: &Path, profile: &Path) -> bool {
+        let executable_matches = self
+            .executable
+            .as_deref()
+            .is_some_and(|actual| actual == executable)
+            || self
+                .argv
+                .first()
+                .is_some_and(|arg0| Path::new(arg0) == executable);
+        let profile_arg = format!("--user-data-dir={}", profile.display());
+        executable_matches && self.argv.iter().any(|arg| arg == &profile_arg)
+    }
+}
+
+fn process_snapshot(pid: u32) -> Result<ProcessSnapshot> {
+    process_snapshot_platform(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn process_snapshot_platform(pid: u32) -> Result<ProcessSnapshot> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let end = stat.rfind(')').context("malformed /proc process stat")?;
+    let fields: Vec<_> = stat[end + 1..].split_whitespace().collect();
+    let birth_token = fields
+        .get(19)
+        .context("missing process start token")?
+        .to_string();
+    let argv = read_nul_argv(&fs::read(format!("/proc/{pid}/cmdline"))?);
+    let executable = fs::read_link(format!("/proc/{pid}/exe")).ok();
+    Ok(ProcessSnapshot {
+        birth_token,
+        executable,
+        argv,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn process_snapshot_platform(pid: u32) -> Result<ProcessSnapshot> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "start=", "-o", "command="])
+        .output()
+        .context("running ps for process identity")?;
+    if !output.status.success() {
+        bail!("ps could not inspect pid {pid}");
+    }
+    let text = String::from_utf8(output.stdout).context("ps returned non-UTF-8 process data")?;
+    let mut fields = text.split_whitespace();
+    let birth_token = fields
+        .next()
+        .context("ps omitted process start token")?
+        .to_string();
+    let argv = fields.map(str::to_string).collect();
+    Ok(ProcessSnapshot {
+        birth_token,
+        executable: None,
+        argv,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn read_nul_argv(raw: &[u8]) -> Vec<String> {
+    raw.split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect()
 }
 
 /// Reap the process if it is a zombie child of this process (e.g. when
@@ -379,7 +557,13 @@ fn wait_for_devtools_port(path: &Path) -> Result<u16> {
     let deadline = Instant::now() + DEVTOOLS_TIMEOUT;
     let mut last_err = None;
     while Instant::now() < deadline {
-        if let Ok(contents) = fs::read_to_string(path) {
+        if let Ok(mut file) = crate::state::secure_input(path) {
+            let mut contents = String::new();
+            use std::io::Read;
+            if file.read_to_string(&mut contents).is_err() {
+                thread::sleep(POLL_INTERVAL);
+                continue;
+            }
             match parse_devtools_active_port(&contents) {
                 Ok(port) => return Ok(port),
                 Err(err) => last_err = Some(err),
@@ -427,19 +611,58 @@ fn first_page_target(host: &str, port: u16) -> Option<String> {
 }
 
 pub fn pid_exists(pid: libc::pid_t) -> bool {
-    unsafe { libc::kill(pid, 0) == 0 }
+    pid_is_alive(pid).unwrap_or(false)
+}
+
+pub fn pid_is_alive(pid: libc::pid_t) -> Result<bool> {
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        Ok(false)
+    } else {
+        Err(err).with_context(|| format!("probing browser pid {pid}"))
+    }
 }
 
 fn kill_child(child: &mut std::process::Child) {
-    unsafe {
-        libc::kill(child.id() as libc::pid_t, libc::SIGKILL);
+    let _ = kill_child_result(child);
+}
+
+fn kill_child_result(child: &mut Child) -> Result<()> {
+    let pid = child.id() as libc::pid_t;
+    if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ESRCH) {
+            return Err(err).with_context(|| format!("killing launched browser pid {pid}"));
+        }
     }
-    let _ = child.wait();
+    child
+        .wait()
+        .with_context(|| format!("reaping launched browser pid {pid}"))?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn state_with_pid(pid: u32, identity: Option<ProcessIdentity>) -> SessionState {
+        SessionState {
+            ws_url: "ws://unused".into(),
+            host: "127.0.0.1".into(),
+            port: 1,
+            pid: Some(pid),
+            process_identity: identity,
+            user_data_dir: None,
+            browser_path: None,
+            target_id: None,
+            label: None,
+            viewport: None,
+            recording: false,
+        }
+    }
 
     #[test]
     fn relaunch_example_names_the_discovered_mac_app() {
@@ -629,13 +852,101 @@ mod tests {
     }
 
     #[test]
+    fn stop_rejects_invalid_and_legacy_live_pids() {
+        let invalid = state_with_pid(0, None);
+        assert!(format!("{:#}", stop(&invalid).unwrap_err()).contains("invalid"));
+
+        let legacy = state_with_pid(std::process::id(), None);
+        let err = stop(&legacy).unwrap_err();
+        assert!(format!("{err:#}").contains("legacy state"));
+    }
+
+    #[test]
+    fn identity_mismatch_refuses_to_signal() {
+        let snapshot = process_snapshot(std::process::id()).unwrap();
+        let identity = ProcessIdentity {
+            birth_token: format!("{}-wrong", snapshot.birth_token),
+            executable: "/definitely/not-this-process".into(),
+            profile: "/also/not-a-profile".into(),
+        };
+        let err = stop(&state_with_pid(std::process::id(), Some(identity))).unwrap_err();
+        assert!(format!("{err:#}").contains("birth token does not match"));
+    }
+
+    #[test]
+    fn identity_matching_is_exact_for_argv_and_profile() {
+        let snapshot = ProcessSnapshot {
+            birth_token: "1".into(),
+            executable: Some("/bin/chrome".into()),
+            argv: vec![
+                "/bin/chrome".into(),
+                "--user-data-dir=/tmp/rdny-profile".into(),
+            ],
+        };
+        assert!(snapshot.matches(Path::new("/bin/chrome"), Path::new("/tmp/rdny-profile")));
+        assert!(!snapshot.matches(
+            Path::new("/bin/chrome-other"),
+            Path::new("/tmp/rdny-profile")
+        ));
+        assert!(!snapshot.matches(Path::new("/bin/chrome"), Path::new("/tmp/rdny")));
+    }
+
+    #[test]
+    fn launch_guard_drop_kills_and_reaps_child() {
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let guard = LaunchGuard {
+            state: state_with_pid(pid, None),
+            child: Some(child),
+        };
+        drop(guard);
+        assert!(!pid_exists(pid as libc::pid_t));
+    }
+
+    #[test]
+    fn launch_guard_commit_disarms_rollback() {
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let guard = LaunchGuard {
+            state: state_with_pid(pid, None),
+            child: Some(child),
+        };
+
+        let state = guard.commit();
+        assert_eq!(state.pid, Some(pid));
+        assert!(pid_exists(pid as libc::pid_t));
+
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) },
+            pid as libc::pid_t
+        );
+        assert!(!pid_exists(pid as libc::pid_t));
+    }
+
+    #[test]
+    fn launch_guard_explicit_rollback_kills_and_reaps_child() {
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let guard = LaunchGuard {
+            state: state_with_pid(pid, None),
+            child: Some(child),
+        };
+
+        guard.rollback().unwrap();
+        assert!(!pid_exists(pid as libc::pid_t));
+    }
+
+    #[test]
     #[ignore]
     fn real_launch_end_to_end() {
         let dir = tempfile::tempdir().unwrap();
-        let state = launch(&LaunchOpts::default(), dir.path()).unwrap_or_else(|err| {
+        let launch = launch(&LaunchOpts::default(), dir.path()).unwrap_or_else(|err| {
             let log = fs::read_to_string(dir.path().join("chrome.log")).unwrap_or_default();
             panic!("{err}\nchrome.log:\n{log}");
         });
+        let state = launch.commit();
         match status(&state).unwrap() {
             BrowserStatus::Running { browser } => assert!(!browser.is_empty()),
             BrowserStatus::Stale => panic!("launched browser is stale"),
