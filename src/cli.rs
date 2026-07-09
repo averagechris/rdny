@@ -115,9 +115,9 @@ pub enum Command {
     /// Wait for page load.
     Waitload,
     /// Wait for page stability.
-    Waitstable,
+    Waitstable(WaitQuietArgs),
     /// Wait for browser idleness.
-    Waitidle,
+    Waitidle(WaitQuietArgs),
     /// Sleep for a number of seconds.
     Sleep { seconds: f64 },
     /// Capture a screenshot.
@@ -153,6 +153,24 @@ pub struct StartArgs {
     /// Human-readable label for this instance.
     #[arg(long)]
     pub label: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+pub struct WaitQuietArgs {
+    /// Quiet-window duration in milliseconds before the wait succeeds.
+    #[arg(long, default_value_t = 500, value_parser = parse_quiet_ms)]
+    pub quiet_ms: u64,
+}
+
+fn parse_quiet_ms(raw: &str) -> std::result::Result<u64, String> {
+    let value: u64 = raw
+        .parse()
+        .map_err(|_| "quiet-ms must be an integer number of milliseconds".to_string())?;
+    if (1..=60_000).contains(&value) {
+        Ok(value)
+    } else {
+        Err("quiet-ms must be between 1 and 60000".to_string())
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -453,8 +471,26 @@ pub fn run() -> Result<()> {
         Command::Focus { selector } => commands::interact::focus(sess!(), &selector)?,
         Command::Wait { selector } => commands::wait::wait(sess!(), &selector)?,
         Command::Waitload => commands::wait::waitload(sess!())?,
-        Command::Waitstable => commands::wait::waitstable(sess!())?,
-        Command::Waitidle => commands::wait::waitidle(sess!())?,
+        Command::Waitstable(args) => {
+            if args.quiet_ms == 500 {
+                commands::wait::waitstable(sess!())?
+            } else {
+                commands::wait::waitstable_quiet(
+                    sess!(),
+                    std::time::Duration::from_millis(args.quiet_ms),
+                )?
+            }
+        }
+        Command::Waitidle(args) => {
+            if args.quiet_ms == 500 {
+                commands::wait::waitidle(sess!())?
+            } else {
+                commands::wait::waitidle_quiet(
+                    sess!(),
+                    std::time::Duration::from_millis(args.quiet_ms),
+                )?
+            }
+        }
         Command::Sleep { seconds } => commands::wait::sleep(seconds)?,
         Command::Screenshot(args) => {
             let state = crate::state::require()?;
@@ -474,7 +510,7 @@ pub fn run() -> Result<()> {
         } => commands::shot::screenshot_el(sess!(), &selector, file.as_deref(), force)?,
         Command::Pages => commands::tabs::pages()?,
         Command::Page { index } => commands::tabs::page(index)?,
-        Command::Newpage { url } => commands::tabs::newpage(url.as_deref())?,
+        Command::Newpage { url } => commands::tabs::newpage(url.as_deref(), cli.timeout)?,
         Command::StartVideo => commands::video::start()?,
         Command::StopVideo(args) => {
             // Assemble even when the browser is gone: frames on disk
@@ -693,9 +729,15 @@ mod tests {
         assert!(matches!(parse(&["rdny", "waitload"]), Command::Waitload));
         assert!(matches!(
             parse(&["rdny", "waitstable"]),
-            Command::Waitstable
+            Command::Waitstable(_)
         ));
-        assert!(matches!(parse(&["rdny", "waitidle"]), Command::Waitidle));
+        assert!(matches!(
+            parse(&["rdny", "waitstable", "--quiet-ms", "750"]),
+            Command::Waitstable(WaitQuietArgs { quiet_ms: 750 })
+        ));
+        assert!(matches!(parse(&["rdny", "waitidle"]), Command::Waitidle(_)));
+        assert!(Cli::try_parse_from(["rdny", "waitidle", "--quiet-ms", "0"]).is_err());
+        assert!(Cli::try_parse_from(["rdny", "waitidle", "--quiet-ms", "60001"]).is_err());
         assert!(matches!(
             parse(&["rdny", "start-video"]),
             Command::StartVideo

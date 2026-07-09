@@ -28,6 +28,7 @@ fn history_target(current: usize, len: usize, delta: i64) -> Option<usize> {
 /// Navigate the current page and wait for the load event.
 pub fn open(sess: &mut PageSession, url: &str) -> Result<()> {
     let url = normalize_url(url);
+    sess.ensure_page_instrumentation()?;
     sess.call("Page.enable", json!({}))?;
     let result = sess.call("Page.navigate", json!({ "url": url }))?;
     if let Some(err) = result["errorText"].as_str()
@@ -74,6 +75,7 @@ pub fn forward(sess: &mut PageSession) -> Result<()> {
 
 /// Reload the page; `hard` bypasses the cache.
 pub fn reload(sess: &mut PageSession, hard: bool) -> Result<()> {
+    sess.ensure_page_instrumentation()?;
     sess.call("Page.enable", json!({}))?;
     sess.call("Page.reload", json!({ "ignoreCache": hard }))?;
     wait_for_load_event(sess)

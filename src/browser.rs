@@ -114,6 +114,7 @@ pub fn launch(opts: &LaunchOpts, storage: BrowserStorage) -> Result<SessionState
         recording_frames_dir: None,
         recoverable_recording: None,
         recoverable_recordings: Vec::new(),
+        instrumentation: None,
     })
 }
 
@@ -144,6 +145,7 @@ pub fn connect(host: &str, port: u16) -> Result<SessionState> {
         recording_frames_dir: None,
         recoverable_recording: None,
         recoverable_recordings: Vec::new(),
+        instrumentation: None,
     })
 }
 

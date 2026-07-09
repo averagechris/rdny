@@ -98,6 +98,8 @@ pub struct SessionState {
     /// Failed/incomplete recordings kept for explicit deterministic retry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recoverable_recordings: Vec<RecoverableRecording>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instrumentation: Option<Box<InstrumentationState>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -114,6 +116,13 @@ pub enum RecordingStatus {
     #[default]
     Recoverable,
     Assembling,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InstrumentationState {
+    pub target_id: String,
+    pub version: u32,
+    pub script_id: String,
 }
 
 /// Directory where video frames are accumulated while recording.
@@ -640,6 +649,7 @@ mod tests {
             recording_frames_dir: None,
             recoverable_recording: None,
             recoverable_recordings: Vec::new(),
+            instrumentation: None,
         }
     }
 

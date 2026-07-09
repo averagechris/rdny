@@ -36,16 +36,20 @@ pub fn page(index: usize) -> Result<()> {
 }
 
 /// Open a new page/tab, optionally at a URL, and make it current.
-pub fn newpage(url: Option<&str>) -> Result<()> {
+pub fn newpage(url: Option<&str>, timeout_secs: f64) -> Result<()> {
     let state = crate::state::require()?;
     let normalized = url.map(crate::commands::nav::normalize_url);
-    let target = http::new_tab(&state.host, state.port, normalized.as_deref())?;
+    let target = http::new_tab(&state.host, state.port, None)?;
     crate::state::update(|state| {
         state.target_id = Some(target.id.clone());
         Ok(())
     })?;
+    if let Some(url) = normalized.as_deref() {
+        let mut sess = crate::session::connect(timeout_secs)?;
+        crate::commands::nav::open(&mut sess, url)?;
+    }
     let opened = if target.url.is_empty() {
-        target.id.as_str()
+        normalized.as_deref().unwrap_or(target.id.as_str())
     } else {
         target.url.as_str()
     };

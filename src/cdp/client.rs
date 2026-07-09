@@ -59,6 +59,17 @@ impl CdpClient {
     /// method name and remote message. Events received while waiting
     /// are buffered for `next_event`.
     pub fn call(&mut self, session_id: Option<&str>, method: &str, params: Value) -> Result<Value> {
+        self.call_until(session_id, method, params, Instant::now() + self.timeout)
+    }
+
+    /// Send a CDP command and wait for its response within an absolute deadline.
+    pub fn call_until(
+        &mut self,
+        session_id: Option<&str>,
+        method: &str,
+        params: Value,
+        deadline: Instant,
+    ) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -75,15 +86,11 @@ impl CdpClient {
             .send(Message::Text(request.to_string().into()))
             .with_context(|| format!("sending CDP command {method}"))?;
 
-        let deadline = Instant::now() + self.timeout;
         loop {
             let msg = match self.read_with_deadline(deadline) {
                 Ok(msg) => msg,
                 Err(err) if is_timeout_error(&err) => {
-                    bail!(
-                        "timed out after {:.3}s waiting for {method}",
-                        self.timeout.as_secs_f64()
-                    )
+                    bail!("timed out waiting for {method} before command deadline")
                 }
                 Err(err) => {
                     return Err(err).with_context(|| format!("reading response for {method}"));
@@ -128,10 +135,22 @@ impl CdpClient {
     /// Return the next event (buffered or read from the socket),
     /// Ok(None) once `timeout` elapses with no event.
     pub fn next_event(&mut self, timeout: Duration) -> Result<Option<Event>> {
+        self.next_event_until(Instant::now() + timeout)
+    }
+
+    /// Return the next event before an absolute deadline. This lets callers
+    /// share one timeout budget across command calls and event polling.
+    pub fn next_event_until(&mut self, deadline: Instant) -> Result<Option<Event>> {
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
         if let Some(event) = self.events.pop_front() {
+            if Instant::now() >= deadline {
+                self.events.push_front(event);
+                return Ok(None);
+            }
             return Ok(Some(event));
         }
-        let deadline = Instant::now() + timeout;
         loop {
             let msg = match self.read_with_deadline(deadline) {
                 Ok(msg) => msg,
@@ -147,6 +166,11 @@ impl CdpClient {
         }
     }
 
+    /// Return one already-buffered event without reading the socket.
+    pub fn next_buffered_event(&mut self) -> Option<Event> {
+        self.events.pop_front()
+    }
+
     fn read_with_deadline(&mut self, deadline: Instant) -> Result<Message> {
         let now = Instant::now();
         if now >= deadline {
@@ -155,7 +179,7 @@ impl CdpClient {
                 "deadline elapsed"
             )));
         }
-        let remaining = (deadline - now).max(Duration::from_millis(10));
+        let remaining = deadline - now;
         self.set_read_timeout(Some(remaining))?;
         self.socket.read().map_err(Into::into)
     }
@@ -292,6 +316,76 @@ mod tests {
         assert_eq!(event.method, "Page.loadEventFired");
         assert_eq!(event.params, json!({"ts": 1}));
         assert_eq!(event.session_id.as_deref(), Some("s"));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn runtime_evaluate_buffers_network_event_for_followup_drain() {
+        let (url, handle) = serve(|mut socket| {
+            let _ = read_json(&mut socket);
+            socket
+                .send(Message::Text(
+                    r#"{"method":"Network.requestWillBeSent","params":{"requestId":"late"},"sessionId":"s"}"#.into(),
+                ))
+                .unwrap();
+            socket
+                .send(Message::Text(r#"{"id":1,"result":{"result":{"value":{"active":0,"seq":0,"readyState":"complete"}}}}"#.into()))
+                .unwrap();
+            let _ = socket.close(None);
+        });
+        let mut client = CdpClient::connect(&url).unwrap();
+        let _ = client
+            .call(Some("s"), "Runtime.evaluate", json!({}))
+            .unwrap();
+        let event = client.next_buffered_event().unwrap();
+        assert_eq!(event.method, "Network.requestWillBeSent");
+        assert_eq!(event.session_id.as_deref(), Some("s"));
+        assert_eq!(event.params["requestId"], "late");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn next_event_until_does_not_return_buffered_event_after_deadline() {
+        let (url, handle) = serve(|mut socket| {
+            let _ = read_json(&mut socket);
+            socket
+                .send(Message::Text(
+                    r#"{"method":"Page.loadEventFired","params":{},"sessionId":"s"}"#.into(),
+                ))
+                .unwrap();
+            socket
+                .send(Message::Text(r#"{"id":1,"result":{}}"#.into()))
+                .unwrap();
+            thread::sleep(Duration::from_millis(200));
+        });
+        let mut client = CdpClient::connect(&url).unwrap();
+        client.call(None, "Page.navigate", json!({})).unwrap();
+        assert!(client.next_event_until(Instant::now()).unwrap().is_none());
+        assert!(
+            client
+                .next_event(Duration::from_millis(50))
+                .unwrap()
+                .is_some()
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn call_until_uses_absolute_deadline() {
+        let (url, handle) = serve(|mut socket| {
+            let _ = read_json(&mut socket);
+            thread::sleep(Duration::from_millis(200));
+        });
+        let mut client = CdpClient::connect(&url).unwrap();
+        let err = client
+            .call_until(
+                None,
+                "Slow.absolute",
+                json!({}),
+                Instant::now() + Duration::from_millis(50),
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("deadline"));
         handle.join().unwrap();
     }
 

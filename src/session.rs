@@ -12,11 +12,119 @@ use crate::cdp::http;
 use crate::hint::hint_error;
 use crate::state;
 
+pub const RDNY_INSTRUMENTATION_VERSION: u32 = 2;
+pub const RDNY_INSTRUMENTATION_SCRIPT: &str = r#"(() => {
+    const key = Symbol.for('rdny.wait.instrumentation.v1');
+    const state = window[key] || { active: 0, seq: 0, installed: false, version: 0 };
+    if (state.version !== 2) { state.version = 2; state.seq += 1; }
+    const inc = () => { state.active += 1; state.seq += 1; };
+    const dec = () => { if (state.active > 0) state.active -= 1; state.seq += 1; };
+    Object.defineProperty(window, key, { value: state, configurable: true });
+    if (typeof window.fetch === 'function' && window.fetch.__rdnyVersion !== 2) {
+        const baseFetch = window.fetch.__rdnyOriginal || window.fetch;
+        const wrappedFetch = (...args) => {
+            inc();
+            try {
+                return Promise.resolve(baseFetch.apply(window, args)).finally(dec);
+            } catch (err) {
+                dec();
+                throw err;
+            }
+        };
+        Object.defineProperty(wrappedFetch, '__rdnyVersion', { value: 2 });
+        Object.defineProperty(wrappedFetch, '__rdnyOriginal', { value: baseFetch });
+        window.fetch = wrappedFetch;
+    }
+    if (window.XMLHttpRequest && window.XMLHttpRequest.prototype.__rdnyVersion !== 2) {
+        const proto = window.XMLHttpRequest.prototype;
+        const originalOpen = proto.__rdnyOriginalOpen || proto.open;
+        const originalSend = proto.__rdnyOriginalSend || proto.send;
+        proto.open = function(...args) {
+            const prior = this.__rdnyRequest;
+            if (prior && prior.counted && !prior.done) prior.finish();
+            this.__rdnyRequest = null;
+            return originalOpen.apply(this, args);
+        };
+        proto.send = function(...args) {
+            if (this.__rdnyRequest && this.__rdnyRequest.counted && !this.__rdnyRequest.done) {
+                return originalSend.apply(this, args);
+            }
+            const request = { counted: false, done: false, finish: null };
+            request.finish = () => {
+                if (!request.done) {
+                    request.done = true;
+                    if (request.counted) dec();
+                    request.counted = false;
+                }
+            };
+            const onDone = () => request.finish();
+            this.addEventListener('loadend', onDone, { once: true });
+            this.addEventListener('error', onDone, { once: true });
+            this.addEventListener('abort', onDone, { once: true });
+            this.addEventListener('timeout', onDone, { once: true });
+            try {
+                request.counted = true;
+                this.__rdnyRequest = request;
+                inc();
+                const result = originalSend.apply(this, args);
+                if (this.readyState === 4) request.finish();
+                return result;
+            } catch (err) {
+                if (!request.done) request.finish();
+                throw err;
+            }
+        };
+        Object.defineProperty(proto, '__rdnyVersion', { value: 2 });
+        Object.defineProperty(proto, '__rdnyOriginalOpen', { value: originalOpen });
+        Object.defineProperty(proto, '__rdnyOriginalSend', { value: originalSend });
+    }
+    state.installed = true;
+    return true;
+})()"#;
+
+pub const RDNY_INSTRUMENTATION_STATE: &str = r#"(() => {
+    const state = window[Symbol.for('rdny.wait.instrumentation.v1')];
+    return { active: state ? state.active : 0, seq: state ? state.seq : 0, version: state ? state.version : 0, readyState: document.readyState };
+})()"#;
+
+/// Absolute timeout budget for commands that mix CDP calls, event polling, and sleeps.
+#[derive(Debug, Clone, Copy)]
+pub struct Deadline {
+    at: Instant,
+}
+
+impl Deadline {
+    pub fn after(timeout: Duration) -> Self {
+        let start = Instant::now();
+        Self {
+            at: start + timeout,
+        }
+    }
+
+    pub fn at(at: Instant) -> Self {
+        Self { at }
+    }
+
+    pub fn remaining(self) -> Option<Duration> {
+        self.at.checked_duration_since(Instant::now())
+    }
+
+    pub fn expired(self) -> bool {
+        self.remaining().is_none_or(|r| r.is_zero())
+    }
+
+    pub fn instant(self) -> Instant {
+        self.at
+    }
+}
+
 /// A live connection to the session's current page target.
 pub struct PageSession {
     client: CdpClient,
     session_id: String,
+    target_id: String,
     frames_dir: Option<state::SecureDir>,
+    instrumentation_registered: bool,
     /// Overall budget for waiting-style commands (from --timeout).
     pub timeout: Duration,
 }
@@ -61,6 +169,9 @@ pub fn connect(timeout_secs: f64) -> Result<PageSession> {
         .with_context(|| format!("connecting to browser websocket {}", state.ws_url))?;
     client.set_timeout(timeout.max(Duration::from_secs(5)));
     let session_id = client.attach_to_target(&target_id)?;
+    // Enable Network once per attached page session so waitidle can observe
+    // requests that began before the wait command but after rdny attached.
+    let _ = client.call(Some(&session_id), "Network.enable", json!({}));
     if let Some(viewport) = &state.viewport {
         client.call(
             Some(&session_id),
@@ -80,12 +191,16 @@ pub fn connect(timeout_secs: f64) -> Result<PageSession> {
     } else {
         None
     };
-    Ok(PageSession {
+    let mut session = PageSession {
         client,
         session_id,
+        target_id,
         frames_dir,
+        instrumentation_registered: false,
         timeout,
-    })
+    };
+    session.ensure_page_instrumentation()?;
+    Ok(session)
 }
 
 /// Quote a string as a JavaScript string literal.
@@ -111,16 +226,125 @@ impl PageSession {
         self.client.call(Some(&self.session_id), method, params)
     }
 
+    /// Send a CDP command to the page session within an absolute deadline.
+    pub fn call_until(&mut self, method: &str, params: Value, deadline: Deadline) -> Result<Value> {
+        if deadline.expired() {
+            bail!("timed out before {method}");
+        }
+        self.client
+            .call_until(Some(&self.session_id), method, params, deadline.instant())
+    }
+
+    pub fn ensure_page_instrumentation(&mut self) -> Result<()> {
+        if !self.instrumentation_registered {
+            self.remove_persisted_instrumentation()?;
+            let result = self.call(
+                "Page.addScriptToEvaluateOnNewDocument",
+                json!({"source": RDNY_INSTRUMENTATION_SCRIPT}),
+            )?;
+            self.persist_instrumentation_id(result["identifier"].as_str())?;
+            self.instrumentation_registered = true;
+        }
+        let _ = self.eval(RDNY_INSTRUMENTATION_SCRIPT)?;
+        Ok(())
+    }
+
+    pub fn ensure_page_instrumentation_until(&mut self, deadline: Deadline) -> Result<()> {
+        if !self.instrumentation_registered {
+            self.remove_persisted_instrumentation_until(deadline)?;
+            let result = self.call_until(
+                "Page.addScriptToEvaluateOnNewDocument",
+                json!({"source": RDNY_INSTRUMENTATION_SCRIPT}),
+                deadline,
+            )?;
+            self.persist_instrumentation_id(result["identifier"].as_str())?;
+            self.instrumentation_registered = true;
+        }
+        let _ = self.eval_until(RDNY_INSTRUMENTATION_SCRIPT, deadline)?;
+        Ok(())
+    }
+
+    fn remove_persisted_instrumentation(&mut self) -> Result<()> {
+        let Some(old) = state::require()?.instrumentation else {
+            return Ok(());
+        };
+        if old.target_id == self.target_id && old.version <= RDNY_INSTRUMENTATION_VERSION {
+            let _ = self.call(
+                "Page.removeScriptToEvaluateOnNewDocument",
+                json!({"identifier": old.script_id}),
+            );
+        }
+        Ok(())
+    }
+
+    fn remove_persisted_instrumentation_until(&mut self, deadline: Deadline) -> Result<()> {
+        let Some(old) = state::require()?.instrumentation else {
+            return Ok(());
+        };
+        if old.target_id == self.target_id && old.version <= RDNY_INSTRUMENTATION_VERSION {
+            let _ = self.call_until(
+                "Page.removeScriptToEvaluateOnNewDocument",
+                json!({"identifier": old.script_id}),
+                deadline,
+            );
+        }
+        Ok(())
+    }
+
+    fn persist_instrumentation_id(&self, script_id: Option<&str>) -> Result<()> {
+        let Some(script_id) = script_id else {
+            return Ok(());
+        };
+        let target_id = self.target_id.clone();
+        let script_id = script_id.to_string();
+        state::update(|state| {
+            state.instrumentation = Some(Box::new(state::InstrumentationState {
+                target_id,
+                version: RDNY_INSTRUMENTATION_VERSION,
+                script_id,
+            }));
+            Ok(())
+        })
+    }
+
     /// Pull the next buffered/incoming CDP event.
     pub fn next_event(&mut self, timeout: Duration) -> Result<Option<Event>> {
+        self.next_event_until(Deadline::after(timeout))
+    }
+
+    /// Pull the next event before an absolute deadline while still processing
+    /// recording acknowledgements. Non-recording events are returned to callers.
+    pub fn next_event_until(&mut self, deadline: Deadline) -> Result<Option<Event>> {
         loop {
-            let Some(event) = self.client.next_event(timeout)? else {
+            if deadline.expired() {
+                return Ok(None);
+            }
+            let Some(event) = self.client.next_event_until(deadline.instant())? else {
                 return Ok(None);
             };
-            if !self.process_recording_event(&event)? {
+            if event.session_id.as_deref() != Some(self.session_id.as_str()) {
+                continue;
+            }
+            if !self.process_recording_event_until(&event, deadline)? {
                 return Ok(Some(event));
             }
         }
+    }
+
+    /// Pull one event already buffered by earlier CDP calls without reading the socket.
+    pub fn next_buffered_event(&mut self, deadline: Deadline) -> Result<Option<Event>> {
+        if deadline.expired() {
+            return Ok(None);
+        }
+        while let Some(event) = self.client.next_buffered_event() {
+            if event.session_id.as_deref() != Some(self.session_id.as_str()) {
+                continue;
+            }
+            if !self.process_recording_event_until(&event, deadline)? {
+                return Ok(Some(event));
+            }
+        }
+        Ok(None)
     }
 
     /// Drain buffered and briefly-arriving events, capturing screencast frames.
@@ -142,6 +366,10 @@ impl PageSession {
     }
 
     fn process_recording_event(&mut self, event: &Event) -> Result<bool> {
+        self.process_recording_event_until(event, Deadline::after(self.timeout))
+    }
+
+    fn process_recording_event_until(&mut self, event: &Event, deadline: Deadline) -> Result<bool> {
         if event.method != "Page.screencastFrame"
             || event.session_id.as_deref() != Some(self.session_id.as_str())
         {
@@ -153,9 +381,10 @@ impl PageSession {
         if let Some(ack_id) =
             crate::commands::video::handle_screencast_frame(&event.params, frames_dir)?
         {
-            self.call(
+            self.call_until(
                 "Page.screencastFrameAck",
                 json!({"sessionId": ack_id.parse::<i64>().unwrap_or_default()}),
+                deadline,
             )?;
         }
         Ok(true)
@@ -176,6 +405,21 @@ impl PageSession {
                 "returnByValue": true,
                 "awaitPromise": true,
             }),
+        )?;
+        check_exception(&result, "js exception")?;
+        Ok(result["result"]["value"].clone())
+    }
+
+    /// Evaluate JavaScript within an absolute deadline.
+    pub fn eval_until(&mut self, expression: &str, deadline: Deadline) -> Result<Value> {
+        let result = self.call_until(
+            "Runtime.evaluate",
+            json!({
+                "expression": expression,
+                "returnByValue": true,
+                "awaitPromise": true,
+            }),
+            deadline,
         )?;
         check_exception(&result, "js exception")?;
         Ok(result["result"]["value"].clone())

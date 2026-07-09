@@ -221,6 +221,43 @@ Both sessions coexist because state is separated. Attached sessions record no
 browser pid, so `rdny stop` and `rdny cleanup` never kill your personal browser;
 they only detach rdny from it or clear rdny state.
 
+## Wait semantics
+
+`rdny waitstable` waits for a quiet DOM window, not for two equal DOM snapshots.
+It installs a page-side `MutationObserver` and succeeds once no observed
+child-list, attribute, or character-data mutation has occurred for the quiet
+window. This catches same-length replacements that fingerprint polling can miss.
+
+`rdny waitidle` waits for a quiet network window using CDP `Network` events.
+rdny enables the Network domain when it attaches to a page and installs a
+page-resident fetch/XMLHttpRequest counter before `open`, `reload`, and
+URL-bearing `newpage` navigations. A request started by one rdny command can
+therefore keep the page non-idle when a later rdny command attaches and runs
+`waitidle`. CDP events track document and subresource requests through
+`loadingFinished` or `loadingFailed`, including redirects and failures; the page
+counter tracks fetch/XHR that remain active across CLI process detach/reattach.
+`waitidle` also requires the current document to be at least `interactive`.
+The instrumentation is versioned and rdny records the CDP script identifier for
+the current target so later attaches remove the prior registration when Chrome
+accepts the identifier; the bootstrap also upgrades existing wrappers in-place so
+an older registered script cannot keep winning after a newer rdny attaches.
+
+Irreducible limits: traffic that began before rdny installed instrumentation and
+enabled Network for the target cannot be reconstructed. WebSocket lifecycle
+events are intentionally ignored by `waitidle`; CDP does not expose them as
+ordinary request lifecycles and the page instrumentation does not wrap
+`WebSocket`. HTTP(S) long-polls made with document loading, fetch, or XHR are
+tracked and keep the page non-idle until Chrome/the page reports completion.
+Service-worker-internal traffic that does not surface as page fetch/XHR or target
+Network events is not counted.
+
+Both commands default to a 500 ms quiet window and accept `--quiet-ms` to tune it:
+
+```sh
+rdny waitstable --quiet-ms 750
+rdny waitidle --quiet-ms 250
+```
+
 ## Development
 
 ```sh

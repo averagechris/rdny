@@ -364,6 +364,7 @@ mod tests {
             recording_frames_dir: None,
             recoverable_recording: None,
             recoverable_recordings: Vec::new(),
+            instrumentation: None,
         }
     }
 
