@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+
+## v0.1.0 - 2026-07-08
+
 ### Added
 
 - Named `rdny connect` targets plus global `--state-dir` for attaching to
