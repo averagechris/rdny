@@ -115,11 +115,7 @@ pub fn launch(opts: &LaunchOpts, data_root: &Path) -> Result<SessionState> {
 /// Attach to an already-running browser at host:port.
 pub fn connect(host: &str, port: u16) -> Result<SessionState> {
     let version = http::version(host, port).map_err(|_| {
-        let relaunch = if cfg!(target_os = "macos") {
-            format!("relaunch it like `open -na Helium --args --remote-debugging-port={port}`")
-        } else {
-            format!("relaunch it like `chromium --remote-debugging-port={port}`")
-        };
+        let relaunch = relaunch_example(discover().ok().as_deref(), port, cfg!(target_os = "macos"));
         hint_error(
             format!("could not reach Chrome DevTools at {host}:{port} (the debug port only exists when the browser was launched with it)"),
             format!("{relaunch}; if it is still unreachable add a non-default --user-data-dir (Chromium 136+ silently ignores the debug port on the default profile)"),
@@ -265,6 +261,47 @@ fn discover_from(
         })
 }
 
+/// Build a copy-pasteable command showing how to relaunch the browser
+/// with a debug port. Uses the browser rdny itself would pick
+/// (RDNY_CHROME > config > well-known locations) so the example names
+/// the binary the user actually has; falls back to a platform-typical
+/// command when discovery finds nothing.
+fn relaunch_example(binary: Option<&Path>, port: u16, macos: bool) -> String {
+    let command = match binary {
+        Some(path) => {
+            let app_name = macos
+                .then(|| {
+                    path.components().rev().find_map(|c| {
+                        c.as_os_str()
+                            .to_str()
+                            .and_then(|s| s.strip_suffix(".app"))
+                            .map(str::to_string)
+                    })
+                })
+                .flatten();
+            match app_name {
+                Some(name) if name.contains(' ') => {
+                    format!("open -na \"{name}\" --args --remote-debugging-port={port}")
+                }
+                Some(name) => format!("open -na {name} --args --remote-debugging-port={port}"),
+                None => {
+                    let path = path.display();
+                    if path.to_string().contains(' ') {
+                        format!("\"{path}\" --remote-debugging-port={port}")
+                    } else {
+                        format!("{path} --remote-debugging-port={port}")
+                    }
+                }
+            }
+        }
+        None if macos => {
+            format!("open -na \"Google Chrome\" --args --remote-debugging-port={port}")
+        }
+        None => format!("chromium --remote-debugging-port={port}"),
+    };
+    format!("relaunch it like `{command}`")
+}
+
 fn well_known_candidates() -> Vec<PathBuf> {
     if cfg!(target_os = "macos") {
         vec![
@@ -403,6 +440,53 @@ fn kill_child(child: &mut std::process::Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relaunch_example_names_the_discovered_mac_app() {
+        assert_eq!(
+            relaunch_example(
+                Some(Path::new("/Applications/Helium.app/Contents/MacOS/Helium")),
+                9333,
+                true,
+            ),
+            "relaunch it like `open -na Helium --args --remote-debugging-port=9333`"
+        );
+        assert_eq!(
+            relaunch_example(
+                Some(Path::new(
+                    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+                )),
+                9222,
+                true,
+            ),
+            "relaunch it like `open -na \"Google Chrome\" --args --remote-debugging-port=9222`"
+        );
+    }
+
+    #[test]
+    fn relaunch_example_uses_binary_path_on_linux_and_raw_binaries() {
+        assert_eq!(
+            relaunch_example(Some(Path::new("/usr/bin/chromium")), 9333, false),
+            "relaunch it like `/usr/bin/chromium --remote-debugging-port=9333`"
+        );
+        // RDNY_CHROME pointing at a raw binary on macOS (not an .app bundle)
+        assert_eq!(
+            relaunch_example(Some(Path::new("/opt/thorium/thorium")), 9333, true),
+            "relaunch it like `/opt/thorium/thorium --remote-debugging-port=9333`"
+        );
+    }
+
+    #[test]
+    fn relaunch_example_falls_back_per_platform() {
+        assert_eq!(
+            relaunch_example(None, 9333, true),
+            "relaunch it like `open -na \"Google Chrome\" --args --remote-debugging-port=9333`"
+        );
+        assert_eq!(
+            relaunch_example(None, 9333, false),
+            "relaunch it like `chromium --remote-debugging-port=9333`"
+        );
+    }
 
     #[test]
     fn discover_env_override_wins() {
