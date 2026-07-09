@@ -16,9 +16,33 @@
       <p class="nav"><a href="https://averagechris.srht.site/">~averagechris</a> / <a href="index.html">rdny</a> / examples</p>
 
         <h1>rdny examples</h1>
-        <pre><code>rdny --help
-rdny --json</code></pre>
-        <p>Replace this page with real workflows as the project grows.</p>
+        <p class="lede">Current workflows using the packaged <code>rdny</code> binary.</p>
+
+        <h2>Start, open, inspect, screenshot, stop</h2>
+        <pre><code>export RDNY_STATE_DIR="$(mktemp -d)"
+rdny start --label docs
+rdny open https://example.com
+rdny title
+rdny text h1
+rdny screenshot example.png
+rdny stop</code></pre>
+
+        <h2>Build or run with Nix</h2>
+        <pre><code>nix run git+https://git.sr.ht/~averagechris/rdny -- --help
+nix build git+https://git.sr.ht/~averagechris/rdny#rdny
+./result/bin/rdny --version</code></pre>
+
+        <h2>Use pinned browser and ffmpeg on Linux/Nix</h2>
+        <pre><code>nix run git+https://git.sr.ht/~averagechris/rdny#rdny-bundled -- start
+nix run git+https://git.sr.ht/~averagechris/rdny#rdny-bundled -- open https://example.com
+nix run git+https://git.sr.ht/~averagechris/rdny#rdny-bundled -- screenshot example.png
+nix run git+https://git.sr.ht/~averagechris/rdny#rdny-bundled -- stop</code></pre>
+
+        <h2>Connect to a browser you launched</h2>
+        <pre><code>open -na "Google Chrome" --args --remote-debugging-port=9333 --user-data-dir=/tmp/rdny-chrome
+rdny --state-dir ~/.local/state/rdny-personal connect 127.0.0.1:9333
+rdny --state-dir ~/.local/state/rdny-personal pages
+rdny --state-dir ~/.local/state/rdny-personal stop</code></pre>
 
     </body>
     </html>

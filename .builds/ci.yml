@@ -20,6 +20,39 @@ tasks:
   - test: |
       cd rdny
       nix run .#ci-test
+  - audit: |
+      cd rdny
+      nix run .#ci-audit
+  - deny: |
+      cd rdny
+      nix run .#ci-deny
+  - machete: |
+      cd rdny
+      nix run .#ci-machete
+  - sort: |
+      cd rdny
+      nix run .#ci-sort
   - package: |
       cd rdny
       nix build .#rdny --print-build-logs
+  - platform-eval: |
+      cd rdny
+      for system in x86_64-linux aarch64-linux x86_64-darwin aarch64-darwin; do
+        nix eval ".#packages.${system}.rdny.name"
+        nix eval ".#packages.${system}.release-artifact.name"
+      done
+  - packaged-smoke: |
+      cd rdny
+      nix build .#rdny-bundled --out-link result-rdny-bundled --print-build-logs
+      nix run .#ci-smoke -- ./result-rdny-bundled/bin/rdny
+  - packaged-smoke-gate: |
+      cd rdny
+      nix run .#ci-smoke-gate
+  - smoke-flow-test: |
+      cd rdny
+      nix run .#ci-smoke-flow-test
+  - release-facing: |
+      cd rdny
+      nix run .#ci-release-facing
+artifacts:
+  - rdny/smoke-artifacts

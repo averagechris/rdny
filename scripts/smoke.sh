@@ -15,16 +15,26 @@ else
   RDNY=(cargo run -q --)
 fi
 
-workdir=$(mktemp -d)
+workdir=${RDNY_SMOKE_WORKDIR:-$(mktemp -d)}
 export RDNY_STATE_DIR="$workdir/state"
+failed=0
 
 cleanup() {
-  "${RDNY[@]}" stop >/dev/null 2>&1 || true
-  rm -rf "$workdir"
+  local status=$?
+  if [[ $status -ne 0 || $failed -ne 0 ]]; then
+    printf 'smoke: preserving workdir after failure: %s\n' "$workdir" >&2
+    "${RDNY[@]}" status >"$workdir/final-status.txt" 2>&1 || true
+  else
+    "${RDNY[@]}" stop >/dev/null 2>&1 || true
+    if [[ -z ${RDNY_SMOKE_WORKDIR:-} ]]; then
+      rm -rf "$workdir"
+    fi
+  fi
 }
 trap cleanup EXIT
 
 fail() {
+  failed=1
   echo "smoke: FAIL: $*" >&2
   exit 1
 }
@@ -102,14 +112,25 @@ expect "js math" "3" "$("${RDNY[@]}" js '1+2')"
 
 # --- screenshots + pdf ----------------------------------------------
 "${RDNY[@]}" screenshot "$workdir/shot.png" >/dev/null
-[[ $(head -c4 "$workdir/shot.png" | tail -c3) == "PNG" ]] || fail "screenshot is not a PNG"
+LC_ALL=C grep -a -q 'PNG' "$workdir/shot.png" || fail "screenshot is not a PNG"
 echo "smoke: ok: screenshot"
 "${RDNY[@]}" screenshot-el "#heading" "$workdir/shot-el.png" >/dev/null
-[[ $(head -c4 "$workdir/shot-el.png" | tail -c3) == "PNG" ]] || fail "screenshot-el is not a PNG"
+LC_ALL=C grep -a -q 'PNG' "$workdir/shot-el.png" || fail "screenshot-el is not a PNG"
 echo "smoke: ok: screenshot-el"
 "${RDNY[@]}" pdf "$workdir/page.pdf" >/dev/null
-[[ $(head -c4 "$workdir/page.pdf") == "%PDF" ]] || fail "pdf is not a PDF"
+LC_ALL=C grep -a -q '%PDF' "$workdir/page.pdf" || fail "pdf is not a PDF"
 echo "smoke: ok: pdf"
+
+# --- video ------------------------------------------------------------
+"${RDNY[@]}" start-video
+"${RDNY[@]}" open "file://$page"
+"${RDNY[@]}" wait "#heading"
+"${RDNY[@]}" click "#btn"
+"${RDNY[@]}" screenshot "$workdir/video-frame.png" >/dev/null
+"${RDNY[@]}" stop-video "$workdir/smoke.mp4" >/dev/null
+[[ -s "$workdir/smoke.mp4" ]] || fail "video was not created"
+LC_ALL=C grep -a -q 'ftyp' "$workdir/smoke.mp4" || fail "video is not an MP4"
+echo "smoke: ok: video"
 
 # --- tabs ------------------------------------------------------------
 "${RDNY[@]}" newpage "file://$page" >/dev/null

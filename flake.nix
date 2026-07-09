@@ -63,6 +63,22 @@
       mkToolApp system "ci-sort" [(pkgsFor system).cargo (pkgsFor system).cargo-sort] ''
         cargo sort --workspace --check
       '';
+    ciSmoke = system:
+      mkToolApp system "ci-smoke" [(pkgsFor system).bash (pkgsFor system).coreutils (pkgsFor system).gnugrep] ''
+        exec bash scripts/ci-smoke.sh "$@"
+      '';
+    ciSmokeGate = system:
+      mkToolApp system "ci-smoke-gate" [(pkgsFor system).bash (pkgsFor system).coreutils] ''
+        exec bash scripts/ci-smoke-gate.sh "$@"
+      '';
+    ciSmokeFlowTest = system:
+      mkToolApp system "ci-smoke-flow-test" [(pkgsFor system).bash (pkgsFor system).coreutils (pkgsFor system).gnugrep] ''
+        exec bash scripts/ci-smoke-flow-test.sh "$@"
+      '';
+    ciReleaseFacing = system:
+      mkToolApp system "ci-release-facing" [(pkgsFor system).bash (pkgsFor system).coreutils (pkgsFor system).findutils (pkgsFor system).gawk (pkgsFor system).gnugrep (pkgsFor system).gnutar (pkgsFor system).nix] ''
+        exec bash scripts/ci-release-facing.sh "$@"
+      '';
     nixFormatter = system: let
       pkgs = pkgsFor system;
     in
@@ -86,6 +102,9 @@
         version = package.version;
         src = lib.cleanSource ./.;
         cargoLock.lockFile = ./Cargo.lock;
+        postInstall = ''
+          install -Dm644 LICENSE "$out/share/licenses/rdny/LICENSE"
+        '';
 
         meta = {
           description = package.description;
@@ -132,6 +151,10 @@
         ci-audit = ciAudit system;
         ci-deny = ciDeny system;
         ci-machete = ciMachete system;
+        ci-release-facing = ciReleaseFacing system;
+        ci-smoke = ciSmoke system;
+        ci-smoke-flow-test = ciSmokeFlowTest system;
+        ci-smoke-gate = ciSmokeGate system;
         ci-sort = ciSort system;
         release-artifact = (fleetApps system).releaseArtifact system;
       }
@@ -164,6 +187,22 @@
         ci-machete = {
           type = "app";
           program = "${self.packages.${system}.ci-machete}/bin/ci-machete";
+        };
+        ci-release-facing = {
+          type = "app";
+          program = "${self.packages.${system}.ci-release-facing}/bin/ci-release-facing";
+        };
+        ci-smoke = {
+          type = "app";
+          program = "${self.packages.${system}.ci-smoke}/bin/ci-smoke";
+        };
+        ci-smoke-flow-test = {
+          type = "app";
+          program = "${self.packages.${system}.ci-smoke-flow-test}/bin/ci-smoke-flow-test";
+        };
+        ci-smoke-gate = {
+          type = "app";
+          program = "${self.packages.${system}.ci-smoke-gate}/bin/ci-smoke-gate";
         };
         ci-sort = {
           type = "app";

@@ -23,6 +23,22 @@
       <li>See command shapes in <a href="examples.html">examples</a>.</li>
     </ul>
 
+    <h2>Installation</h2>
+    <p>rdny builds through the Nix flake for <code>x86_64-linux</code>, <code>aarch64-linux</code>, <code>x86_64-darwin</code>, and <code>aarch64-darwin</code>. SourceHut CI builds and browser-smokes Linux x86_64, runs a native Linux aarch64 build/test manifest, and evaluates Darwin attributes from Linux. Native Darwin CI is unavailable on SourceHut.</p>
+    <p>Release tarballs are Nix release outputs for matching Nix systems, not yet promised as portable binaries for non-Nix hosts. Verify and inspect them with:</p>
+    <pre><code>sha256sum -c rdny-v0.1.0-x86_64-linux.tar.gz.sha256
+tar -xzf rdny-v0.1.0-x86_64-linux.tar.gz
+rdny-v0.1.0-x86_64-linux/rdny --version</code></pre>
+    <p>With Nix, use <code>nix run git+https://git.sr.ht/~averagechris/rdny -- --help</code> or <code>nix profile install git+https://git.sr.ht/~averagechris/rdny#rdny</code>. From source, enter <code>nix develop</code> and run <code>cargo build --release</code>.</p>
+
+    <h2>Quickstart</h2>
+    <pre><code>rdny start
+rdny open https://example.com
+rdny title
+rdny text h1
+rdny screenshot example.png
+rdny stop</code></pre>
+
     <h2>Browser provisioning</h2>
     <p>The default rdny package does not bundle Chrome. At runtime rdny uses <code>RDNY_CHROME</code> when set, then checks well-known macOS and Linux Chrome/Chromium locations, then reports a clear error explaining how to provide a browser path. Use <code>RDNY_CHROME_ARGS</code> to append launch flags.</p>
     <p>Linux/Nix users can opt into a browser-containing closure with <code>nix run .#rdny-bundled</code>. That package wraps rdny with Nixpkgs <code>ungoogled-chromium</code> and <code>ffmpeg-headless</code>, setting <code>RDNY_CHROME</code> and <code>RDNY_FFMPEG</code> only as defaults. The bundled output is Linux-only; Darwin relies on system Chrome/Chromium discovery or an explicit <code>RDNY_CHROME</code>.</p>

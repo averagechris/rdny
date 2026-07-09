@@ -8,6 +8,82 @@ persistent-browser philosophy, but no code. Where rodney wraps
 [go-rod](https://github.com/go-rod/rod), rdny speaks the Chrome DevTools
 Protocol from Rust.
 
+## Installation
+
+rdny currently builds through the Nix flake for `x86_64-linux`,
+`aarch64-linux`, `x86_64-darwin`, and `aarch64-darwin`. SourceHut CI currently
+runs Linux x86_64 jobs for the full check and browser-smoke path. A separate
+native Linux aarch64 manifest builds and tests on SourceHut aarch64. Darwin
+attributes are evaluated from Linux, but native Darwin CI remains unavailable on
+SourceHut and is follow-up work for ticket #139.
+
+The most reproducible install path is Nix:
+
+```sh
+nix run git+https://git.sr.ht/~averagechris/rdny -- --help
+nix profile install git+https://git.sr.ht/~averagechris/rdny#rdny
+```
+
+Release artifacts contain `rdny`, `README.md`, `CHANGELOG.md`, and `LICENSE`.
+They are produced by the Nix release workflow for matching Nix systems and are
+not currently promised as portable, copy-to-`PATH` binaries for hosts without
+the required Nix runtime closure. For Linux x86_64 releases, CI extracts the
+tarball, verifies the SHA-256 sidecar, and runs `rdny --version` and
+`rdny --help` outside the build directory before upload. Inspect one with:
+
+```sh
+sha256sum -c rdny-v0.1.0-x86_64-linux.tar.gz.sha256
+tar -xzf rdny-v0.1.0-x86_64-linux.tar.gz
+rdny-v0.1.0-x86_64-linux/rdny --version
+```
+
+From source, use the Rust toolchain supplied by the flake or your local Cargo:
+
+```sh
+nix develop
+cargo build --release
+target/release/rdny --help
+```
+
+rdny needs a Chrome/Chromium-compatible browser for commands that launch or
+inspect pages. Browser-backed CI currently uses Nixpkgs `ungoogled-chromium` on
+Linux x86_64; local development has also been smoke-tested with Helium on macOS.
+Other Chrome/Chromium-compatible builds should work through the Chrome DevTools
+Protocol, but are not yet part of the automated support matrix. Video export
+additionally requires ffmpeg. Provide paths with
+`RDNY_CHROME` and `RDNY_FFMPEG`, config file entries, or use the Nix wrappers
+described below.
+
+SourceHut only uploads declared build artifacts for successful jobs. The smoke
+wrapper therefore records status and artifacts, prints captured smoke logs inline
+on failure, exits successfully, and lets a following gate task fail the build
+from the recorded status. Failed smoke evidence is retained in the SourceHut task
+log; successful smoke artifacts are also exposed as build artifacts.
+
+## Quickstart
+
+These commands use the packaged binary shape, so they work with `nix run`, a
+profile install, or `result/bin/rdny` after `nix build`:
+
+```sh
+rdny start
+rdny open https://example.com
+rdny title
+rdny text h1
+rdny screenshot example.png
+rdny stop
+```
+
+Use an isolated state directory while experimenting or in tests:
+
+```sh
+export RDNY_STATE_DIR="$(mktemp -d)"
+rdny start --label quickstart
+rdny open https://example.com
+rdny status
+rdny stop
+```
+
 ## Browser provisioning
 
 The default `rdny` package does not bundle a browser. At runtime rdny looks for
@@ -25,7 +101,7 @@ example:
 ```sh
 RDNY_CHROME=/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
 RDNY_CHROME_ARGS="--headless=new --disable-gpu" \
-rdny screenshot https://example.com out.png
+rdny start --label docs
 ```
 
 Linux/Nix users can opt into a browser-containing closure with

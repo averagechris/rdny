@@ -16,6 +16,7 @@ tasks:
       set -eu
       cd rdny
       nix build .#release-artifact --out-link result-release-artifact
+      nix run .#ci-release-facing
       mkdir -p ~/artifacts
       cp -p result-release-artifact/* ~/artifacts/
   - upload-and-refresh: |
