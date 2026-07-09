@@ -1,0 +1,5 @@
+[[pages]]
+slug = "chromium-remote-debugging"
+title = "Chromium remote debugging"
+description = "Expose a Chromium DevTools port so rdny can attach to your browser."
+file = "chromium-remote-debugging.md"
