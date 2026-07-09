@@ -1,5 +1,6 @@
 //! Command implementations, grouped to mirror the CLI surface.
 
+pub mod artifacts;
 pub mod cookie;
 pub mod instances;
 pub mod interact;

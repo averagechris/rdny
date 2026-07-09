@@ -76,7 +76,7 @@ pub enum Command {
     /// Print an element attribute.
     Attr { selector: String, name: String },
     /// Save the current page as PDF.
-    Pdf { file: Option<PathBuf> },
+    Pdf(ArtifactArgs),
     /// Evaluate JavaScript in the current page. Pass `-` or omit EXPRESSION to read stdin.
     Js {
         /// JavaScript expression to evaluate.
@@ -97,6 +97,9 @@ pub enum Command {
     /// Click and download a linked resource.
     Download {
         selector: String,
+        /// Replace an existing output file.
+        #[arg(long)]
+        force: bool,
         file: Option<PathBuf>,
     },
     /// Select an option by value.
@@ -122,6 +125,9 @@ pub enum Command {
     /// Capture an element screenshot.
     ScreenshotEl {
         selector: String,
+        /// Replace an existing output file.
+        #[arg(long)]
+        force: bool,
         file: Option<PathBuf>,
     },
     /// List open pages.
@@ -133,7 +139,7 @@ pub enum Command {
     /// Start collecting video frames from commands.
     StartVideo,
     /// Stop collecting frames and assemble a video file.
-    StopVideo { file: Option<PathBuf> },
+    StopVideo(ArtifactArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -271,6 +277,18 @@ pub struct ScreenshotArgs {
     /// Show help.
     #[arg(long, action = clap::ArgAction::Help)]
     pub help: Option<bool>,
+    /// Replace an existing output file.
+    #[arg(long)]
+    pub force: bool,
+    /// Output file.
+    pub file: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+pub struct ArtifactArgs {
+    /// Replace an existing output file.
+    #[arg(long)]
+    pub force: bool,
     /// Output file.
     pub file: Option<PathBuf>,
 }
@@ -402,7 +420,7 @@ pub fn run() -> Result<()> {
         Command::Html { selector } => commands::pageinfo::html(sess!(), selector.as_deref())?,
         Command::Text { selector } => commands::pageinfo::text(sess!(), &selector)?,
         Command::Attr { selector, name } => commands::pageinfo::attr(sess!(), &selector, &name)?,
-        Command::Pdf { file } => commands::pageinfo::pdf(sess!(), file.as_deref())?,
+        Command::Pdf(args) => commands::pageinfo::pdf(sess!(), args.file.as_deref(), args.force)?,
         Command::Js { expression } => {
             let stdin = std::io::stdin();
             let stdin_is_tty = stdin.is_terminal();
@@ -422,9 +440,11 @@ pub fn run() -> Result<()> {
         Command::Input { selector, text } => commands::interact::input(sess!(), &selector, &text)?,
         Command::Clear { selector } => commands::interact::clear(sess!(), &selector)?,
         Command::File { selector, path } => commands::interact::file(sess!(), &selector, &path)?,
-        Command::Download { selector, file } => {
-            commands::interact::download(sess!(), &selector, file.as_deref())?
-        }
+        Command::Download {
+            selector,
+            force,
+            file,
+        } => commands::interact::download(sess!(), &selector, file.as_deref(), force)?,
         Command::Select { selector, value } => {
             commands::interact::select(sess!(), &selector, &value)?
         }
@@ -443,21 +463,24 @@ pub fn run() -> Result<()> {
                 args.width,
                 args.height,
                 args.file.as_deref(),
+                args.force,
                 state.viewport.as_ref(),
             )?
         }
-        Command::ScreenshotEl { selector, file } => {
-            commands::shot::screenshot_el(sess!(), &selector, file.as_deref())?
-        }
+        Command::ScreenshotEl {
+            selector,
+            force,
+            file,
+        } => commands::shot::screenshot_el(sess!(), &selector, file.as_deref(), force)?,
         Command::Pages => commands::tabs::pages()?,
         Command::Page { index } => commands::tabs::page(index)?,
         Command::Newpage { url } => commands::tabs::newpage(url.as_deref())?,
         Command::StartVideo => commands::video::start()?,
-        Command::StopVideo { file } => {
+        Command::StopVideo(args) => {
             // Assemble even when the browser is gone: frames on disk
             // should never be stranded behind a dead session.
             let mut live = session::connect(cli.timeout).ok();
-            commands::video::stop(live.as_mut(), file.as_deref())?
+            commands::video::stop(live.as_mut(), args.file.as_deref(), args.force)?
         }
     }
     if drain_after_dispatch && let Some(session) = page_session.as_mut() {
@@ -679,10 +702,13 @@ mod tests {
         ));
         assert!(matches!(
             parse(&["rdny", "stop-video"]),
-            Command::StopVideo { file: None }
+            Command::StopVideo(ArtifactArgs {
+                file: None,
+                force: false
+            })
         ));
         assert!(
-            matches!(parse(&["rdny", "stop-video", "out.mp4"]), Command::StopVideo { file: Some(file) } if file.as_os_str() == "out.mp4")
+            matches!(parse(&["rdny", "stop-video", "out.mp4"]), Command::StopVideo(ArtifactArgs { file: Some(file), force: false }) if file.as_os_str() == "out.mp4")
         );
         assert!(matches!(
             parse(&["rdny", "logs", "--follow"]),
@@ -703,7 +729,7 @@ mod tests {
             Command::Page { index: 2 }
         ));
         assert!(
-            matches!(parse(&["rdny", "download", "a.link", "-"]), Command::Download { selector, file: Some(file) } if selector == "a.link" && file.as_os_str() == "-")
+            matches!(parse(&["rdny", "download", "a.link", "-"]), Command::Download { selector, file: Some(file), force: false } if selector == "a.link" && file.as_os_str() == "-")
         );
     }
 

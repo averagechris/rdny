@@ -1,6 +1,6 @@
 //! Screenshots: screenshot, screenshot-el.
 
-use std::{fs, path::Path};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -14,6 +14,7 @@ pub fn screenshot(
     width: Option<u32>,
     height: Option<u32>,
     file: Option<&Path>,
+    force: bool,
     persisted_viewport: Option<&ViewportOverride>,
 ) -> Result<()> {
     let override_set = width.is_some() || height.is_some();
@@ -34,7 +35,7 @@ pub fn screenshot(
 
     let result = (|| {
         let result = sess.call("Page.captureScreenshot", json!({"format": "png"}))?;
-        save_screenshot(result, file)
+        save_screenshot(result, file, force)
     })();
 
     if override_set {
@@ -45,7 +46,12 @@ pub fn screenshot(
 }
 
 /// Capture a screenshot clipped to the first selector match.
-pub fn screenshot_el(sess: &mut PageSession, selector: &str, file: Option<&Path>) -> Result<()> {
+pub fn screenshot_el(
+    sess: &mut PageSession,
+    selector: &str,
+    file: Option<&Path>,
+    force: bool,
+) -> Result<()> {
     let object_id = sess.element(selector)?;
     let _ = sess.call("DOM.scrollIntoViewIfNeeded", json!({"objectId": object_id}));
     let result = sess.call("DOM.getBoxModel", json!({"objectId": object_id}))?;
@@ -65,17 +71,18 @@ pub fn screenshot_el(sess: &mut PageSession, selector: &str, file: Option<&Path>
             "captureBeyondViewport": true,
         }),
     )?;
-    save_screenshot(result, file)
+    save_screenshot(result, file, force)
 }
 
-fn save_screenshot(result: Value, file: Option<&Path>) -> Result<()> {
+fn save_screenshot(result: Value, file: Option<&Path>, force: bool) -> Result<()> {
     let data = result["data"]
         .as_str()
         .context("screenshot response missing data")?;
     let bytes = crate::commands::decode_base64(data)?;
     let default = Path::new("screenshot.png");
     let path = file.unwrap_or(default);
-    fs::write(path, bytes).with_context(|| format!("writing screenshot {}", path.display()))?;
+    crate::commands::artifacts::write_artifact(path, &bytes, force)
+        .with_context(|| format!("writing screenshot {}", path.display()))?;
     println!("saved {}", path.display());
     Ok(())
 }

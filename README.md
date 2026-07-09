@@ -46,6 +46,18 @@ from configuration or `PATH`; set `RDNY_FFMPEG` to force a specific binary:
 RDNY_FFMPEG=/opt/homebrew/bin/ffmpeg rdny stop-video video.mp4
 ```
 
+Commands that create artifacts (`download`, `pdf`, `screenshot`,
+`screenshot-el`, and `stop-video`) refuse to overwrite existing paths by
+default, including symlinks. Pass `--force` to replace an output intentionally.
+When `download` infers a filename from page-controlled URLs, rdny keeps the file
+in the current directory and sanitizes separators, dotfiles, control characters,
+`.`/`..`, and overlong names before creating it on Linux/macOS.
+
+`rdny file SELECTOR -` reads upload data from stdin into a private temporary file
+with owner-only permissions, keeps it until Chrome accepts the upload, and then
+removes it on success or normal error. Stdin uploads are limited to 64 MiB; pass
+a real file path for larger payloads.
+
 All Nix systems can opt into an ffmpeg-containing closure without a bundled
 browser using `.#rdny-ffmpeg`:
 

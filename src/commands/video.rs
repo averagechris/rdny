@@ -23,7 +23,7 @@ pub fn start() -> Result<()> {
     })
 }
 
-pub fn stop(session: Option<&mut PageSession>, output: Option<&Path>) -> Result<()> {
+pub fn stop(session: Option<&mut PageSession>, output: Option<&Path>, force: bool) -> Result<()> {
     if let Some(session) = session {
         let _ = session.call("Page.stopScreencast", serde_json::json!({}));
         session.drain_events(std::time::Duration::from_millis(300))?;
@@ -49,27 +49,40 @@ pub fn stop(session: Option<&mut PageSession>, output: Option<&Path>) -> Result<
 
     let config = config::load()?;
     let ffmpeg = config::resolve_ffmpeg(std::env::var_os("RDNY_FFMPEG"), &config);
-    let status = Command::new(&ffmpeg)
+    assemble_video(&ffmpeg, &frames_dir, &list_path, output, force)?;
+    state::remove_frames_dir().context("removing video frames directory")?;
+    state::update_if_present(|state| {
+        state.recording = false;
+        Ok(())
+    })?;
+    println!("{}", output.display());
+    Ok(())
+}
+
+fn assemble_video(
+    ffmpeg: &Path,
+    frames_dir: &state::SecureDir,
+    list_path: &Path,
+    output: &Path,
+    force: bool,
+) -> Result<()> {
+    let reservation = crate::commands::artifacts::ReservedArtifact::reserve(output, force)?;
+    let status = Command::new(ffmpeg)
         .args([OsStr::new("-loglevel"), OsStr::new("error")])
         .args([OsStr::new("-y"), OsStr::new("-f"), OsStr::new("concat")])
         .args([OsStr::new("-safe"), OsStr::new("0"), OsStr::new("-i")])
-        .arg(&list_path)
+        .arg(list_path)
         .args([
             OsStr::new("-vf"),
             OsStr::new("pad=ceil(iw/2)*2:ceil(ih/2)*2"),
         ])
         .args([OsStr::new("-pix_fmt"), OsStr::new("yuv420p")])
-        .arg(output)
+        .arg(reservation.tmp_path())
         .status();
 
     match status {
         Ok(status) if status.success() => {
-            state::remove_frames_dir().context("removing video frames directory")?;
-            state::update_if_present(|state| {
-                state.recording = false;
-                Ok(())
-            })?;
-            println!("{}", output.display());
+            reservation.finalize(force)?;
             Ok(())
         }
         Ok(status) => Err(hint_error(
@@ -160,6 +173,7 @@ fn read_frames(frames_dir: &state::SecureDir) -> Result<Vec<(f64, PathBuf)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn handles_screencast_frame() {
@@ -209,6 +223,63 @@ mod tests {
         assert_eq!(
             concat_list(&[(1.0, PathBuf::from("one.jpg"))]),
             "file 'one.jpg'\nduration 0.100000\nfile 'one.jpg'\n"
+        );
+    }
+
+    #[test]
+    fn stop_video_passes_mp4_temp_output_and_publishes_atomically() {
+        let bin_dir = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let output = work.path().join("out.mp4");
+        let ffmpeg = bin_dir.path().join("ffmpeg");
+        fs::write(
+            &ffmpeg,
+            "#!/bin/sh\nfor out do :; done\ncase \"$out\" in *.mp4) printf video > \"$out\" ;; *) exit 44 ;; esac\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&ffmpeg, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let frames = crate::state::open_store_at(work.path())
+            .unwrap()
+            .subdir("frames")
+            .unwrap();
+        frames.write_file("1.000000.jpg", b"jpg").unwrap();
+        let list_path = frames.path().join("frames.txt");
+        fs::write(&list_path, "file '1.000000.jpg'\n").unwrap();
+        assemble_video(&ffmpeg, &frames, &list_path, &output, false).unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"video");
+        assert!(frames.path().exists());
+    }
+
+    #[test]
+    fn failed_ffmpeg_removes_reserved_temp_and_preserves_output() {
+        let bin_dir = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let output = work.path().join("out.mp4");
+        fs::write(&output, b"old").unwrap();
+        let ffmpeg = bin_dir.path().join("ffmpeg");
+        fs::write(&ffmpeg, "#!/bin/sh\nexit 44\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&ffmpeg, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let frames = crate::state::open_store_at(work.path())
+            .unwrap()
+            .subdir("frames")
+            .unwrap();
+        let list_path = frames.path().join("frames.txt");
+        fs::write(&list_path, "file '1.000000.jpg'\n").unwrap();
+        assert!(assemble_video(&ffmpeg, &frames, &list_path, &output, true).is_err());
+        assert_eq!(fs::read(&output).unwrap(), b"old");
+        assert!(
+            !fs::read_dir(work.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().contains("rdny-"))
         );
     }
 }

@@ -1,14 +1,13 @@
 //! Interaction: js, click, input, clear, file, download, select,
 //! submit, hover, focus.
 
-use std::fs;
-use std::io::{self, Read as _, Write as _};
-use std::path::{Path, PathBuf};
+use std::io::{self, Write as _};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde_json::json;
 
-use crate::commands::{decode_base64, print_value};
+use crate::commands::{artifacts, decode_base64, print_value};
 use crate::session::PageSession;
 
 /// Evaluate a JavaScript expression and print its result.
@@ -49,7 +48,15 @@ pub fn clear(_sess: &mut PageSession, _selector: &str) -> Result<()> {
 
 /// Set a file on a file input; path "-" reads the payload from stdin.
 pub fn file(_sess: &mut PageSession, _selector: &str, _path: &Path) -> Result<()> {
-    let path = upload_path(_path)?;
+    let upload;
+    let path = if _path == Path::new("-") {
+        upload = artifacts::stdin_upload(io::stdin())?;
+        upload.path().to_path_buf()
+    } else {
+        _path
+            .canonicalize()
+            .with_context(|| format!("canonicalizing {}", _path.display()))?
+    };
     let id = _sess.element(_selector)?;
     _sess.call(
         "DOM.setFileInputFiles",
@@ -60,7 +67,12 @@ pub fn file(_sess: &mut PageSession, _selector: &str, _path: &Path) -> Result<()
 
 /// Download the href/src target of the first selector match; file "-"
 /// (or no file) streams to stdout.
-pub fn download(_sess: &mut PageSession, _selector: &str, _file: Option<&Path>) -> Result<()> {
+pub fn download(
+    _sess: &mut PageSession,
+    _selector: &str,
+    _file: Option<&Path>,
+    force: bool,
+) -> Result<()> {
     let id = _sess.element(_selector)?;
     let url_value = _sess.call_on(
         &id,
@@ -81,12 +93,12 @@ pub fn download(_sess: &mut PageSession, _selector: &str, _file: Option<&Path>) 
     match _file {
         Some(path) if path == Path::new("-") => io::stdout().lock().write_all(&bytes)?,
         Some(path) => {
-            fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
+            artifacts::write_artifact(path, &bytes, force)?;
             println!("saved {}", path.display());
         }
         None => {
             let name = filename_from_url(&url);
-            fs::write(&name, bytes).with_context(|| format!("writing {name}"))?;
+            artifacts::write_artifact(Path::new(&name), &bytes, force)?;
             println!("saved {name}");
         }
     }
@@ -146,19 +158,6 @@ fn dispatch_mouse(
     Ok(())
 }
 
-fn upload_path(path: &Path) -> Result<PathBuf> {
-    if path == Path::new("-") {
-        let mut bytes = Vec::new();
-        io::stdin().read_to_end(&mut bytes)?;
-        let tmp = std::env::temp_dir().join("rdny-stdin-upload");
-        fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-        Ok(tmp)
-    } else {
-        path.canonicalize()
-            .with_context(|| format!("canonicalizing {}", path.display()))
-    }
-}
-
 fn filename_from_url(url: &str) -> String {
     let without_fragment = url.split('#').next().unwrap_or(url);
     let without_query = without_fragment
@@ -170,11 +169,7 @@ fn filename_from_url(url: &str) -> String {
         .map(|(_, rest)| rest.find('/').map(|i| &rest[i..]).unwrap_or(""))
         .unwrap_or(without_query);
     let name = path.rsplit('/').next().unwrap_or_default();
-    if name.is_empty() {
-        "download.bin".to_string()
-    } else {
-        name.to_string()
-    }
+    artifacts::sanitize_download_name(name)
 }
 
 #[cfg(test)]

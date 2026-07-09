@@ -57,7 +57,7 @@ pub fn attr(sess: &mut PageSession, selector: &str, name: &str) -> Result<()> {
 }
 
 /// Save the page as PDF (default file: page.pdf).
-pub fn pdf(sess: &mut PageSession, file: Option<&Path>) -> Result<()> {
+pub fn pdf(sess: &mut PageSession, file: Option<&Path>, force: bool) -> Result<()> {
     let path = file
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("page.pdf"));
@@ -66,7 +66,8 @@ pub fn pdf(sess: &mut PageSession, file: Option<&Path>) -> Result<()> {
         .as_str()
         .context("Page.printToPDF response missing data")?;
     let bytes = crate::commands::decode_base64(data)?;
-    std::fs::write(&path, bytes).with_context(|| format!("writing PDF to {}", path.display()))?;
+    crate::commands::artifacts::write_artifact(&path, &bytes, force)
+        .with_context(|| format!("writing PDF to {}", path.display()))?;
     println!("saved {}", path.display());
     Ok(())
 }
