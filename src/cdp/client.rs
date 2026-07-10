@@ -1,10 +1,11 @@
 //! Blocking CDP WebSocket client (flat session protocol).
 
 use std::collections::VecDeque;
-use std::io;
+use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use crate::session::Deadline;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use tungstenite::client::IntoClientRequest;
@@ -17,7 +18,14 @@ use tungstenite::{Message, WebSocket};
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_WEBSOCKET_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_WEBSOCKET_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_PIPE_MESSAGE_BYTES: usize = 100 * 1024 * 1024;
 pub const MAX_QUEUED_EVENTS: usize = 1024;
+
+trait CdpTransport: Send {
+    fn send_json(&mut self, value: &Value, deadline: Deadline) -> Result<()>;
+    fn recv_json(&mut self, deadline: Deadline) -> Result<Value>;
+    fn close(&mut self) -> Result<()>;
+}
 
 fn url_host_is_loopback(url: &url::Url) -> bool {
     match url.host() {
@@ -85,7 +93,7 @@ pub struct Event {
 
 /// Blocking connection to a browser WebSocket debugger URL.
 pub struct CdpClient {
-    socket: WebSocket<MaybeTlsStream<TcpStream>>,
+    transport: Box<dyn CdpTransport>,
     next_id: u64,
     events: VecDeque<Event>,
     timeout: Duration,
@@ -95,11 +103,11 @@ impl CdpClient {
     /// Connect to a bounded ws:// debugger URL (browser-level endpoint).
     #[cfg(test)]
     pub fn connect(ws_url: &str) -> Result<Self> {
-        Self::connect_until(ws_url, Instant::now() + DEFAULT_TIMEOUT)
+        Self::connect_until(ws_url, Deadline::after(DEFAULT_TIMEOUT))
     }
 
     /// Connect TCP and complete the WebSocket handshake before `deadline`.
-    pub fn connect_until(ws_url: &str, deadline: Instant) -> Result<Self> {
+    pub fn connect_until(ws_url: &str, deadline: Deadline) -> Result<Self> {
         let parsed = url::Url::parse(ws_url).context("malformed browser WebSocket URL")?;
         if parsed.scheme() != "ws" || !url_host_is_loopback(&parsed) {
             bail!(
@@ -169,10 +177,31 @@ impl CdpClient {
             stream.set_nonblocking(false)?;
         }
         Ok(Self {
-            socket,
+            transport: Box::new(WebSocketTransport { socket }),
             next_id: 1,
             events: VecDeque::new(),
             timeout: DEFAULT_TIMEOUT,
+        })
+    }
+
+    #[cfg(unix)]
+    pub fn from_pipe_fds(read_fd: std::os::fd::OwnedFd, write_fd: std::os::fd::OwnedFd) -> Self {
+        Self {
+            transport: Box::new(PipeTransport::from_owned_fds(read_fd, write_fd)),
+            next_id: 1,
+            events: VecDeque::new(),
+            timeout: DEFAULT_TIMEOUT,
+        }
+    }
+
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    pub unsafe fn from_inherited_pipe_fds() -> Self {
+        use std::os::fd::FromRawFd;
+        // Chrome remote-debugging-pipe uses inherited fd3 for browser->client
+        // reads and fd4 for client->browser writes.
+        Self::from_pipe_fds(unsafe { std::os::fd::OwnedFd::from_raw_fd(3) }, unsafe {
+            std::os::fd::OwnedFd::from_raw_fd(4)
         })
     }
 
@@ -188,7 +217,7 @@ impl CdpClient {
     /// are buffered for `next_event`.
     #[cfg(test)]
     pub fn call(&mut self, session_id: Option<&str>, method: &str, params: Value) -> Result<Value> {
-        self.call_until(session_id, method, params, Instant::now() + self.timeout)
+        self.call_until(session_id, method, params, Deadline::after(self.timeout))
     }
 
     /// Send a CDP command and wait for its response within an absolute deadline.
@@ -197,7 +226,7 @@ impl CdpClient {
         session_id: Option<&str>,
         method: &str,
         params: Value,
-        deadline: Instant,
+        deadline: Deadline,
     ) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
@@ -211,32 +240,12 @@ impl CdpClient {
             request["sessionId"] = Value::String(session_id.to_string());
         }
 
-        remaining(deadline, "sending CDP command")?;
-        self.set_nonblocking(true)?;
-        let send_result = self.socket.send(Message::Text(request.to_string().into()));
-        let send_result = match send_result {
-            Ok(()) => Ok(()),
-            Err(tungstenite::Error::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {
-                loop {
-                    remaining(deadline, "sending CDP command")?;
-                    match self.socket.flush() {
-                        Ok(()) => break Ok(()),
-                        Err(tungstenite::Error::Io(error))
-                            if error.kind() == io::ErrorKind::WouldBlock =>
-                        {
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                        Err(error) => break Err(error),
-                    }
-                }
-            }
-            Err(error) => Err(error),
-        };
-        self.set_nonblocking(false)?;
-        send_result.with_context(|| format!("sending CDP command {method}"))?;
+        self.transport
+            .send_json(&request, deadline)
+            .with_context(|| format!("sending CDP command {method}"))?;
 
         loop {
-            let msg = match self.read_with_deadline(deadline) {
+            let value = match self.transport.recv_json(deadline) {
                 Ok(msg) => msg,
                 Err(err) if is_timeout_error(&err) => {
                     bail!("timed out waiting for {method} before command deadline")
@@ -244,9 +253,6 @@ impl CdpClient {
                 Err(err) => {
                     return Err(err).with_context(|| format!("reading response for {method}"));
                 }
-            };
-            let Some(value) = self.message_to_json(msg, deadline)? else {
-                continue;
             };
             if value.get("method").is_some() {
                 if self.events.len() >= MAX_QUEUED_EVENTS {
@@ -273,10 +279,14 @@ impl CdpClient {
     /// Attach to a target with `flatten: true`; returns the sessionId.
     #[cfg(test)]
     pub fn attach_to_target(&mut self, target_id: &str) -> Result<String> {
-        self.attach_to_target_until(target_id, Instant::now() + self.timeout)
+        self.attach_to_target_until(target_id, Deadline::after(self.timeout))
     }
 
-    pub fn attach_to_target_until(&mut self, target_id: &str, deadline: Instant) -> Result<String> {
+    pub fn attach_to_target_until(
+        &mut self,
+        target_id: &str,
+        deadline: Deadline,
+    ) -> Result<String> {
         let result = self.call_until(
             None,
             "Target.attachToTarget",
@@ -293,30 +303,27 @@ impl CdpClient {
     /// Return the next event (buffered or read from the socket),
     /// Ok(None) once `timeout` elapses with no event.
     pub fn next_event(&mut self, timeout: Duration) -> Result<Option<Event>> {
-        self.next_event_until(Instant::now() + timeout)
+        self.next_event_until(Deadline::after(timeout))
     }
 
     /// Return the next event before an absolute deadline. This lets callers
     /// share one timeout budget across command calls and event polling.
-    pub fn next_event_until(&mut self, deadline: Instant) -> Result<Option<Event>> {
-        if Instant::now() >= deadline {
+    pub fn next_event_until(&mut self, deadline: Deadline) -> Result<Option<Event>> {
+        if deadline.expired() {
             return Ok(None);
         }
         if let Some(event) = self.events.pop_front() {
-            if Instant::now() >= deadline {
+            if deadline.expired() {
                 self.events.push_front(event);
                 return Ok(None);
             }
             return Ok(Some(event));
         }
         loop {
-            let msg = match self.read_with_deadline(deadline) {
+            let value = match self.transport.recv_json(deadline) {
                 Ok(msg) => msg,
                 Err(err) if is_timeout_error(&err) => return Ok(None),
                 Err(err) => return Err(err).context("reading next CDP event"),
-            };
-            let Some(value) = self.message_to_json(msg, deadline)? else {
-                continue;
             };
             if value.get("method").is_some() {
                 return Ok(Some(event_from_value(value)?));
@@ -328,16 +335,21 @@ impl CdpClient {
     pub fn next_buffered_event(&mut self) -> Option<Event> {
         self.events.pop_front()
     }
+}
 
-    fn read_with_deadline(&mut self, deadline: Instant) -> Result<Message> {
-        let now = Instant::now();
-        if now >= deadline {
-            return Err(anyhow!(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "deadline elapsed"
-            )));
-        }
-        let remaining = deadline - now;
+impl Drop for CdpClient {
+    fn drop(&mut self) {
+        let _ = self.transport.close();
+    }
+}
+
+struct WebSocketTransport {
+    socket: WebSocket<MaybeTlsStream<TcpStream>>,
+}
+
+impl WebSocketTransport {
+    fn read_with_deadline(&mut self, deadline: Deadline) -> Result<Message> {
+        let remaining = remaining(deadline, "reading WebSocket message")?;
         self.set_read_timeout(Some(remaining))?;
         self.set_write_timeout(Some(remaining))?;
         self.socket.read().map_err(Into::into)
@@ -364,7 +376,7 @@ impl CdpClient {
         }
     }
 
-    fn message_to_json(&mut self, msg: Message, deadline: Instant) -> Result<Option<Value>> {
+    fn message_to_json(&mut self, msg: Message, deadline: Deadline) -> Result<Option<Value>> {
         match msg {
             Message::Text(text) => Ok(Some(
                 serde_json::from_str(&text).context("parsing CDP JSON frame")?,
@@ -380,9 +392,159 @@ impl CdpClient {
     }
 }
 
-fn remaining(deadline: Instant, operation: &str) -> Result<Duration> {
+impl CdpTransport for WebSocketTransport {
+    fn send_json(&mut self, value: &Value, deadline: Deadline) -> Result<()> {
+        remaining(deadline, "sending CDP command")?;
+        self.set_nonblocking(true)?;
+        let send_result = self.socket.send(Message::Text(value.to_string().into()));
+        let send_result = match send_result {
+            Ok(()) => Ok(()),
+            Err(tungstenite::Error::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+                loop {
+                    remaining(deadline, "sending CDP command")?;
+                    match self.socket.flush() {
+                        Ok(()) => break Ok(()),
+                        Err(tungstenite::Error::Io(error))
+                            if error.kind() == io::ErrorKind::WouldBlock =>
+                        {
+                            deadline.sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => break Err(error),
+                    }
+                }
+            }
+            Err(error) => Err(error),
+        };
+        self.set_nonblocking(false)?;
+        send_result.map_err(Into::into)
+    }
+
+    fn recv_json(&mut self, deadline: Deadline) -> Result<Value> {
+        loop {
+            let msg = self.read_with_deadline(deadline)?;
+            if let Some(value) = self.message_to_json(msg, deadline)? {
+                return Ok(value);
+            }
+        }
+    }
+
+    fn close(&mut self) -> Result<()> {
+        let _ = self.socket.close(None);
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+struct PipeTransport {
+    read: std::fs::File,
+    write: std::fs::File,
+    buf: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl PipeTransport {
+    fn from_owned_fds(read_fd: std::os::fd::OwnedFd, write_fd: std::os::fd::OwnedFd) -> Self {
+        Self {
+            read: std::fs::File::from(read_fd),
+            write: std::fs::File::from(write_fd),
+            buf: Vec::new(),
+        }
+    }
+
+    fn wait(fd: std::os::fd::RawFd, events: libc::c_short, deadline: Deadline) -> io::Result<()> {
+        let Some(remaining) = deadline
+            .remaining()
+            .filter(|remaining| !remaining.is_zero())
+        else {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "deadline elapsed"));
+        };
+        let timeout = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let mut pfd = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, timeout) };
+        if rc == 0 {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "deadline elapsed"));
+        }
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if pfd.revents & libc::POLLNVAL != 0 {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "pipe fd invalid"));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl CdpTransport for PipeTransport {
+    fn send_json(&mut self, value: &Value, deadline: Deadline) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        let mut bytes = value.to_string().into_bytes();
+        bytes.push(0);
+        let mut written = 0;
+        while written < bytes.len() {
+            Self::wait(self.write.as_raw_fd(), libc::POLLOUT, deadline)?;
+            match self.write.write(&bytes[written..]) {
+                Ok(0) => bail!("pipe write returned zero bytes"),
+                Ok(n) => written += n,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(e).context("writing CDP pipe message"),
+            }
+        }
+        self.write.flush().context("flushing CDP pipe message")
+    }
+
+    fn recv_json(&mut self, deadline: Deadline) -> Result<Value> {
+        use std::os::fd::AsRawFd;
+        loop {
+            if let Some(pos) = self.buf.iter().position(|b| *b == 0) {
+                let frame: Vec<u8> = self.buf.drain(..=pos).take(pos).collect();
+                return serde_json::from_slice(&frame).context("parsing CDP pipe JSON message");
+            }
+            if self.buf.len() >= MAX_PIPE_MESSAGE_BYTES {
+                bail!("CDP pipe message exceeds {MAX_PIPE_MESSAGE_BYTES} bytes");
+            }
+            Self::wait(self.read.as_raw_fd(), libc::POLLIN, deadline)?;
+            let mut chunk = [0u8; 8192];
+            match self.read.read(&mut chunk) {
+                Ok(0) => bail!("CDP pipe closed by browser"),
+                Ok(n) => {
+                    if self.buf.len() + n > MAX_PIPE_MESSAGE_BYTES {
+                        bail!("CDP pipe message exceeds {MAX_PIPE_MESSAGE_BYTES} bytes");
+                    }
+                    self.buf.extend_from_slice(&chunk[..n]);
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(e).context("reading CDP pipe message"),
+            }
+        }
+    }
+
+    fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+fn remaining(deadline: Deadline, operation: &str) -> Result<Duration> {
     deadline
-        .checked_duration_since(Instant::now())
+        .remaining()
         .filter(|remaining| !remaining.is_zero())
         .with_context(|| format!("deadline elapsed while {operation}"))
 }
@@ -427,6 +589,7 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::thread::{self, JoinHandle};
+    use std::time::Instant;
 
     fn serve<F>(script: F) -> (String, JoinHandle<()>)
     where
@@ -541,7 +704,12 @@ mod tests {
         });
         let mut client = CdpClient::connect(&url).unwrap();
         client.call(None, "Page.navigate", json!({})).unwrap();
-        assert!(client.next_event_until(Instant::now()).unwrap().is_none());
+        assert!(
+            client
+                .next_event_until(Deadline::at(Instant::now()))
+                .unwrap()
+                .is_none()
+        );
         assert!(
             client
                 .next_event(Duration::from_millis(50))
@@ -563,7 +731,7 @@ mod tests {
                 None,
                 "Slow.absolute",
                 json!({}),
-                Instant::now() + Duration::from_millis(50),
+                Deadline::after(Duration::from_millis(50)),
             )
             .unwrap_err();
         assert!(format!("{err}").contains("deadline"));
@@ -581,7 +749,7 @@ mod tests {
         let started = Instant::now();
         let result = CdpClient::connect_until(
             &format!("ws://127.0.0.1:{port}"),
-            started + Duration::from_millis(60),
+            Deadline::at(started + Duration::from_millis(60)),
         );
         assert!(result.is_err());
         assert!(started.elapsed() < Duration::from_millis(250));
@@ -603,7 +771,7 @@ mod tests {
         });
         let mut client = CdpClient::connect(&url).unwrap();
         let started = Instant::now();
-        let deadline = started + Duration::from_millis(85);
+        let deadline = Deadline::at(started + Duration::from_millis(85));
         client
             .call_until(None, "First", json!({}), deadline)
             .unwrap();
@@ -755,5 +923,172 @@ mod tests {
         assert!(format!("{error:#}").contains("Message too long"));
         drop(client);
         handle.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    fn pipe_client_and_browser() -> (
+        CdpClient,
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+    ) {
+        use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+        use std::os::unix::net::UnixStream;
+        let (browser_write, client_read) = UnixStream::pair().unwrap();
+        let (client_write, browser_read) = UnixStream::pair().unwrap();
+        client_read.set_nonblocking(false).unwrap();
+        client_write.set_nonblocking(false).unwrap();
+        let client = CdpClient::from_pipe_fds(
+            unsafe { OwnedFd::from_raw_fd(client_read.into_raw_fd()) },
+            unsafe { OwnedFd::from_raw_fd(client_write.into_raw_fd()) },
+        );
+        (client, browser_read, browser_write)
+    }
+
+    #[cfg(unix)]
+    fn read_pipe_json(read: &mut std::os::unix::net::UnixStream) -> Value {
+        let mut buf = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            read.read_exact(&mut byte).unwrap();
+            if byte[0] == 0 {
+                break;
+            }
+            buf.push(byte[0]);
+        }
+        serde_json::from_slice(&buf).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pipe_call_uses_nul_delimited_json() {
+        let (mut client, mut browser_read, mut browser_write) = pipe_client_and_browser();
+        let handle = thread::spawn(move || {
+            let request = read_pipe_json(&mut browser_read);
+            assert_eq!(request["method"], "Browser.getVersion");
+            browser_write
+                .write_all(br#"{"id":1,"result":{"product":"Fake/1"}}"#)
+                .unwrap();
+            browser_write.write_all(&[0]).unwrap();
+        });
+        assert_eq!(
+            client.call(None, "Browser.getVersion", json!({})).unwrap(),
+            json!({"product":"Fake/1"})
+        );
+        handle.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pipe_handles_partial_and_coalesced_reads() {
+        let (mut client, mut browser_read, mut browser_write) = pipe_client_and_browser();
+        let handle = thread::spawn(move || {
+            let _ = read_pipe_json(&mut browser_read);
+            browser_write.write_all(br#"{"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"t"}}}"#).unwrap();
+            browser_write.write_all(&[0]).unwrap();
+            browser_write
+                .write_all(br#"{"id":1,"result":{"targetInfos":[]}}"#)
+                .unwrap();
+            browser_write.write_all(&[0]).unwrap();
+        });
+        assert_eq!(
+            client.call(None, "Target.getTargets", json!({})).unwrap(),
+            json!({"targetInfos":[]})
+        );
+        assert_eq!(
+            client.next_buffered_event().unwrap().method,
+            "Target.targetCreated"
+        );
+        handle.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pipe_eof_and_timeout_are_reported() {
+        let (mut client, mut browser_read, browser_write) = pipe_client_and_browser();
+        drop(browser_write);
+        let _ = thread::spawn(move || {
+            let _ = read_pipe_json(&mut browser_read);
+        });
+        let err = client.call(None, "Browser.close", json!({})).unwrap_err();
+        assert!(format!("{err:#}").contains("closed"));
+    }
+
+    #[cfg(all(test, unix, any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    #[ignore = "requires Chrome/Chromium in PATH and launches a real browser with --remote-debugging-pipe"]
+    fn real_chrome_remote_debugging_pipe_smoke() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+        use std::process::{Child, Command, Stdio};
+        let chrome = std::env::var("RDNY_CHROME").unwrap_or_else(|_| "chromium".to_string());
+
+        fn wait_exited(child: &mut Child) {
+            let deadline = Deadline::after(Duration::from_secs(10));
+            loop {
+                if child.try_wait().unwrap().is_some() {
+                    return;
+                }
+                assert!(!deadline.expired(), "Chrome did not exit after pipe close");
+                deadline.sleep(Duration::from_millis(50));
+            }
+        }
+
+        let launch = || {
+            let temp = tempfile::tempdir().unwrap();
+            let mut to_chrome = [0; 2];
+            let mut from_chrome = [0; 2];
+            unsafe {
+                assert_eq!(libc::pipe(to_chrome.as_mut_ptr()), 0);
+                assert_eq!(libc::pipe(from_chrome.as_mut_ptr()), 0);
+            }
+            let mut command = Command::new(&chrome);
+            command
+                .arg("--headless=new")
+                .arg("--remote-debugging-pipe")
+                .arg(format!("--user-data-dir={}", temp.path().display()))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::dup2(to_chrome[0], 3) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if libc::dup2(from_chrome[1], 4) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let child = command.spawn().unwrap();
+            unsafe {
+                libc::close(to_chrome[0]);
+                libc::close(from_chrome[1]);
+            }
+            let mut client =
+                CdpClient::from_pipe_fds(unsafe { OwnedFd::from_raw_fd(from_chrome[0]) }, unsafe {
+                    OwnedFd::from_raw_fd(to_chrome[1])
+                });
+            client.set_timeout(Duration::from_secs(10));
+            (temp, child, client)
+        };
+
+        let (_temp, mut child, mut client) = launch();
+        client.set_timeout(Duration::from_secs(10));
+        let version = client.call(None, "Browser.getVersion", json!({})).unwrap();
+        assert!(version.get("product").is_some());
+        let targets = client.call(None, "Target.getTargets", json!({})).unwrap();
+        assert!(targets.get("targetInfos").is_some());
+        let created = client
+            .call(None, "Target.createTarget", json!({"url":"about:blank"}))
+            .unwrap();
+        assert!(created.get("targetId").is_some());
+        let _ = client.call(None, "Browser.close", json!({})).unwrap();
+        drop(client);
+        wait_exited(&mut child);
+
+        let (_temp, mut child, client) = launch();
+        drop(client);
+        wait_exited(&mut child);
     }
 }

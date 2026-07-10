@@ -289,24 +289,19 @@ pub fn connect(deadline: Deadline, timeout: Duration) -> Result<PageSession> {
             Ok(())
         })?;
     }
-    let mut client = CdpClient::connect_until(&state.ws_url, deadline.instant())
+    let mut client = CdpClient::connect_until(&state.ws_url, deadline)
         .with_context(|| format!("connecting to browser websocket {}", state.ws_url))?;
     client.set_timeout(timeout);
-    let session_id = client.attach_to_target_until(&target_id, deadline.instant())?;
+    let session_id = client.attach_to_target_until(&target_id, deadline)?;
     // Enable Network once per attached page session so waitidle can observe
     // requests that began before the wait command but after rdny attached.
-    let _ = client.call_until(
-        Some(&session_id),
-        "Network.enable",
-        json!({}),
-        deadline.instant(),
-    );
+    let _ = client.call_until(Some(&session_id), "Network.enable", json!({}), deadline);
     if let Some(viewport) = &state.viewport {
         client.call_until(
             Some(&session_id),
             "Emulation.setDeviceMetricsOverride",
             viewport.cdp_params(),
-            deadline.instant(),
+            deadline,
         )?;
     }
     let frames_dir = if state.recording {
@@ -316,7 +311,7 @@ pub fn connect(deadline: Deadline, timeout: Duration) -> Result<PageSession> {
             Some(&session_id),
             "Page.startScreencast",
             json!({"format": "jpeg", "quality": 70, "everyNthFrame": 1}),
-            deadline.instant(),
+            deadline,
         )?;
         Some(frames_dir)
     } else {
@@ -368,7 +363,7 @@ impl PageSession {
             bail!("timed out before {method}");
         }
         self.client
-            .call_until(Some(&self.session_id), method, params, deadline.instant())
+            .call_until(Some(&self.session_id), method, params, deadline)
     }
 
     pub fn ensure_page_instrumentation(&mut self) -> Result<()> {
@@ -455,7 +450,7 @@ impl PageSession {
             if deadline.expired() {
                 return Ok(None);
             }
-            let Some(event) = self.client.next_event_until(deadline.instant())? else {
+            let Some(event) = self.client.next_event_until(deadline)? else {
                 return Ok(None);
             };
             if event.session_id.as_deref() != Some(self.session_id.as_str()) {

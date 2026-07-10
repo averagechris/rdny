@@ -281,9 +281,9 @@ pub fn stop_until(state: &SessionState, deadline: Deadline) -> Result<StopOutcom
 }
 
 fn close_browser(ws_url: &str, deadline: Deadline) -> Result<()> {
-    let mut client = CdpClient::connect_until(ws_url, deadline.instant())?;
+    let mut client = CdpClient::connect_until(ws_url, deadline)?;
     client
-        .call_until(None, "Browser.close", json!({}), deadline.instant())
+        .call_until(None, "Browser.close", json!({}), deadline)
         .context("sending Browser.close")?;
     Ok(())
 }
