@@ -11,6 +11,8 @@ use crate::cdp::http;
 use crate::process_identity::{self, ProcessClass};
 use crate::state::{self, Generation, Inspection, SessionState};
 
+type CandidateDir = (PathBuf, Option<String>);
+
 /// How an instance relates to a running browser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Liveness {
@@ -68,6 +70,15 @@ pub struct Instance {
     pub dir: PathBuf,
     pub state: SessionState,
     generation: Generation,
+    registered: bool,
+    registry_instance_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Discovery {
+    pub instances: Vec<Instance>,
+    pub diagnostics: Vec<String>,
+    pub stale_registered: Vec<(PathBuf, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -79,7 +90,11 @@ pub struct InstanceLine {
 }
 
 pub fn list() -> Result<()> {
-    for instance in discover()? {
+    let discovery = discover()?;
+    for diagnostic in &discovery.diagnostics {
+        eprintln!("warning: {diagnostic}");
+    }
+    for instance in discovery.instances {
         let liveness = probe_liveness(&instance.state);
         println!(
             "{}",
@@ -95,7 +110,14 @@ pub fn list() -> Result<()> {
 }
 
 pub fn cleanup(all: bool) -> Result<()> {
-    let cleaned = cleanup_instances(discover()?, all, probe_liveness)?;
+    let discovery = discover()?;
+    for diagnostic in &discovery.diagnostics {
+        eprintln!("warning: {diagnostic}");
+    }
+    for (dir, instance_id) in &discovery.stale_registered {
+        state::unregister_state_dir_if_observed_id(dir, instance_id)?;
+    }
+    let cleaned = cleanup_instances(discovery.instances, all, probe_liveness)?;
     for instance in cleaned {
         println!(
             "cleaned: {} (pid={} label={})",
@@ -107,53 +129,144 @@ pub fn cleanup(all: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn discover() -> Result<Vec<Instance>> {
-    discover_from(candidate_dirs()?)
+pub fn discover() -> Result<Discovery> {
+    let (dirs, diagnostics) = candidate_dirs()?;
+    discover_from_with_diagnostics(dirs, diagnostics)
 }
 
-fn candidate_dirs() -> Result<Vec<PathBuf>> {
-    let mut dirs = vec![state::state_dir()?, state::default_state_dir()?];
-    let tmp = std::env::temp_dir();
-    scan_rdny_tmp(&tmp, &mut dirs);
-    scan_rdny_tmp(Path::new("/tmp"), &mut dirs);
-    Ok(dirs)
+fn candidate_dirs() -> Result<(Vec<CandidateDir>, Vec<String>)> {
+    let current = state::state_dir()?;
+    let default = state::default_state_dir()?;
+    let (registered, diagnostics) = state::registered_state_dirs()?;
+    let mut dirs = vec![(current, None), (default, None)];
+    dirs.extend(
+        registered
+            .into_iter()
+            .map(|entry| (entry.dir, Some(entry.instance_id))),
+    );
+    Ok((dirs, diagnostics))
 }
 
-fn scan_rdny_tmp(root: &Path, dirs: &mut Vec<PathBuf>) {
-    if let Ok(entries) = fs::read_dir(root) {
-        dirs.extend(entries.flatten().filter_map(|entry| {
-            let name = entry.file_name();
-            name.to_str()
-                .is_some_and(|s| s.starts_with("rdny-"))
-                .then(|| entry.path())
-        }));
-    }
-}
-
+#[cfg(test)]
 pub fn discover_from(candidate_dirs: Vec<PathBuf>) -> Result<Vec<Instance>> {
-    let mut found = BTreeMap::new();
-    for dir in candidate_dirs {
+    Ok(discover_from_with_diagnostics(
+        candidate_dirs.into_iter().map(|dir| (dir, None)).collect(),
+        Vec::new(),
+    )?
+    .instances)
+}
+
+fn discover_from_with_diagnostics(
+    candidate_dirs: Vec<CandidateDir>,
+    mut diagnostics: Vec<String>,
+) -> Result<Discovery> {
+    let mut found: BTreeMap<PathBuf, Instance> = BTreeMap::new();
+    let mut stale_registered = Vec::new();
+    for (dir, registry_instance_id) in candidate_dirs {
+        let registered = registry_instance_id.is_some();
         let key = canonical_key(&dir);
-        if found.contains_key(&key) {
+        if let Some(existing) = found.get_mut(&key) {
+            existing.registered |= registered;
+            if let Some(observed_id) = registry_instance_id {
+                if existing.state.instance_id.as_deref() == Some(&observed_id) {
+                    if existing.registry_instance_id.is_none() {
+                        existing.registry_instance_id = Some(observed_id);
+                    }
+                } else {
+                    diagnostics.push(format!(
+                        "registered state dir stale instance id: {}",
+                        dir.display()
+                    ));
+                    stale_registered.push((dir, observed_id));
+                }
+            }
             continue;
         }
-        let Ok(store) = state::open_store_at(&dir) else {
-            continue;
+        let store = match state::open_store_at(&dir) {
+            Ok(store) => store,
+            Err(err) => {
+                if registered {
+                    diagnostics.push(format!(
+                        "registered state dir unavailable: {} ({err})",
+                        dir.display()
+                    ));
+                    if let Some(observed_id) = registry_instance_id {
+                        stale_registered.push((dir, observed_id));
+                    }
+                }
+                continue;
+            }
         };
-        let Ok(Inspection::Valid(state, generation)) = store.inspect::<SessionState>("state.json")
-        else {
-            continue;
+        let inspection = store.inspect::<SessionState>("state.json")?;
+        let (state, generation) = match inspection {
+            Inspection::Valid(state, generation) => (state, generation),
+            Inspection::Missing => {
+                if registered {
+                    diagnostics.push(format!(
+                        "registered state dir missing state.json: {}",
+                        dir.display()
+                    ));
+                    if let Some(observed_id) = registry_instance_id {
+                        stale_registered.push((dir, observed_id));
+                    }
+                }
+                continue;
+            }
+            Inspection::Malformed(malformed) => {
+                diagnostics.push(format!(
+                    "malformed state in {}: {}",
+                    dir.display(),
+                    malformed.message()
+                ));
+                if let Some(path) = store.quarantine_malformed("state.json", &malformed)? {
+                    diagnostics.push(format!("quarantined malformed state as {}", path.display()));
+                }
+                if let Some(observed_id) = registry_instance_id {
+                    stale_registered.push((dir, observed_id));
+                }
+                continue;
+            }
+            Inspection::Incompatible(err, _) => {
+                diagnostics.push(format!("incompatible state in {}: {err}", dir.display()));
+                continue;
+            }
         };
+        if let Some(observed_id) = &registry_instance_id
+            && state.instance_id.as_deref() != Some(observed_id)
+        {
+            diagnostics.push(format!(
+                "registered state dir stale instance id: {}",
+                dir.display()
+            ));
+            stale_registered.push((dir, observed_id.clone()));
+            continue;
+        }
         found.insert(
             key,
             Instance {
                 dir,
                 state,
                 generation,
+                registered,
+                registry_instance_id,
             },
         );
     }
-    Ok(found.into_values().collect())
+    Ok(Discovery {
+        instances: found.into_values().collect(),
+        diagnostics,
+        stale_registered,
+    })
+}
+
+fn prune_registered_if_empty(instance: &Instance) -> Result<()> {
+    if instance.registered
+        && !instance.dir.join("state.json").exists()
+        && let Some(instance_id) = &instance.state.instance_id
+    {
+        state::unregister_state_dir_if_observed(&instance.dir, instance_id)?;
+    }
+    Ok(())
 }
 
 fn canonical_key(dir: &Path) -> PathBuf {
@@ -221,6 +334,7 @@ fn cleanup_instances_with_hook(
             })
             .with_context(|| format!("removing state in {}", instance.dir.display()))?;
         if removed {
+            prune_registered_if_empty(&instance)?;
             cleaned.push(instance);
         }
     }
@@ -234,6 +348,7 @@ mod tests {
 
     fn state(pid: Option<u32>, label: Option<&str>) -> SessionState {
         SessionState {
+            instance_id: label.map(|l| format!("id-{l}")),
             ws_url: "ws://x".into(),
             host: "127.0.0.1".into(),
             port: 1,
@@ -283,6 +398,58 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].dir, one);
         assert_eq!(found[0].state.label.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn discovery_dedupe_preserves_registered_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("state.json"),
+            serde_json::to_vec(&state(Some(1), Some("a"))).unwrap(),
+        )
+        .unwrap();
+        let discovery = discover_from_with_diagnostics(
+            vec![
+                (temp.path().to_path_buf(), None),
+                (temp.path().to_path_buf(), Some("id-a".to_string())),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(discovery.instances.len(), 1);
+        assert!(discovery.instances[0].registered);
+        assert_eq!(
+            discovery.instances[0].registry_instance_id.as_deref(),
+            Some("id-a")
+        );
+    }
+
+    #[test]
+    fn malformed_state_is_quarantined_during_discovery() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("state.json"), "not json").unwrap();
+        let discovery = discover_from_with_diagnostics(
+            vec![(temp.path().to_path_buf(), Some("observed".to_string()))],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(discovery.instances.is_empty());
+        assert_eq!(
+            discovery.stale_registered,
+            vec![(temp.path().to_path_buf(), "observed".to_string())]
+        );
+        assert!(
+            discovery
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("malformed state"))
+        );
+        assert!(!temp.path().join("state.json").exists());
+        assert!(fs::read_dir(temp.path()).unwrap().flatten().any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .contains("state.json.quarantine")
+        }));
     }
 
     #[test]
@@ -417,5 +584,40 @@ mod tests {
         let replacement: SessionState =
             serde_json::from_slice(&fs::read(temp.path().join("state.json")).unwrap()).unwrap();
         assert_eq!(replacement.label.as_deref(), Some("replacement"));
+    }
+
+    #[test]
+    fn cleanup_preserves_concurrent_replacement_and_registration() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("state.json"),
+            serde_json::to_vec(&state(Some(1), Some("discovered"))).unwrap(),
+        )
+        .unwrap();
+        let mut discovered = discover_from_with_diagnostics(
+            vec![(temp.path().to_path_buf(), Some("id-discovered".to_string()))],
+            Vec::new(),
+        )
+        .unwrap()
+        .instances;
+        assert_eq!(discovered.len(), 1);
+        discovered[0].registered = true;
+        let new_dir = temp.path().join("new");
+        fs::create_dir_all(&new_dir).unwrap();
+        let cleaned = cleanup_instances_with_hook(
+            discovered,
+            false,
+            |_| Liveness::Dead,
+            |_| {
+                fs::write(
+                    temp.path().join("state.json"),
+                    serde_json::to_vec(&state(Some(2), Some("replacement"))).unwrap(),
+                )
+                .unwrap();
+            },
+        )
+        .unwrap();
+        assert!(cleaned.is_empty());
+        assert!(temp.path().join("state.json").exists());
     }
 }

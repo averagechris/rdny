@@ -57,6 +57,12 @@ impl Malformed {
     }
 }
 
+impl Generation {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 pub(crate) struct StateStore {
     root: PathBuf,
     dir: File,
@@ -282,7 +288,32 @@ impl StateStore {
         Ok(Some(raw))
     }
 
+    pub(crate) fn read_string_file(&self, name: &str) -> Result<Option<String>> {
+        let Some(bytes) = self.read_bytes(name)? else {
+            return Ok(None);
+        };
+        String::from_utf8(bytes)
+            .context("state file is not UTF-8")
+            .map(Some)
+    }
+
     pub(crate) fn transaction<F>(&self, name: &str, timeout: Duration, update: F) -> Result<()>
+    where
+        F: FnOnce(Option<Value>) -> Result<Value>,
+    {
+        validate_name(name)?;
+        let _lock = self.lock(timeout)?;
+        let next = update(self.read_value(name)?)?;
+        self.write_json_locked(name, &next, FailurePoint::None)
+            .map(|_| ())
+    }
+
+    pub(crate) fn transaction_generation<F>(
+        &self,
+        name: &str,
+        timeout: Duration,
+        update: F,
+    ) -> Result<Generation>
     where
         F: FnOnce(Option<Value>) -> Result<Value>,
     {
@@ -309,9 +340,62 @@ impl StateStore {
         Ok(())
     }
 
+    pub(crate) fn inspect_transaction<T, F>(
+        &self,
+        name: &str,
+        timeout: Duration,
+        update: F,
+    ) -> Result<()>
+    where
+        T: DeserializeOwned,
+        F: FnOnce(Inspection<T>) -> Result<Option<Value>>,
+    {
+        validate_name(name)?;
+        let _lock = self.lock(timeout)?;
+        let mut quarantine_before_write = false;
+        let inspection = match self.read_bytes(name)? {
+            None => Inspection::Missing,
+            Some(raw) => {
+                let generation = Generation(raw.clone());
+                match serde_json::from_slice(&raw) {
+                    Ok(value) => Inspection::Valid(value, generation),
+                    Err(err) if err.is_data() => {
+                        quarantine_before_write = true;
+                        Inspection::Incompatible(err.to_string(), generation)
+                    }
+                    Err(err) => {
+                        quarantine_before_write = true;
+                        Inspection::Malformed(Malformed {
+                            generation,
+                            message: err.to_string(),
+                        })
+                    }
+                }
+            }
+        };
+        if let Some(next) = update(inspection)? {
+            if quarantine_before_write {
+                for _ in 0..100 {
+                    let dest = unique_name(&format!("{name}.quarantine"));
+                    match rename_noreplace(self.dir.as_raw_fd(), name, &dest) {
+                        Ok(()) => break,
+                        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => continue,
+                        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => break,
+                        Err(e) => {
+                            return Err(e).context("atomically quarantining state before repair");
+                        }
+                    }
+                }
+            }
+            self.write_json_locked(name, &next, FailurePoint::None)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn write_json<T: Serialize>(&self, name: &str, value: &T) -> Result<()> {
         let _lock = self.lock(DEFAULT_TIMEOUT)?;
         self.write_json_locked(name, value, FailurePoint::None)
+            .map(|_| ())
     }
 
     fn write_json_locked<T: Serialize>(
@@ -319,7 +403,7 @@ impl StateStore {
         name: &str,
         value: &T,
         fail: FailurePoint,
-    ) -> Result<()> {
+    ) -> Result<Generation> {
         validate_name(name)?;
         let raw = serde_json::to_vec_pretty(value).context("serializing state JSON")?;
         let tmp = unique_name(&format!(".{name}.tmp"));
@@ -330,7 +414,7 @@ impl StateStore {
             0o600,
         )
         .with_context(|| format!("creating temp state file {tmp}"))?;
-        let result = (|| -> Result<()> {
+        let result = (|| -> Result<Generation> {
             validate_regular(&file, 0o600)?;
             fail.check(FailurePoint::AfterCreate)?;
             file.write_all(&raw)?;
@@ -342,7 +426,7 @@ impl StateStore {
             renameat(self.dir.as_raw_fd(), &tmp, self.dir.as_raw_fd(), name)?;
             fail.check(FailurePoint::AfterRename)?;
             self.dir.sync_all().context("syncing state directory")?;
-            Ok(())
+            Ok(Generation(raw))
         })();
         if result.is_err() {
             let _ = unlinkat(self.dir.as_raw_fd(), &tmp, 0);

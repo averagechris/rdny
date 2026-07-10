@@ -13,7 +13,8 @@ use std::{
     env,
     fs::File,
     path::{Path, PathBuf},
-    time::Duration,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -25,6 +26,7 @@ use storage::StateStore;
 pub(crate) use storage::{Generation, Inspection, SecureDir};
 
 const STATE_FILE: &str = "state.json";
+const REGISTRY_FILE: &str = "instances.json";
 
 /// Persisted viewport/mobile emulation override.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -54,6 +56,9 @@ impl ViewportOverride {
 /// Persisted session record (state.json in the state dir).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionState {
+    /// Stable lifecycle identity used to couple state and registry entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
     /// Browser-level WebSocket debugger URL from /json/version.
     pub ws_url: String,
     pub host: String,
@@ -201,11 +206,172 @@ pub fn load() -> Result<Option<SessionState>> {
 /// Explicitly replace the lifecycle state while preserving unknown fields.
 /// Incremental command changes must use [`update`] instead.
 pub fn replace(state: &SessionState) -> Result<()> {
+    // Lifecycle lock order is deliberately non-nested: repair registry, mutate
+    // state, then publish the resulting state generation to the registry. Clear
+    // and cleanup likewise release the state lock before pruning the matching
+    // registry generation, so separate processes cannot deadlock on registry vs
+    // state locks and concurrent re-registers with a newer generation survive.
+    repair_registry_for_lifecycle()?;
     let store = open_store()?;
-    store.transaction(STATE_FILE, Duration::from_secs(5), |current| {
-        merge_state(current, state)
-    })?;
+    let instance_id = new_instance_id();
+    let generation =
+        store.transaction_generation(STATE_FILE, Duration::from_secs(5), |current| {
+            let mut state = state.clone();
+            state.instance_id = Some(instance_id.clone());
+            merge_state(current, &state)
+        })?;
+    publish_current_state_dir_if_current(&instance_id, &generation)?;
     Ok(())
+}
+
+fn new_instance_id() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(
+        "{:032x}{:08x}{:016x}",
+        now,
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct InstanceRegistry {
+    #[serde(default)]
+    entries: Vec<RegistryEntry>,
+    #[serde(default)]
+    dirs: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RegistryEntry {
+    pub(crate) dir: PathBuf,
+    pub(crate) instance_id: String,
+}
+
+fn default_store() -> Result<StateStore> {
+    let dir = default_state_dir()?;
+    StateStore::open(&dir)
+        .with_context(|| format!("opening secure default state dir {}", dir.display()))
+}
+
+fn publish_current_state_dir_if_current(instance_id: &str, generation: &Generation) -> Result<()> {
+    let dir = resolved_state_dir()?;
+    let store = StateStore::open(&dir)?;
+    // Lifecycle publication lock order is state -> registry. No lifecycle code
+    // holds the registry lock while opening/locking a state dir, avoiding cycles.
+    store.inspect_transaction::<SessionState, _>(STATE_FILE, Duration::from_secs(5), |inspection| {
+        let Inspection::Valid(state, observed_generation) = inspection else {
+            return Ok(None);
+        };
+        if state.instance_id.as_deref() == Some(instance_id)
+            && observed_generation.bytes() == generation.bytes()
+        {
+            register_state_dir(&dir, instance_id)?;
+        }
+        Ok(None)
+    })
+}
+
+pub(crate) fn register_state_dir(dir: &Path, instance_id: &str) -> Result<()> {
+    let dir = storage::normalize_absolute(dir)?;
+    let store = default_store()?;
+    registry_transaction(&store, |reg| {
+        reg.entries
+            .retain(|entry| entry.dir != dir && entry.instance_id != instance_id);
+        reg.entries.push(RegistryEntry {
+            dir: dir.clone(),
+            instance_id: instance_id.to_string(),
+        });
+        reg.entries.sort_by(|a, b| a.dir.cmp(&b.dir));
+        reg.dirs.clear();
+        Ok(true)
+    })
+}
+
+pub(crate) fn unregister_state_dir_if_observed(dir: &Path, instance_id: &str) -> Result<()> {
+    unregister_state_dir_if_observed_id(dir, instance_id)
+}
+
+pub(crate) fn unregister_state_dir_if_observed_id(dir: &Path, instance_id: &str) -> Result<()> {
+    let dir = storage::normalize_absolute(dir)?;
+    let store = default_store()?;
+    registry_transaction(&store, |reg| {
+        let before = reg.entries.len() + reg.dirs.len();
+        reg.entries
+            .retain(|entry| !(entry.dir == dir && entry.instance_id == instance_id));
+        reg.dirs.retain(|entry| entry != &dir);
+        Ok(reg.entries.len() + reg.dirs.len() != before)
+    })
+}
+
+fn registry_from_valid_value(value: Value) -> Result<InstanceRegistry> {
+    let mut reg: InstanceRegistry =
+        serde_json::from_value(value).context("instance registry has incompatible schema")?;
+    reg.entries = reg
+        .entries
+        .into_iter()
+        .filter_map(|mut entry| {
+            entry.dir = storage::normalize_absolute(&entry.dir).ok()?;
+            Some(entry)
+        })
+        .collect();
+    reg.entries.sort_by(|a, b| a.dir.cmp(&b.dir));
+    reg.entries
+        .dedup_by(|a, b| a.dir == b.dir && a.instance_id == b.instance_id);
+    reg.dirs.clear();
+    Ok(reg)
+}
+
+pub(crate) fn registered_state_dirs() -> Result<(Vec<RegistryEntry>, Vec<String>)> {
+    let store = default_store()?;
+    match store.inspect::<InstanceRegistry>(REGISTRY_FILE)? {
+        Inspection::Missing => Ok((Vec::new(), Vec::new())),
+        Inspection::Valid(reg, _) => Ok((valid_registry_entries(reg), Vec::new())),
+        Inspection::Incompatible(e, _) => {
+            Ok((Vec::new(), vec![format!("registry incompatible: {e}")]))
+        }
+        Inspection::Malformed(m) => Ok((
+            Vec::new(),
+            vec![format!("registry malformed: {}", m.message())],
+        )),
+    }
+}
+
+fn valid_registry_entries(reg: InstanceRegistry) -> Vec<RegistryEntry> {
+    registry_from_valid_value(serde_json::to_value(reg).expect("registry serializes"))
+        .map(|reg| reg.entries)
+        .unwrap_or_default()
+}
+
+fn registry_transaction(
+    store: &StateStore,
+    mutate: impl FnOnce(&mut InstanceRegistry) -> Result<bool>,
+) -> Result<()> {
+    store.inspect_transaction::<Value, _>(REGISTRY_FILE, Duration::from_secs(5), |inspection| {
+        let mut reg = match inspection {
+            Inspection::Missing => InstanceRegistry::default(),
+            Inspection::Valid(value, _) => registry_from_valid_value(value).unwrap_or_default(),
+            Inspection::Incompatible(_, _) | Inspection::Malformed(_) => {
+                InstanceRegistry::default()
+            }
+        };
+        let changed = mutate(&mut reg)?;
+        if changed {
+            serde_json::to_value(reg)
+                .context("serializing instance registry")
+                .map(Some)
+        } else {
+            Ok(None)
+        }
+    })
+}
+
+fn repair_registry_for_lifecycle() -> Result<()> {
+    registry_transaction(&default_store()?, |_| Ok(true))
 }
 
 /// Lock, load the latest state, apply one incremental mutation, and atomically
@@ -250,6 +416,7 @@ fn merge_state(current: Option<Value>, state: &SessionState) -> Result<Value> {
     if let (Value::Object(dst), Value::Object(src)) = (&mut next, state_value) {
         for key in [
             "ws_url",
+            "instance_id",
             "host",
             "port",
             "pid",
@@ -272,7 +439,30 @@ fn merge_state(current: Option<Value>, state: &SessionState) -> Result<Value> {
 
 /// Remove the state file if present.
 pub fn clear() -> Result<()> {
-    open_store()?.remove(STATE_FILE)
+    repair_registry_for_lifecycle()?;
+    let dir = resolved_state_dir()?;
+    let store = open_store()?;
+    let removed_instance = match store.inspect::<SessionState>(STATE_FILE)? {
+        Inspection::Valid(state, generation) => {
+            if store
+                .remove_if_generation::<SessionState, _>(STATE_FILE, &generation, |_| Ok(true))?
+            {
+                state.instance_id
+            } else {
+                None
+            }
+        }
+        Inspection::Missing => None,
+        Inspection::Malformed(malformed) => {
+            store.quarantine_malformed(STATE_FILE, &malformed)?;
+            None
+        }
+        Inspection::Incompatible(e, _) => anyhow::bail!("state file has incompatible schema: {e}"),
+    };
+    if let Some(instance_id) = removed_instance {
+        unregister_state_dir_if_observed(&dir, &instance_id)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -338,6 +528,7 @@ mod tests {
 
     fn sample_state() -> SessionState {
         SessionState {
+            instance_id: None,
             ws_url: "ws://127.0.0.1:9222/devtools/browser/abc".to_string(),
             host: "127.0.0.1".to_string(),
             port: 9222,
@@ -349,6 +540,323 @@ mod tests {
             label: None,
             viewport: None,
             recording: false,
+        }
+    }
+
+    #[test]
+    fn registry_process_helper() {
+        let Some(root) = env::var_os("RDNY_REGISTRY_PROCESS_ROOT") else {
+            return;
+        };
+        let role = env::var("RDNY_REGISTRY_PROCESS_ROLE").unwrap();
+        let root = PathBuf::from(root);
+        std::fs::write(root.join(format!("ready-{role}")), b"ready").unwrap();
+        while !root.join("go").exists() {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let dir = root.join(format!("state-{role}"));
+        let store = StateStore::open(&dir).unwrap();
+        store.write_json(STATE_FILE, &sample_state()).unwrap();
+        let Inspection::Valid(_, generation) = store.inspect::<SessionState>(STATE_FILE).unwrap()
+        else {
+            unreachable!();
+        };
+        let _ = generation;
+        register_state_dir(&dir, &format!("helper-{role}")).unwrap();
+    }
+
+    #[test]
+    fn relative_register_process_helper() {
+        if env::var_os("RDNY_RELATIVE_REGISTER_HELPER").is_none() {
+            return;
+        }
+        replace(&sample_state()).unwrap();
+    }
+
+    #[test]
+    fn reregister_process_helper() {
+        let Some(root) = env::var_os("RDNY_REREGISTER_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        std::fs::write(root.join("ready"), b"ready").unwrap();
+        while !root.join("go").exists() {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        replace(&sample_state()).unwrap();
+    }
+
+    #[test]
+    fn late_publish_process_helper() {
+        let Some(root) = env::var_os("RDNY_LATE_PUBLISH_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let instance_id = "late-a".to_string();
+        let store = open_store().unwrap();
+        let generation = store
+            .transaction_generation(STATE_FILE, Duration::from_secs(5), |current| {
+                let mut state = sample_state();
+                state.instance_id = Some(instance_id.clone());
+                merge_state(current, &state)
+            })
+            .unwrap();
+        std::fs::write(root.join("ready"), b"ready").unwrap();
+        while !root.join("go").exists() {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        publish_current_state_dir_if_current(&instance_id, &generation).unwrap();
+    }
+
+    #[test]
+    fn registry_preserves_concurrent_process_registrations() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous_xdg = env::var_os("XDG_STATE_HOME");
+        let temp = tempfile::tempdir().unwrap();
+        unsafe {
+            env::set_var("XDG_STATE_HOME", temp.path().join("xdg"));
+        }
+        StateStore::open(&default_state_dir().unwrap()).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let mut children: Vec<_> = ["a", "b"]
+            .into_iter()
+            .map(|role| {
+                Command::new(&exe)
+                    .arg("state::tests::registry_process_helper")
+                    .arg("--exact")
+                    .env("XDG_STATE_HOME", temp.path().join("xdg"))
+                    .env("RDNY_REGISTRY_PROCESS_ROOT", temp.path())
+                    .env("RDNY_REGISTRY_PROCESS_ROLE", role)
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        while ["a", "b"]
+            .into_iter()
+            .any(|r| !temp.path().join(format!("ready-{r}")).exists())
+        {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        std::fs::write(temp.path().join("go"), b"go").unwrap();
+        for child in &mut children {
+            assert!(child.wait().unwrap().success());
+        }
+        let (dirs, diagnostics) = registered_state_dirs().unwrap();
+        assert!(diagnostics.is_empty());
+        assert!(
+            dirs.iter().any(
+                |e| e.dir == storage::normalize_absolute(&temp.path().join("state-a")).unwrap()
+            )
+        );
+        assert!(
+            dirs.iter().any(
+                |e| e.dir == storage::normalize_absolute(&temp.path().join("state-b")).unwrap()
+            )
+        );
+        if let Some(v) = previous_xdg {
+            unsafe { env::set_var("XDG_STATE_HOME", v) }
+        } else {
+            unsafe { env::remove_var("XDG_STATE_HOME") }
+        }
+    }
+
+    #[test]
+    fn relative_state_dir_registers_absolute_for_other_cwd() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous_xdg = env::var_os("XDG_STATE_HOME");
+        let temp = tempfile::tempdir().unwrap();
+        let xdg = temp.path().join("xdg");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("state::tests::relative_register_process_helper")
+            .arg("--exact")
+            .current_dir(temp.path())
+            .env("XDG_STATE_HOME", &xdg)
+            .env("RDNY_STATE_DIR", "relative-state")
+            .env("RDNY_RELATIVE_REGISTER_HELPER", "1")
+            .spawn()
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        unsafe {
+            env::set_var("XDG_STATE_HOME", &xdg);
+        }
+        let (dirs, _) = registered_state_dirs().unwrap();
+        assert!(
+            dirs.iter().any(|e| e.dir
+                == storage::normalize_absolute(&temp.path().join("relative-state")).unwrap())
+        );
+        if let Some(v) = previous_xdg {
+            unsafe { env::set_var("XDG_STATE_HOME", v) }
+        } else {
+            unsafe { env::remove_var("XDG_STATE_HOME") }
+        }
+    }
+
+    #[test]
+    fn malformed_registry_is_not_salvaged_from_unrelated_strings() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous_xdg = env::var_os("XDG_STATE_HOME");
+        let temp = tempfile::tempdir().unwrap();
+        unsafe {
+            env::set_var("XDG_STATE_HOME", temp.path().join("xdg"));
+        }
+        let default = default_state_dir().unwrap();
+        use std::io::Write;
+        let mut file = StateStore::open(&default)
+            .unwrap()
+            .create_file(REGISTRY_FILE, true)
+            .unwrap();
+        file.write_all(br#"{"dirs":["/valid/one", bad, "/valid/two"]}"#)
+            .unwrap();
+        file.sync_all().unwrap();
+        let (dirs, diagnostics) = registered_state_dirs().unwrap();
+        assert!(diagnostics.iter().any(|d| d.contains("registry malformed")));
+        assert!(dirs.is_empty());
+        repair_registry_for_lifecycle().unwrap();
+        let (dirs, diagnostics) = registered_state_dirs().unwrap();
+        assert!(dirs.is_empty());
+        assert!(diagnostics.is_empty());
+        assert!(std::fs::read_dir(&default).unwrap().flatten().any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .contains("instances.json.quarantine")
+        }));
+        if let Some(v) = previous_xdg {
+            unsafe { env::set_var("XDG_STATE_HOME", v) }
+        } else {
+            unsafe { env::remove_var("XDG_STATE_HOME") }
+        }
+    }
+
+    #[test]
+    fn lifecycle_register_quarantines_malformed_registry_then_registers() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous_xdg = env::var_os("XDG_STATE_HOME");
+        let previous_state = env::var_os("RDNY_STATE_DIR");
+        let temp = tempfile::tempdir().unwrap();
+        unsafe {
+            env::set_var("XDG_STATE_HOME", temp.path().join("xdg"));
+            env::set_var("RDNY_STATE_DIR", temp.path().join("state"));
+        }
+        let default = default_state_dir().unwrap();
+        use std::io::Write;
+        let mut file = StateStore::open(&default)
+            .unwrap()
+            .create_file(REGISTRY_FILE, true)
+            .unwrap();
+        file.write_all(b"not json").unwrap();
+        file.sync_all().unwrap();
+        replace(&sample_state()).unwrap();
+        let (entries, diagnostics) = registered_state_dirs().unwrap();
+        assert!(diagnostics.is_empty());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].dir,
+            storage::normalize_absolute(&temp.path().join("state")).unwrap()
+        );
+        assert!(std::fs::read_dir(&default).unwrap().flatten().any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .contains("instances.json.quarantine")
+        }));
+        if let Some(v) = previous_state {
+            unsafe { env::set_var("RDNY_STATE_DIR", v) }
+        } else {
+            unsafe { env::remove_var("RDNY_STATE_DIR") }
+        }
+        if let Some(v) = previous_xdg {
+            unsafe { env::set_var("XDG_STATE_HOME", v) }
+        } else {
+            unsafe { env::remove_var("XDG_STATE_HOME") }
+        }
+    }
+
+    #[test]
+    fn clear_unregister_preserves_concurrent_process_reregister() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous_xdg = env::var_os("XDG_STATE_HOME");
+        let previous_state = env::var_os("RDNY_STATE_DIR");
+        let temp = tempfile::tempdir().unwrap();
+        let xdg = temp.path().join("xdg");
+        let state_dir = temp.path().join("state");
+        unsafe {
+            env::set_var("XDG_STATE_HOME", &xdg);
+            env::set_var("RDNY_STATE_DIR", &state_dir);
+        }
+        replace(&sample_state()).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("state::tests::reregister_process_helper")
+            .arg("--exact")
+            .env("XDG_STATE_HOME", &xdg)
+            .env("RDNY_STATE_DIR", &state_dir)
+            .env("RDNY_REREGISTER_ROOT", temp.path())
+            .spawn()
+            .unwrap();
+        while !temp.path().join("ready").exists() {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        clear().unwrap();
+        std::fs::write(temp.path().join("go"), b"go").unwrap();
+        assert!(child.wait().unwrap().success());
+        let (entries, _) = registered_state_dirs().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].dir,
+            storage::normalize_absolute(&state_dir).unwrap()
+        );
+        if let Some(v) = previous_state {
+            unsafe { env::set_var("RDNY_STATE_DIR", v) }
+        } else {
+            unsafe { env::remove_var("RDNY_STATE_DIR") }
+        }
+        if let Some(v) = previous_xdg {
+            unsafe { env::set_var("XDG_STATE_HOME", v) }
+        } else {
+            unsafe { env::remove_var("XDG_STATE_HOME") }
+        }
+    }
+
+    #[test]
+    fn late_publish_after_replacement_does_not_overwrite_registry() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous_xdg = env::var_os("XDG_STATE_HOME");
+        let previous_state = env::var_os("RDNY_STATE_DIR");
+        let temp = tempfile::tempdir().unwrap();
+        let xdg = temp.path().join("xdg");
+        let state_dir = temp.path().join("state");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("state::tests::late_publish_process_helper")
+            .arg("--exact")
+            .env("XDG_STATE_HOME", &xdg)
+            .env("RDNY_STATE_DIR", &state_dir)
+            .env("RDNY_LATE_PUBLISH_ROOT", temp.path())
+            .spawn()
+            .unwrap();
+        while !temp.path().join("ready").exists() {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        unsafe {
+            env::set_var("XDG_STATE_HOME", &xdg);
+            env::set_var("RDNY_STATE_DIR", &state_dir);
+        }
+        replace(&sample_state()).unwrap();
+        let current = load().unwrap().unwrap();
+        let current_id = current.instance_id.clone().unwrap();
+        assert_ne!(current_id, "late-a");
+        std::fs::write(temp.path().join("go"), b"go").unwrap();
+        assert!(child.wait().unwrap().success());
+        let (entries, diagnostics) = registered_state_dirs().unwrap();
+        assert!(diagnostics.is_empty());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].instance_id, current_id);
+        if let Some(v) = previous_state {
+            unsafe { env::set_var("RDNY_STATE_DIR", v) }
+        } else {
+            unsafe { env::remove_var("RDNY_STATE_DIR") }
+        }
+        if let Some(v) = previous_xdg {
+            unsafe { env::set_var("XDG_STATE_HOME", v) }
+        } else {
+            unsafe { env::remove_var("XDG_STATE_HOME") }
         }
     }
 
@@ -432,10 +940,14 @@ mod tests {
 
     #[test]
     fn round_trip_state_with_env_override() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = env::var("RDNY_STATE_DIR").ok();
+        let previous_xdg = env::var_os("XDG_STATE_HOME");
         let temp = tempfile::tempdir_in(".").unwrap();
-        unsafe { env::set_var("RDNY_STATE_DIR", temp.path()) };
+        unsafe {
+            env::set_var("RDNY_STATE_DIR", temp.path().join("state"));
+            env::set_var("XDG_STATE_HOME", temp.path().join("xdg"));
+        }
 
         assert_eq!(load().unwrap(), None);
         let err = require().unwrap_err();
@@ -443,7 +955,11 @@ mod tests {
 
         let state = sample_state();
         replace(&state).unwrap();
-        assert_eq!(load().unwrap(), Some(state));
+        let loaded = load().unwrap().unwrap();
+        assert!(loaded.instance_id.is_some());
+        let mut expected = state;
+        expected.instance_id = loaded.instance_id.clone();
+        assert_eq!(loaded, expected);
         clear().unwrap();
         assert_eq!(load().unwrap(), None);
 
@@ -452,16 +968,26 @@ mod tests {
         } else {
             unsafe { env::remove_var("RDNY_STATE_DIR") };
         }
+        if let Some(previous) = previous_xdg {
+            unsafe { env::set_var("XDG_STATE_HOME", previous) };
+        } else {
+            unsafe { env::remove_var("XDG_STATE_HOME") };
+        }
     }
 
     #[test]
     fn save_preserves_unknown_fields_but_clears_omitted_known_fields() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = env::var_os("RDNY_STATE_DIR");
+        let previous_xdg = env::var_os("XDG_STATE_HOME");
         let temp = tempfile::tempdir_in(".").unwrap();
-        unsafe { env::set_var("RDNY_STATE_DIR", temp.path()) };
+        unsafe {
+            env::set_var("RDNY_STATE_DIR", temp.path().join("state"));
+            env::set_var("XDG_STATE_HOME", temp.path().join("xdg"));
+        }
+        std::fs::create_dir_all(temp.path().join("state")).unwrap();
         std::fs::write(
-            temp.path().join(STATE_FILE),
+            temp.path().join("state").join(STATE_FILE),
             serde_json::to_vec(&json!({
                 "ws_url":"old", "host":"old", "port":1,
                 "pid":null, "user_data_dir":null, "browser_path":null,
@@ -474,8 +1000,10 @@ mod tests {
         .unwrap();
 
         replace(&sample_state()).unwrap();
-        let raw: Value =
-            serde_json::from_slice(&std::fs::read(temp.path().join(STATE_FILE)).unwrap()).unwrap();
+        let raw: Value = serde_json::from_slice(
+            &std::fs::read(temp.path().join("state").join(STATE_FILE)).unwrap(),
+        )
+        .unwrap();
         assert!(raw.get("label").is_none());
         assert!(raw.get("viewport").is_none(), "viewport must reset to None");
         assert!(
@@ -488,6 +1016,11 @@ mod tests {
             unsafe { env::set_var("RDNY_STATE_DIR", previous) }
         } else {
             unsafe { env::remove_var("RDNY_STATE_DIR") }
+        }
+        if let Some(previous) = previous_xdg {
+            unsafe { env::set_var("XDG_STATE_HOME", previous) }
+        } else {
+            unsafe { env::remove_var("XDG_STATE_HOME") }
         }
     }
 

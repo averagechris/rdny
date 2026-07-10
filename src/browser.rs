@@ -98,6 +98,7 @@ pub fn launch(opts: &LaunchOpts, storage: BrowserStorage) -> Result<SessionState
     );
     launch_guard.commit();
     Ok(SessionState {
+        instance_id: None,
         ws_url: version.ws_url,
         host: "127.0.0.1".into(),
         port,
@@ -123,6 +124,7 @@ pub fn connect(host: &str, port: u16) -> Result<SessionState> {
         )
     })?;
     Ok(SessionState {
+        instance_id: None,
         ws_url: version.ws_url,
         host: host.into(),
         port,
