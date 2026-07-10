@@ -1,3 +1,4 @@
+mod broker;
 mod browser;
 mod cdp;
 mod cli;

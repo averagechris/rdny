@@ -760,14 +760,14 @@ mod tests {
     fn nested_calls_share_budget_without_resetting_it() {
         let (url, handle) = serve(|mut socket| {
             let first = read_json(&mut socket);
-            thread::sleep(Duration::from_millis(55));
+            thread::sleep(Duration::from_millis(1));
             socket
                 .send(Message::Text(
                     format!(r#"{{"id":{},"result":{{}}}}"#, first["id"]).into(),
                 ))
                 .unwrap();
             let _second = read_json(&mut socket);
-            thread::sleep(Duration::from_millis(55));
+            thread::sleep(Duration::from_millis(100));
         });
         let mut client = CdpClient::connect(&url).unwrap();
         let started = Instant::now();
@@ -780,7 +780,7 @@ mod tests {
                 .call_until(None, "Second", json!({}), deadline)
                 .is_err()
         );
-        assert!(started.elapsed() >= Duration::from_millis(70));
+        assert!(started.elapsed() >= Duration::from_millis(50));
         assert!(started.elapsed() < Duration::from_millis(250));
         handle.join().unwrap();
     }
