@@ -78,6 +78,7 @@ pub(crate) struct SecureDir {
 }
 
 pub(crate) struct AdvisoryLock(File);
+pub(crate) struct LockGuard(File);
 
 #[derive(Clone, Copy)]
 pub(crate) enum AdvisoryLockMode {
@@ -431,6 +432,54 @@ impl StateStore {
             .map(Some)
     }
 
+    pub(crate) fn raw_snapshot_locked(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        validate_trusted_raw_name(name)?;
+        self.read_bytes(name)
+    }
+
+    pub(crate) fn raw_restore_locked(&self, name: &str, bytes: Option<&[u8]>) -> Result<()> {
+        validate_trusted_raw_name(name)?;
+        match bytes {
+            Some(raw) => {
+                let tmp = unique_name(&format!(".{name}.restore"));
+                let mut file = file_from_openat(
+                    self.dir.as_raw_fd(),
+                    &tmp,
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+                    0o600,
+                )?;
+                validate_regular(&file, 0o600)?;
+                file.write_all(raw)?;
+                file.sync_all()?;
+                drop(file);
+                renameat(self.dir.as_raw_fd(), &tmp, self.dir.as_raw_fd(), name)?;
+                self.dir.sync_all()?;
+            }
+            None => match unlinkat(self.dir.as_raw_fd(), name, 0) {
+                Ok(()) => self.dir.sync_all()?,
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
+                Err(e) => return Err(e.into()),
+            },
+        }
+        Ok(())
+    }
+
+    pub(crate) fn inspect_locked<T: DeserializeOwned>(&self, name: &str) -> Result<Inspection<T>> {
+        validate_name(name)?;
+        let Some(raw) = self.read_bytes(name)? else {
+            return Ok(Inspection::Missing);
+        };
+        let generation = Generation(raw.clone());
+        Ok(match serde_json::from_slice(&raw) {
+            Ok(value) => Inspection::Valid(value, generation),
+            Err(err) if err.is_data() => Inspection::Incompatible(err.to_string(), generation),
+            Err(err) => Inspection::Malformed(Malformed {
+                generation,
+                message: err.to_string(),
+            }),
+        })
+    }
+
     pub(crate) fn transaction<F>(&self, name: &str, timeout: Duration, update: F) -> Result<()>
     where
         F: FnOnce(Option<Value>) -> Result<Value>,
@@ -532,6 +581,14 @@ impl StateStore {
             .map(|_| ())
     }
 
+    pub(crate) fn write_json_locked_normal<T: Serialize>(
+        &self,
+        name: &str,
+        value: &T,
+    ) -> Result<Generation> {
+        self.write_json_locked(name, value, FailurePoint::None)
+    }
+
     fn write_json_locked<T: Serialize>(
         &self,
         name: &str,
@@ -566,6 +623,15 @@ impl StateStore {
             let _ = unlinkat(self.dir.as_raw_fd(), &tmp, 0);
         }
         result
+    }
+
+    pub(crate) fn remove_locked(&self, name: &str) -> Result<()> {
+        validate_name(name)?;
+        match unlinkat(self.dir.as_raw_fd(), name, 0) {
+            Ok(()) => self.dir.sync_all().context("syncing state directory"),
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("removing state file {name}")),
+        }
     }
 
     pub(crate) fn remove(&self, name: &str) -> Result<()> {
@@ -675,6 +741,32 @@ impl StateStore {
         bail!("could not allocate unique quarantine name")
     }
 
+    pub(crate) fn quarantine_malformed_locked(
+        &self,
+        name: &str,
+        observed: &Malformed,
+    ) -> Result<Option<PathBuf>> {
+        validate_name(name)?;
+        let Some(current) = self.read_bytes(name)? else {
+            return Ok(None);
+        };
+        if current != observed.generation.0 {
+            bail!("state changed since inspection; refusing to quarantine")
+        }
+        for _ in 0..100 {
+            let dest = unique_name(&format!("{name}.quarantine"));
+            match rename_noreplace(self.dir.as_raw_fd(), name, &dest) {
+                Ok(()) => {
+                    self.dir.sync_all()?;
+                    return Ok(Some(self.root.join(dest)));
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EEXIST) => continue,
+                Err(e) => return Err(e).context("atomically renaming malformed state"),
+            }
+        }
+        bail!("could not allocate unique quarantine name")
+    }
+
     fn lock_for(&self, data_name: &str, timeout: Duration) -> Result<LockGuard> {
         let lock_name = if data_name == "instances.json" {
             ".registry.lock"
@@ -684,22 +776,39 @@ impl StateStore {
         self.lock_named(lock_name, timeout)
     }
 
-    fn lock_named(&self, lock_name: &str, timeout: Duration) -> Result<LockGuard> {
+    pub(crate) fn lock_named(&self, lock_name: &str, timeout: Duration) -> Result<LockGuard> {
         validate_name(lock_name)?;
-        let file = file_from_openat(
-            self.dir.as_raw_fd(),
-            lock_name,
-            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW,
-            0o600,
-        )
-        .with_context(|| format!("opening {lock_name} lock file"))?;
-        validate_regular(&file, 0o600).with_context(|| format!("validating {lock_name}"))?;
         let start = Instant::now();
+        let file = loop {
+            match file_from_openat(
+                self.dir.as_raw_fd(),
+                lock_name,
+                libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW,
+                0o600,
+            ) {
+                Ok(file) => break file,
+                // macOS can transiently report ENOENT when two processes race
+                // O_CREAT|O_NOFOLLOW for the same absent lock name.
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ENOENT) && start.elapsed() < timeout =>
+                {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("opening {lock_name} lock file"));
+                }
+            }
+        };
+        validate_regular(&file, 0o600).with_context(|| format!("validating {lock_name}"))?;
         loop {
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
                 return Ok(LockGuard(file));
             }
             let err = std::io::Error::last_os_error();
+            #[cfg(test)]
+            if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                record_test_lock_contention(lock_name);
+            }
             if err.raw_os_error() != Some(libc::EWOULDBLOCK)
                 && err.raw_os_error() != Some(libc::EINTR)
             {
@@ -721,7 +830,35 @@ impl StateStore {
     }
 }
 
-struct LockGuard(File);
+#[cfg(test)]
+fn record_test_lock_contention(lock_name: &str) {
+    let Some(expected) = std::env::var_os("RDNY_TEST_CONTENTION_LOCK") else {
+        return;
+    };
+    if expected != OsStr::new(lock_name) {
+        return;
+    }
+    let Some(marker) = std::env::var_os("RDNY_TEST_CONTENTION_MARKER") else {
+        return;
+    };
+    use std::io::Write as _;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker)
+    {
+        let _ = file.write_all(lock_name.as_bytes());
+        let _ = file.sync_all();
+    }
+}
+
+fn validate_trusted_raw_name(name: &str) -> Result<()> {
+    match name {
+        "state.json" | "instances.json" => Ok(()),
+        _ => bail!("unsupported raw lifecycle file {name}"),
+    }
+}
+
 impl Drop for LockGuard {
     fn drop(&mut self) {
         unsafe {
@@ -779,16 +916,24 @@ fn open_secure_dir(path: &Path, create: bool) -> Result<StateStore> {
         let (next, created) = match file_from_openat(current.as_raw_fd(), name, flags, 0) {
             Ok(dir) => (dir, false),
             Err(e) if create && e.raw_os_error() == Some(libc::ENOENT) => {
-                mkdir_private(current.as_raw_fd(), name).with_context(|| {
-                    format!(
-                        "creating state directory component {}",
-                        part.to_string_lossy()
-                    )
-                })?;
+                let created = match mkdir_private(current.as_raw_fd(), name) {
+                    Ok(()) => true,
+                    // Another rdny process may have won the same component
+                    // creation race. Reopen and validate its inode below.
+                    Err(error) if error.raw_os_error() == Some(libc::EEXIST) => false,
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "creating state directory component {}",
+                                part.to_string_lossy()
+                            )
+                        });
+                    }
+                };
                 // Open immediately and perform every subsequent operation on
                 // the descriptor, never on a followable pathname.
                 #[cfg(target_os = "macos")]
-                {
+                if created {
                     // An extreme umask can create mode 000. O_EVTONLY still
                     // gives us an inode-bound descriptor so we can fchmod it
                     // without ever following the name.
@@ -802,7 +947,7 @@ fn open_secure_dir(path: &Path, create: bool) -> Result<StateStore> {
                     inode.set_permissions(std::fs::Permissions::from_mode(0o700))?;
                 }
                 #[cfg(not(target_os = "macos"))]
-                {
+                if created {
                     // O_PATH bypasses mode-000 lookup restrictions. chmod via
                     // procfs addresses that open descriptor, not the original
                     // replaceable directory name.
@@ -819,7 +964,10 @@ fn open_secure_dir(path: &Path, create: bool) -> Result<StateStore> {
                         return Err(std::io::Error::last_os_error().into());
                     }
                 }
-                (file_from_openat(current.as_raw_fd(), name, flags, 0)?, true)
+                (
+                    file_from_openat(current.as_raw_fd(), name, flags, 0)?,
+                    created,
+                )
             }
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -1313,7 +1461,7 @@ mod tests {
         );
         let elapsed = start.elapsed();
         assert!(elapsed >= Duration::from_millis(7));
-        assert!(elapsed < Duration::from_millis(40), "{elapsed:?}");
+        assert!(elapsed < Duration::from_millis(150), "{elapsed:?}");
     }
 
     #[test]

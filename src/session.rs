@@ -93,6 +93,122 @@ pub struct Deadline {
     at: Instant,
 }
 
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+    use tungstenite::{Message, accept};
+
+    #[test]
+    fn recording_page_command_post_dispatch_drain_writes_and_acks_frame() {
+        let _env = crate::state::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let prior = std::env::var_os("RDNY_STATE_DIR");
+        let prior_xdg = std::env::var_os("XDG_STATE_HOME");
+        let temp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("RDNY_STATE_DIR", temp.path().join("state"));
+            std::env::set_var("XDG_STATE_HOME", temp.path().join("xdg"));
+        }
+        let frames = crate::state::create_recording_frames_dir("drain-regression")
+            .unwrap()
+            .unwrap();
+        crate::state::replace(&crate::state::SessionState {
+            instance_id: None,
+            ws_url: "ws://unused".into(),
+            host: "127.0.0.1".into(),
+            port: 1,
+            pid: None,
+            process_identity: None,
+            user_data_dir: None,
+            browser_path: None,
+            target_id: Some("target".into()),
+            label: None,
+            viewport: None,
+            recording: true,
+            recording_id: Some("drain-regression".into()),
+            recording_frames_dir: Some(frames.path().to_path_buf()),
+            recoverable_recording: None,
+            recoverable_recordings: Vec::new(),
+            instrumentation: None,
+        })
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = accept(stream).unwrap();
+            let command: Value = match socket.read().unwrap() {
+                Message::Text(text) => serde_json::from_str(&text).unwrap(),
+                message => panic!("unexpected command message {message:?}"),
+            };
+            assert_eq!(command["method"], "Runtime.evaluate");
+            socket
+                .send(Message::Text(
+                    r#"{"method":"Page.screencastFrame","sessionId":"page-session","params":{"data":"aGVsbG8=","sessionId":42,"metadata":{"timestamp":1.25}}}"#
+                        .into(),
+                ))
+                .unwrap();
+            socket
+                .send(Message::Text(
+                    format!(
+                        r#"{{"id":{},"result":{{"result":{{"value":"ok"}}}}}}"#,
+                        command["id"]
+                    )
+                    .into(),
+                ))
+                .unwrap();
+            let ack: Value = match socket.read().unwrap() {
+                Message::Text(text) => serde_json::from_str(&text).unwrap(),
+                message => panic!("unexpected ack message {message:?}"),
+            };
+            assert_eq!(ack["method"], "Page.screencastFrameAck");
+            assert_eq!(ack["params"]["sessionId"], 42);
+            socket
+                .send(Message::Text(
+                    format!(r#"{{"id":{},"result":{{}}}}"#, ack["id"]).into(),
+                ))
+                .unwrap();
+            thread::sleep(Duration::from_millis(150));
+            let _ = socket.close(None);
+        });
+
+        let client = CdpClient::connect(&format!("ws://127.0.0.1:{port}")).unwrap();
+        let mut session = PageSession {
+            client,
+            session_id: "page-session".into(),
+            target_id: "target".into(),
+            frames_dir: Some(frames),
+            instrumentation_registered: true,
+            timeout: Duration::from_secs(1),
+        };
+        assert!(session.is_recording());
+        assert_eq!(session.eval("'command'").unwrap(), json!("ok"));
+        session.drain_events(Duration::from_millis(100)).unwrap();
+        server.join().unwrap();
+        assert!(
+            std::fs::read_dir(temp.path().join("state/recordings/drain-regression/frames"))
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.path().extension().is_some_and(|ext| ext == "jpg"))
+        );
+        if let Some(prior) = prior {
+            unsafe { std::env::set_var("RDNY_STATE_DIR", prior) };
+        } else {
+            unsafe { std::env::remove_var("RDNY_STATE_DIR") };
+        }
+        if let Some(prior) = prior_xdg {
+            unsafe { std::env::set_var("XDG_STATE_HOME", prior) };
+        } else {
+            unsafe { std::env::remove_var("XDG_STATE_HOME") };
+        }
+    }
+}
+
 impl Deadline {
     pub fn after(timeout: Duration) -> Self {
         let start = Instant::now();
@@ -221,6 +337,10 @@ fn check_exception(result: &Value, what: &str) -> Result<()> {
 }
 
 impl PageSession {
+    pub(crate) fn is_recording(&self) -> bool {
+        self.frames_dir.is_some()
+    }
+
     /// Send a CDP command to the page session.
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value> {
         self.client.call(Some(&self.session_id), method, params)

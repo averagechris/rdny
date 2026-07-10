@@ -58,7 +58,25 @@ pub fn discover() -> Result<PathBuf> {
 /// root-owned sticky directories; the state root/profile are current-user 0700.
 /// This prevents cross-UID replacement. Same-UID lifecycle orchestration is
 /// intentionally deferred to #130/#131.
+#[allow(dead_code)]
 pub fn launch(opts: &LaunchOpts, storage: BrowserStorage) -> Result<SessionState> {
+    let mut launched = launch_armed(opts, storage)?;
+    launched.commit();
+    Ok(launched.state)
+}
+
+pub(crate) struct LaunchedBrowser {
+    pub(crate) state: SessionState,
+    guard: ChildLaunchGuard,
+}
+
+impl LaunchedBrowser {
+    pub(crate) fn commit(&mut self) {
+        self.guard.commit();
+    }
+}
+
+pub(crate) fn launch_armed(opts: &LaunchOpts, storage: BrowserStorage) -> Result<LaunchedBrowser> {
     let binary = discover()?;
     let profile_dir = storage.profile.path().to_path_buf();
     let data_root = profile_dir.parent().context("profile has no state root")?;
@@ -81,7 +99,7 @@ pub fn launch(opts: &LaunchOpts, storage: BrowserStorage) -> Result<SessionState
         .stderr(Stdio::from(log_err))
         .spawn()
         .with_context(|| format!("launching {}", binary.display()))?;
-    let mut launch_guard = ChildLaunchGuard::armed(child);
+    let launch_guard = ChildLaunchGuard::armed(child);
 
     let port = match wait_for_devtools_port(&storage.profile) {
         Ok(port) => port,
@@ -98,8 +116,7 @@ pub fn launch(opts: &LaunchOpts, storage: BrowserStorage) -> Result<SessionState
         process_identity::capture(child_id, &binary, Some(&profile_dir))
             .context("capturing launched browser process identity")?,
     );
-    launch_guard.commit();
-    Ok(SessionState {
+    let state = SessionState {
         instance_id: None,
         ws_url: version.ws_url,
         host: "127.0.0.1".into(),
@@ -117,6 +134,10 @@ pub fn launch(opts: &LaunchOpts, storage: BrowserStorage) -> Result<SessionState
         recoverable_recording: None,
         recoverable_recordings: Vec::new(),
         instrumentation: None,
+    };
+    Ok(LaunchedBrowser {
+        state,
+        guard: launch_guard,
     })
 }
 

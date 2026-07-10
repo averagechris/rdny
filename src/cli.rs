@@ -319,44 +319,37 @@ pub fn run() -> Result<()> {
         // background work, so mutating the process environment cannot race other threads.
         unsafe { std::env::set_var("RDNY_STATE_DIR", state_dir) };
     }
-    let recording_active = crate::state::load()?.is_some_and(|state| state.recording);
-    let drain_after_dispatch =
-        recording_active && !matches!(cli.command, Command::StopVideo { .. });
+    // Avoid unconditional lifecycle state reads before lifecycle commands have
+    // taken .lifecycle.lock. Page commands may opt into draining once connected.
+    let mut drain_after_dispatch = false;
     let mut page_session = None;
     macro_rules! sess {
         () => {{
             if page_session.is_none() {
                 page_session = Some(session::connect(cli.timeout)?);
+                drain_after_dispatch = page_session
+                    .as_ref()
+                    .is_some_and(session::PageSession::is_recording);
             }
             page_session.as_mut().expect("session just connected")
         }};
     }
     match cli.command {
         Command::Start(args) => {
-            if let Some(state) = crate::state::load()?
-                && let Ok(BrowserStatus::Running { .. }) = browser::status(&state)
-            {
-                let pid = state
-                    .pid
-                    .map(|pid| pid.to_string())
-                    .unwrap_or_else(|| "attached".to_string());
-                return Err(crate::hint::hint_error(
-                    format!(
-                        "a browser session is already running (pid {pid}/port {})",
-                        state.port
-                    ),
-                    "run `rdny stop` first",
-                    None,
-                ));
-            }
+            let _lifecycle = crate::state::lifecycle_lock()?;
+            refuse_occupied_lifecycle(&_lifecycle, "start")?;
             let opts = LaunchOpts {
                 show: args.show,
                 insecure: args.insecure,
                 extra_args: vec![],
                 label: args.label,
             };
-            let state = browser::launch(&opts, crate::state::browser_storage()?)?;
-            crate::state::replace(&state)?;
+            let mut launched = browser::launch_armed(&opts, crate::state::browser_storage()?)?;
+            if let Err(err) = crate::state::replace_lifecycle(&_lifecycle, &launched.state) {
+                return Err(err.context("publishing launched browser ownership; child was terminated and previous state preserved"));
+            }
+            launched.commit();
+            let state = launched.state;
             let browser = state
                 .browser_path
                 .as_ref()
@@ -369,16 +362,41 @@ pub fn run() -> Result<()> {
             println!("started {browser} pid {pid} on port {}", state.port);
         }
         Command::Connect { address } => {
+            let _lifecycle = crate::state::lifecycle_lock()?;
+            refuse_occupied_lifecycle(&_lifecycle, "connect")?;
             let config = config::load()?;
             let (host, port) = resolve_connect_target(address.as_deref(), &config)?;
             let state = browser::connect(&host, port)?;
-            crate::state::replace(&state)?;
+            crate::state::replace_lifecycle(&_lifecycle, &state)
+                .context("publishing attached browser ownership; previous state preserved")?;
             println!("connected to {host}:{port}");
         }
         Command::Stop => {
-            let state = crate::state::require()?;
+            let _lifecycle = crate::state::lifecycle_lock()?;
+            let (state, generation) = match crate::state::inspect_for_lifecycle(&_lifecycle)? {
+                crate::state::Inspection::Valid(state, generation) => (state, generation),
+                crate::state::Inspection::Missing => {
+                    return Err(crate::state::require().unwrap_err());
+                }
+                crate::state::Inspection::Malformed(m) => anyhow::bail!(
+                    "state file contains malformed JSON: {}; not stopping or clearing; quarantine or remove it explicitly",
+                    m.message()
+                ),
+                crate::state::Inspection::Incompatible(e, _) => anyhow::bail!(
+                    "state file has incompatible schema: {e}; not stopping or clearing"
+                ),
+            };
+            let observed_id = state.instance_id.clone();
             let outcome = browser::stop(&state)?;
-            crate::state::clear()?;
+            if !crate::state::clear_observed_lifecycle(
+                &_lifecycle,
+                observed_id.as_deref(),
+                &generation,
+            )? {
+                anyhow::bail!(
+                    "state changed while stopping; preserved concurrent replacement and did not clear it"
+                )
+            }
             match outcome {
                 browser::StopOutcome::Stopped => println!("stopped"),
                 browser::StopOutcome::Detached => println!("detached (browser left running)"),
@@ -523,6 +541,58 @@ pub fn run() -> Result<()> {
         session.drain_events(std::time::Duration::from_millis(300))?;
     }
     Ok(())
+}
+
+fn refuse_occupied_lifecycle(lock: &crate::state::LifecycleLock, action: &str) -> Result<()> {
+    match crate::state::inspect_for_lifecycle(lock)? {
+        crate::state::Inspection::Missing => Ok(()),
+        crate::state::Inspection::Malformed(m) => anyhow::bail!(
+            "refusing to {action}: state file contains malformed JSON: {}; run `rdny cleanup` or remove/quarantine the corrupt state after verifying no browser owns it",
+            m.message()
+        ),
+        crate::state::Inspection::Incompatible(e, _) => anyhow::bail!(
+            "refusing to {action}: state file has incompatible schema: {e}; upgrade rdny or inspect/remove the state explicitly"
+        ),
+        crate::state::Inspection::Valid(state, _) => {
+            if let Some(id) = &state.process_identity {
+                crate::process_identity::validate_persisted(
+                    state.pid,
+                    state.browser_path.as_deref(),
+                    state.user_data_dir.as_deref(),
+                    id,
+                )
+                .with_context(|| {
+                    format!("refusing to {action}: existing managed state identity is inconsistent")
+                })?;
+            }
+            let reachable = crate::cdp::http::version(&state.host, state.port).is_ok();
+            match crate::process_identity::classify(
+                state.pid,
+                state.process_identity.as_ref(),
+                reachable,
+            ) {
+                crate::process_identity::ProcessClass::ManagedMatching
+                | crate::process_identity::ProcessClass::AttachedReachable
+                | crate::process_identity::ProcessClass::LegacyUnverifiable => {
+                    let owner = state
+                        .pid
+                        .map(|pid| format!("managed pid {pid}"))
+                        .unwrap_or_else(|| "attached browser".to_string());
+                    Err(crate::hint::hint_error(
+                        format!(
+                            "refusing to {action}: live {owner} already owns state dir on port {}",
+                            state.port
+                        ),
+                        "run `rdny stop` first, or use a different --state-dir",
+                        None,
+                    ))
+                }
+                crate::process_identity::ProcessClass::ManagedDead
+                | crate::process_identity::ProcessClass::AttachedDead
+                | crate::process_identity::ProcessClass::PidReusedOrUnrelated => Ok(()),
+            }
+        }
+    }
 }
 
 pub fn parse_address(address: &str) -> Result<(String, u16)> {

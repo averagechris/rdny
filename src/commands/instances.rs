@@ -79,6 +79,7 @@ pub struct Discovery {
     pub instances: Vec<Instance>,
     pub diagnostics: Vec<String>,
     pub stale_registered: Vec<(PathBuf, String)>,
+    pub malformed: Vec<(PathBuf, Option<String>)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -114,8 +115,18 @@ pub fn cleanup(all: bool) -> Result<()> {
     for diagnostic in &discovery.diagnostics {
         eprintln!("warning: {diagnostic}");
     }
+    for (dir, instance_id) in &discovery.malformed {
+        let lifecycle = state::lifecycle_lock_at(dir)
+            .with_context(|| format!("locking lifecycle in {}", dir.display()))?;
+        if let Some(path) = state::quarantine_malformed_locked(&lifecycle, instance_id.as_deref())?
+        {
+            eprintln!("warning: quarantined malformed state as {}", path.display());
+        }
+    }
     for (dir, instance_id) in &discovery.stale_registered {
-        state::unregister_state_dir_if_observed_id(dir, instance_id)?;
+        let lifecycle = state::lifecycle_lock_at(dir)
+            .with_context(|| format!("locking lifecycle in {}", dir.display()))?;
+        state::prune_stale_registry_locked(&lifecycle, instance_id)?;
     }
     let cleaned = cleanup_instances(discovery.instances, all, probe_liveness)?;
     for instance in cleaned {
@@ -135,7 +146,7 @@ pub fn discover() -> Result<Discovery> {
 }
 
 fn candidate_dirs() -> Result<(Vec<CandidateDir>, Vec<String>)> {
-    let current = state::state_dir()?;
+    let current = state::resolved_state_dir()?;
     let default = state::default_state_dir()?;
     let (registered, diagnostics) = state::registered_state_dirs()?;
     let mut dirs = vec![(current, None), (default, None)];
@@ -162,6 +173,7 @@ fn discover_from_with_diagnostics(
 ) -> Result<Discovery> {
     let mut found: BTreeMap<PathBuf, Instance> = BTreeMap::new();
     let mut stale_registered = Vec::new();
+    let mut malformed_found = Vec::new();
     for (dir, registry_instance_id) in candidate_dirs {
         let registered = registry_instance_id.is_some();
         let key = canonical_key(&dir);
@@ -218,11 +230,11 @@ fn discover_from_with_diagnostics(
                     dir.display(),
                     malformed.message()
                 ));
-                if let Some(path) = store.quarantine_malformed("state.json", &malformed)? {
-                    diagnostics.push(format!("quarantined malformed state as {}", path.display()));
-                }
                 if let Some(observed_id) = registry_instance_id {
-                    stale_registered.push((dir, observed_id));
+                    stale_registered.push((dir.clone(), observed_id.clone()));
+                    malformed_found.push((dir, Some(observed_id)));
+                } else {
+                    malformed_found.push((dir, None));
                 }
                 continue;
             }
@@ -256,17 +268,8 @@ fn discover_from_with_diagnostics(
         instances: found.into_values().collect(),
         diagnostics,
         stale_registered,
+        malformed: malformed_found,
     })
-}
-
-fn prune_registered_if_empty(instance: &Instance) -> Result<()> {
-    if instance.registered
-        && !instance.dir.join("state.json").exists()
-        && let Some(instance_id) = &instance.state.instance_id
-    {
-        state::unregister_state_dir_if_observed(&instance.dir, instance_id)?;
-    }
-    Ok(())
 }
 
 fn canonical_key(dir: &Path) -> PathBuf {
@@ -319,22 +322,39 @@ fn cleanup_instances_with_hook(
             continue;
         }
         before_locked_action(&instance);
-        // Attached sessions are only detached: removing state.json
-        // never touches the externally-owned browser.
-        let removed = state::open_store_at(&instance.dir)
-            .with_context(|| format!("opening {}", instance.dir.display()))?
-            .remove_if_generation::<SessionState, _>("state.json", &instance.generation, |latest| {
-                let latest_liveness = liveness(latest);
-                if latest_liveness == Liveness::Alive {
-                    browser::stop(latest).with_context(|| {
-                        format!("stopping instance in {}", instance.dir.display())
-                    })?;
-                }
-                Ok(all || latest_liveness == Liveness::Dead)
-            })
-            .with_context(|| format!("removing state in {}", instance.dir.display()))?;
+        let _lifecycle = state::lifecycle_lock_at(&instance.dir)
+            .with_context(|| format!("locking lifecycle in {}", instance.dir.display()))?;
+        let store = state::open_store_at(&instance.dir)
+            .with_context(|| format!("opening {}", instance.dir.display()))?;
+        let Inspection::Valid(latest, latest_generation) =
+            store.inspect::<SessionState>("state.json")?
+        else {
+            continue;
+        };
+        if latest_generation.bytes() != instance.generation.bytes()
+            || instance
+                .registry_instance_id
+                .as_deref()
+                .is_some_and(|id| latest.instance_id.as_deref() != Some(id))
+        {
+            continue;
+        }
+        let latest_liveness = liveness(&latest);
+        if !all && latest_liveness != Liveness::Dead {
+            continue;
+        }
+        // Attached sessions are only detached. Managed live sessions selected
+        // by --all are stopped while lifecycle ownership remains exclusive.
+        if latest_liveness == Liveness::Alive {
+            browser::stop(&latest)
+                .with_context(|| format!("stopping instance in {}", instance.dir.display()))?;
+        }
+        let removed = state::clear_observed_lifecycle(
+            &_lifecycle,
+            latest.instance_id.as_deref(),
+            &latest_generation,
+        )?;
         if removed {
-            prune_registered_if_empty(&instance)?;
             cleaned.push(instance);
         }
     }
@@ -430,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_state_is_quarantined_during_discovery() {
+    fn malformed_state_discovery_is_read_only() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("state.json"), "not json").unwrap();
         let discovery = discover_from_with_diagnostics(
@@ -449,12 +469,14 @@ mod tests {
                 .iter()
                 .any(|d| d.contains("malformed state"))
         );
-        assert!(!temp.path().join("state.json").exists());
-        assert!(fs::read_dir(temp.path()).unwrap().flatten().any(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .contains("state.json.quarantine")
-        }));
+        assert!(temp.path().join("state.json").exists());
+        assert_eq!(discovery.malformed.len(), 1);
+        assert!(
+            !fs::read_dir(temp.path())
+                .unwrap()
+                .flatten()
+                .any(|e| { e.file_name().to_string_lossy().contains("quarantine") })
+        );
     }
 
     #[test]
