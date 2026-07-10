@@ -47,10 +47,25 @@ pub fn set(sess: &mut PageSession, cookie: &SetCookie<'_>) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn list(sess: &mut PageSession) -> Result<()> {
+    list_format(sess, false)
+}
+
+pub fn list_format(sess: &mut PageSession, structured: bool) -> Result<()> {
     let url = current_url(sess)?;
-    for line in format_cookie_list(&cookies_for_urls(sess, &[url])?) {
-        println!("{line}");
+    let cookies = cookies_for_urls(sess, std::slice::from_ref(&url))?;
+    if structured {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &json!({"schemaVersion":1,"kind":"cookies","url":url,"cookies": normalize_cookie_list(&cookies)})
+            )?
+        );
+    } else {
+        for line in format_cookie_list(&cookies) {
+            println!("{line}");
+        }
     }
     Ok(())
 }
@@ -128,9 +143,18 @@ pub fn format_cookie_list(cookies: &[Value]) -> Vec<String> {
         .iter()
         .filter_map(|cookie| {
             Some(format!(
-                "{}={}",
+                "{}={} domain={} path={} secure={} httpOnly={} sameSite={} expires={}",
                 cookie["name"].as_str()?,
-                cookie["value"].as_str()?
+                cookie["value"].as_str()?,
+                cookie["domain"].as_str().unwrap_or(""),
+                cookie["path"].as_str().unwrap_or("/"),
+                cookie["secure"].as_bool().unwrap_or(false),
+                cookie["httpOnly"].as_bool().unwrap_or(false),
+                cookie["sameSite"].as_str().unwrap_or("unspecified"),
+                cookie
+                    .get("expires")
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "session".to_string())
             ))
         })
         .collect();
@@ -140,6 +164,21 @@ pub fn format_cookie_list(cookies: &[Value]) -> Vec<String> {
         an.cmp(bn)
     });
     lines
+}
+
+fn normalize_cookie_list(cookies: &[Value]) -> Vec<Value> {
+    let mut out: Vec<_> = cookies
+        .iter()
+        .map(|c| {
+            json!({
+                "name": c.get("name"), "value": c.get("value"), "domain": c.get("domain"),
+                "path": c.get("path"), "secure": c.get("secure"), "httpOnly": c.get("httpOnly"),
+                "sameSite": c.get("sameSite"), "expires": c.get("expires")
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    out
 }
 
 pub fn find_cookie_value(cookies: &[Value], name: &str) -> Option<String> {
@@ -172,7 +211,13 @@ mod tests {
             json!({ "name": "z", "value": "last" }),
             json!({ "name": "a", "value": "first" }),
         ];
-        assert_eq!(format_cookie_list(&cookies), vec!["a=first", "z=last"]);
+        assert_eq!(
+            format_cookie_list(&cookies),
+            vec![
+                "a=first domain= path=/ secure=false httpOnly=false sameSite=unspecified expires=session",
+                "z=last domain= path=/ secure=false httpOnly=false sameSite=unspecified expires=session",
+            ]
+        );
     }
 
     #[test]

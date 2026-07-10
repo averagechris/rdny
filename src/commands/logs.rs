@@ -1,6 +1,6 @@
 //! Console and browser log capture.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -9,7 +9,17 @@ use crate::cdp::client::Event;
 use crate::session::PageSession;
 
 /// Enable log domains and print console/log events.
+#[allow(dead_code)]
 pub fn logs(sess: &mut PageSession, follow: bool) -> Result<()> {
+    logs_format(sess, follow, None, false)
+}
+
+pub fn logs_format(
+    sess: &mut PageSession,
+    follow: bool,
+    duration_secs: Option<f64>,
+    structured: bool,
+) -> Result<()> {
     sess.call("Runtime.enable", json!({}))?;
     sess.call("Log.enable", json!({}))?;
 
@@ -18,20 +28,23 @@ pub fn logs(sess: &mut PageSession, follow: bool) -> Result<()> {
         loop {
             if let Some(event) = sess.next_event(Duration::from_secs(1))?
                 && event.session_id.as_deref() == Some(session_id.as_str())
-                && let Some(line) = event_line(&event)
+                && let Some(line) = event_line_format(&event, structured)
             {
                 println!("{line}");
             }
         }
     }
 
-    let deadline = Instant::now() + sess.timeout;
+    let timeout = duration_secs
+        .map(Duration::from_secs_f64)
+        .unwrap_or(sess.timeout);
+    let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let poll = remaining.min(Duration::from_millis(100));
         if let Some(event) = sess.next_event(poll)?
             && event.session_id.as_deref() == Some(session_id.as_str())
-            && let Some(line) = event_line(&event)
+            && let Some(line) = event_line_format(&event, structured)
         {
             println!("{line}");
         }
@@ -40,13 +53,52 @@ pub fn logs(sess: &mut PageSession, follow: bool) -> Result<()> {
 }
 
 /// Convert a CDP event into the single stdout line rdny logs should print.
+#[allow(dead_code)]
 pub fn event_line(event: &Event) -> Option<String> {
+    event_line_format(event, false)
+}
+
+pub fn event_line_format(event: &Event, structured: bool) -> Option<String> {
+    if structured {
+        return structured_event(event).map(|v| v.to_string());
+    }
     match event.method.as_str() {
         "Runtime.consoleAPICalled" => console_api_line(&event.params),
         "Runtime.exceptionThrown" => exception_line(&event.params),
         "Log.entryAdded" => log_entry_line(&event.params),
         _ => None,
     }
+}
+
+fn structured_event(event: &Event) -> Option<Value> {
+    let (severity, text) = match event.method.as_str() {
+        "Runtime.consoleAPICalled" => (
+            event
+                .params
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("log"),
+            console_api_line(&event.params)?,
+        ),
+        "Runtime.exceptionThrown" => ("error", exception_line(&event.params)?),
+        "Log.entryAdded" => (
+            event
+                .params
+                .get("entry")?
+                .get("level")
+                .and_then(Value::as_str)
+                .unwrap_or("info"),
+            log_entry_line(&event.params)?,
+        ),
+        _ => return None,
+    };
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs_f64();
+    Some(
+        json!({"schemaVersion":1,"kind":"log","timestamp":ts,"instance":event.session_id,"target":event.session_id,"severity":severity,"message":text}),
+    )
 }
 
 fn console_api_line(params: &Value) -> Option<String> {

@@ -90,21 +90,39 @@ pub struct InstanceLine {
     pub label: Option<String>,
 }
 
+#[allow(dead_code)]
 pub fn list() -> Result<()> {
+    list_format(false)
+}
+
+pub fn list_format(structured: bool) -> Result<()> {
     let discovery = discover()?;
     for diagnostic in &discovery.diagnostics {
         eprintln!("warning: {diagnostic}");
     }
+    let mut rows = Vec::new();
     for instance in discovery.instances {
         let liveness = probe_liveness(&instance.state);
+        if structured {
+            rows.push(serde_json::json!({"dir":instance.dir,"pid":instance.state.pid,"liveness":format!("{:?}", liveness).to_lowercase(),"label":instance.state.label,"instance":instance.state.instance_id,"target":instance.state.target_id,"host":instance.state.host,"port":instance.state.port}));
+        } else {
+            println!(
+                "{}",
+                format_line(&InstanceLine {
+                    dir: instance.dir,
+                    pid: instance.state.pid,
+                    liveness,
+                    label: instance.state.label
+                })
+            );
+        }
+    }
+    if structured {
         println!(
             "{}",
-            format_line(&InstanceLine {
-                dir: instance.dir,
-                pid: instance.state.pid,
-                liveness,
-                label: instance.state.label,
-            })
+            serde_json::to_string_pretty(
+                &serde_json::json!({"schemaVersion":1,"kind":"list","instances":rows})
+            )?
         );
     }
     Ok(())

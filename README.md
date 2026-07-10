@@ -134,6 +134,14 @@ Downloads perform a best-effort `HEAD` preflight and reject payloads larger than
 Fetched chunks are decoded and written incrementally to the reserved artifact (or
 stdout) instead of materializing additional full output copies in Rust.
 
+Machine-readable command output is selected globally with
+`--format human|json|jsonl`. Supported schemas are versioned with
+`schemaVersion: 1` and documented in [`docs/cli-output-schemas.md`](docs/cli-output-schemas.md).
+Human page/content output strips terminal-control bytes before printing, and
+warnings/progress are written to stderr so structured stdout remains parseable.
+Use `rdny status --check` as a health check, and `rdny completion SHELL` to
+generate shell completions.
+
 `rdny file SELECTOR -` reads upload data from stdin into a private temporary file
 with owner-only permissions, keeps it until Chrome accepts the upload, and then
 removes it on success or normal error. Stdin uploads are limited to 64 MiB; pass

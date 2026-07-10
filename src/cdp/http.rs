@@ -405,6 +405,7 @@ mod tests {
     fn rejects_oversized_headers_and_bodies() {
         let mut response = b"HTTP/1.1 200 OK\r\nX-Big: ".to_vec();
         response.extend(vec![b'a'; MAX_HEADER_BYTES]);
+        response.extend_from_slice(b"\r\n\r\n{}");
         let port = serve_once(response);
         assert!(
             format!("{}", get_json("127.0.0.1", port, "/").unwrap_err()).contains("headers exceed")

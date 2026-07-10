@@ -22,9 +22,16 @@ use serde_json::Value;
 pub fn print_value(value: &Value) {
     match value {
         Value::Null => {}
-        Value::String(s) => println!("{s}"),
+        Value::String(s) => println!("{}", human_sanitize(s)),
         other => println!("{other}"),
     }
+}
+
+/// Strip terminal-control bytes from browser/page controlled text before human output.
+pub fn human_sanitize(s: &str) -> String {
+    s.chars()
+        .filter(|&c| c == '\n' || c == '\t' || c == '\r' || (!c.is_control() && c != '\u{7f}'))
+        .collect()
 }
 
 /// Decode a base64 payload as returned by Chrome (screenshots, PDF,

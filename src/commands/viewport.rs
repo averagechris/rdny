@@ -6,6 +6,7 @@ use serde_json::json;
 use crate::session::PageSession;
 use crate::state::{self, ViewportOverride};
 
+#[allow(dead_code)]
 pub fn viewport(
     sess: &mut PageSession,
     width: Option<u32>,
@@ -14,12 +15,30 @@ pub fn viewport(
     mobile: bool,
     reset: bool,
 ) -> Result<()> {
+    viewport_format(sess, width, height, scale, mobile, reset, false)
+}
+
+pub fn viewport_format(
+    sess: &mut PageSession,
+    width: Option<u32>,
+    height: Option<u32>,
+    scale: f64,
+    mobile: bool,
+    reset: bool,
+    structured: bool,
+) -> Result<()> {
     if reset {
         sess.call("Emulation.clearDeviceMetricsOverride", json!({}))?;
         state::update(|state| {
             state.viewport = None;
             Ok(())
         })?;
+        if structured {
+            println!(
+                "{}",
+                serde_json::json!({"schemaVersion":1,"kind":"viewport","reset":true,"viewport":null})
+            );
+        }
         return Ok(());
     }
 
@@ -33,23 +52,41 @@ pub fn viewport(
             };
             sess.call("Emulation.setDeviceMetricsOverride", override_.cdp_params())?;
             state::update(|state| {
-                state.viewport = Some(override_);
+                state.viewport = Some(override_.clone());
                 Ok(())
             })?;
+            if structured {
+                println!("{}", viewport_json(&override_, true));
+            }
         }
         (None, None) => {
             if let Some(override_) = state::require()?.viewport {
-                println!("{}", format_viewport(&override_));
+                if structured {
+                    println!("{}", viewport_json(&override_, false));
+                } else {
+                    println!("{}", format_viewport(&override_));
+                }
             } else {
                 let width = value_as_u32(sess.eval("window.innerWidth")?, "window.innerWidth")?;
                 let height = value_as_u32(sess.eval("window.innerHeight")?, "window.innerHeight")?;
-                println!("{width}x{height}");
+                if structured {
+                    println!(
+                        "{}",
+                        serde_json::json!({"schemaVersion":1,"kind":"viewport","applied":false,"width":width,"height":height,"scale":1.0,"mobile":false})
+                    );
+                } else {
+                    println!("{width}x{height}");
+                }
             }
         }
         _ => unreachable!("clap requires width and height together"),
     }
 
     Ok(())
+}
+
+fn viewport_json(viewport: &ViewportOverride, applied: bool) -> serde_json::Value {
+    serde_json::json!({"schemaVersion":1,"kind":"viewport","applied":applied,"width":viewport.width,"height":viewport.height,"scale":viewport.scale,"mobile":viewport.mobile})
 }
 
 pub fn restore_persisted(

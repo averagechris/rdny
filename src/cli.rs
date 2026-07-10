@@ -1,7 +1,8 @@
 //! Command-line surface and dispatch.
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use serde_json::json;
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 
@@ -24,8 +25,30 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub state_dir: Option<PathBuf>,
 
+    /// Output format for supported commands (schemaVersion 1 for structured output).
+    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Human)]
+    pub format: OutputFormat,
+
     #[command(subcommand)]
     pub command: Command,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    Human,
+    Json,
+    Jsonl,
+}
+
+impl OutputFormat {
+    fn emit(self, value: &serde_json::Value) -> Result<()> {
+        match self {
+            Self::Human => println!("{}", crate::commands::human_sanitize(&value.to_string())),
+            Self::Json => println!("{}", serde_json::to_string_pretty(value)?),
+            Self::Jsonl => println!("{}", serde_json::to_string(value)?),
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -52,9 +75,11 @@ pub enum Command {
     /// Stop the current browser session.
     Stop,
     /// Show current browser session status.
-    Status,
+    Status(StatusArgs),
     /// List discovered rdny instances.
     List,
+    /// Generate shell completion script for a supported shell.
+    Completion { shell: clap_complete::Shell },
     /// Clean up stale instance state files.
     Cleanup(CleanupArgs),
     /// Open a URL in the current page.
@@ -97,13 +122,14 @@ pub enum Command {
     /// Click an element.
     Click { selector: String },
     /// Type text into an element.
-    Input { selector: String, text: String },
+    Input(InputArgs),
     /// Clear an element's value.
     Clear { selector: String },
     /// Upload a file to an input element.
     File { selector: String, path: PathBuf },
     /// Click and download a linked resource.
     Download {
+        /// Link or element selector to click.
         selector: String,
         /// Maximum accepted payload bytes (default 268435456; env RDNY_MAX_DOWNLOAD_BYTES).
         #[arg(long)]
@@ -228,6 +254,13 @@ pub struct CleanupArgs {
 }
 
 #[derive(Debug, Parser)]
+pub struct StatusArgs {
+    /// Exit 0 only for a healthy running/reachable session, 1 otherwise.
+    #[arg(long)]
+    pub check: bool,
+}
+
+#[derive(Debug, Parser)]
 pub struct ReloadArgs {
     /// Bypass cache while reloading.
     #[arg(long)]
@@ -239,6 +272,9 @@ pub struct LogsArgs {
     /// Keep streaming log events until interrupted.
     #[arg(long)]
     pub follow: bool,
+    /// Capture duration in seconds when not following (default: global --timeout).
+    #[arg(long)]
+    pub duration: Option<f64>,
 }
 
 #[derive(Debug, Parser)]
@@ -282,8 +318,17 @@ pub enum CookieCommand {
 pub struct CookieSetArgs {
     /// Cookie name.
     pub name: String,
-    /// Cookie value.
-    pub value: String,
+    /// Cookie value. Prefer --value-stdin/--value-file/--value-fd for secrets.
+    pub value: Option<String>,
+    /// Read cookie value from stdin to avoid argv leakage.
+    #[arg(long, conflicts_with_all = ["value", "value_file", "value_fd"])]
+    pub value_stdin: bool,
+    /// Read cookie value from this file to avoid argv leakage.
+    #[arg(long = "value-file", conflicts_with_all = ["value", "value_stdin", "value_fd"])]
+    pub value_file: Option<PathBuf>,
+    /// Read cookie value from this file descriptor to avoid argv leakage.
+    #[arg(long = "value-fd", conflicts_with_all = ["value", "value_stdin", "value_file"])]
+    pub value_fd: Option<i32>,
     /// Cookie domain.
     #[arg(long)]
     pub domain: String,
@@ -299,6 +344,23 @@ pub struct CookieSetArgs {
     /// SameSite policy: strict, lax, or none.
     #[arg(long = "same-site", value_enum, ignore_case = true)]
     pub same_site: Option<CookieSameSiteArg>,
+}
+
+#[derive(Debug, Parser)]
+pub struct InputArgs {
+    /// CSS selector.
+    pub selector: String,
+    /// Text to type. Prefer --text-stdin/--text-file/--text-fd for secrets.
+    pub text: Option<String>,
+    /// Read input text from stdin to avoid argv leakage.
+    #[arg(long, conflicts_with_all = ["text", "text_file", "text_fd"])]
+    pub text_stdin: bool,
+    /// Read input text from this file to avoid argv leakage.
+    #[arg(long = "text-file", conflicts_with_all = ["text", "text_stdin", "text_fd"])]
+    pub text_file: Option<PathBuf>,
+    /// Read input text from this file descriptor to avoid argv leakage.
+    #[arg(long = "text-fd", conflicts_with_all = ["text", "text_stdin", "text_file"])]
+    pub text_fd: Option<i32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -331,17 +393,13 @@ pub struct CookieDeleteArgs {
 }
 
 #[derive(Debug, Parser)]
-#[command(disable_help_flag = true)]
 pub struct ScreenshotArgs {
     /// Screenshot width.
     #[arg(short = 'w')]
     pub width: Option<u32>,
-    /// Screenshot height.
-    #[arg(short = 'h', long)]
+    /// Screenshot height. Short -H replaces legacy -h so -h shows help.
+    #[arg(short = 'H', long, alias = "legacy-height")]
     pub height: Option<u32>,
-    /// Show help.
-    #[arg(long, action = clap::ArgAction::Help)]
-    pub help: Option<bool>,
     /// Replace an existing output file.
     #[arg(long)]
     pub force: bool,
@@ -452,8 +510,17 @@ pub fn run() -> Result<()> {
                 browser::StopOutcome::Detached => println!("detached (browser left running)"),
             }
         }
-        Command::Status => match crate::state::load()? {
-            None => println!("no session"),
+        Command::Status(args) => match crate::state::load()? {
+            None => {
+                if cli.format == OutputFormat::Human {
+                    println!("no session")
+                } else {
+                    cli.format.emit(&json!({"schemaVersion":1,"kind":"status","status":"missing","healthy":false}))?;
+                }
+                if args.check {
+                    std::process::exit(1);
+                }
+            }
             Some(state) => match browser::status(&state)? {
                 BrowserStatus::Running { browser } => {
                     let pid = state
@@ -465,17 +532,32 @@ pub fn run() -> Result<()> {
                         .as_deref()
                         .map(|label| format!(" label={label}"))
                         .unwrap_or_default();
-                    println!(
-                        "running: {browser} on {}:{} (pid {pid}){label}",
-                        state.host, state.port
-                    );
+                    if cli.format == OutputFormat::Human {
+                        println!(
+                            "running: {browser} on {}:{} (pid {pid}){label}",
+                            state.host, state.port
+                        );
+                    } else {
+                        cli.format.emit(&json!({"schemaVersion":1,"kind":"status","status":"running","healthy":true,"browser":browser,"host":state.host,"port":state.port,"pid":state.pid,"instance":state.instance_id,"target":state.target_id,"label":state.label}))?;
+                    }
                 }
                 BrowserStatus::Stale => {
-                    println!("stale: state file exists but browser is not responding");
+                    if cli.format == OutputFormat::Human {
+                        println!("stale: state file exists but browser is not responding");
+                    } else {
+                        cli.format.emit(&json!({"schemaVersion":1,"kind":"status","status":"stale","healthy":false,"host":state.host,"port":state.port,"pid":state.pid,"instance":state.instance_id,"target":state.target_id}))?;
+                    }
+                    if args.check {
+                        std::process::exit(1);
+                    }
                 }
             },
         },
-        Command::List => commands::instances::list()?,
+        Command::List => commands::instances::list_format(cli.format != OutputFormat::Human)?,
+        Command::Completion { shell } => {
+            let mut cmd = Cli::command();
+            clap_complete::generate(shell, &mut cmd, "rdny", &mut std::io::stdout());
+        }
         Command::Cleanup(args) => commands::instances::cleanup(args.all)?,
         Command::Open { url, policy } => {
             commands::nav::open_with_policy(sess!(), &url, &(&policy).into())?
@@ -485,19 +567,30 @@ pub fn run() -> Result<()> {
         Command::Reload(args) => commands::nav::reload(sess!(), args.hard)?,
         Command::ClearCache => commands::nav::clear_cache(sess!())?,
         Command::Cookie(args) => match args.command {
-            CookieCommand::Set(args) => commands::cookie::set(
-                sess!(),
-                &commands::cookie::SetCookie {
-                    name: &args.name,
-                    value: &args.value,
-                    domain: &args.domain,
-                    path: &args.path,
-                    secure: args.secure,
-                    http_only: args.http_only,
-                    same_site: args.same_site.map(Into::into),
-                },
-            )?,
-            CookieCommand::List => commands::cookie::list(sess!())?,
+            CookieCommand::Set(args) => {
+                let value = resolve_secret(
+                    args.value.as_deref(),
+                    args.value_stdin,
+                    args.value_file.as_deref(),
+                    args.value_fd,
+                    "cookie value",
+                )?;
+                commands::cookie::set(
+                    sess!(),
+                    &commands::cookie::SetCookie {
+                        name: &args.name,
+                        value: &value,
+                        domain: &args.domain,
+                        path: &args.path,
+                        secure: args.secure,
+                        http_only: args.http_only,
+                        same_site: args.same_site.map(Into::into),
+                    },
+                )?
+            }
+            CookieCommand::List => {
+                commands::cookie::list_format(sess!(), cli.format != OutputFormat::Human)?
+            }
             CookieCommand::Get { name } => commands::cookie::get(sess!(), &name)?,
             CookieCommand::Delete(args) => {
                 commands::cookie::delete(sess!(), &args.name, &args.domain, &args.path)?
@@ -515,17 +608,32 @@ pub fn run() -> Result<()> {
             let expression = resolve_js_expression(expression, stdin, stdin_is_tty)?;
             commands::interact::js(sess!(), &expression)?
         }
-        Command::Logs(args) => commands::logs::logs(sess!(), args.follow)?,
-        Command::Viewport(args) => commands::viewport::viewport(
+        Command::Logs(args) => commands::logs::logs_format(
+            sess!(),
+            args.follow,
+            args.duration,
+            cli.format != OutputFormat::Human,
+        )?,
+        Command::Viewport(args) => commands::viewport::viewport_format(
             sess!(),
             args.width,
             args.height,
             args.scale,
             args.mobile,
             args.reset,
+            cli.format != OutputFormat::Human,
         )?,
         Command::Click { selector } => commands::interact::click(sess!(), &selector)?,
-        Command::Input { selector, text } => commands::interact::input(sess!(), &selector, &text)?,
+        Command::Input(args) => {
+            let text = resolve_secret(
+                args.text.as_deref(),
+                args.text_stdin,
+                args.text_file.as_deref(),
+                args.text_fd,
+                "input text",
+            )?;
+            commands::interact::input(sess!(), &args.selector, &text)?
+        }
         Command::Clear { selector } => commands::interact::clear(sess!(), &selector)?,
         Command::File { selector, path } => commands::interact::file(sess!(), &selector, &path)?,
         Command::Download {
@@ -579,7 +687,7 @@ pub fn run() -> Result<()> {
             force,
             file,
         } => commands::shot::screenshot_el(sess!(), &selector, file.as_deref(), force)?,
-        Command::Pages => commands::tabs::pages()?,
+        Command::Pages => commands::tabs::pages_format(cli.format != OutputFormat::Human)?,
         Command::Page { index } => commands::tabs::page(index)?,
         Command::Newpage { url, policy } => {
             commands::tabs::newpage_with_policy(url.as_deref(), cli.timeout, &(&policy).into())?
@@ -648,6 +756,57 @@ fn refuse_occupied_lifecycle(lock: &crate::state::LifecycleLock, action: &str) -
             }
         }
     }
+}
+
+fn resolve_secret(
+    value: Option<&str>,
+    stdin: bool,
+    file: Option<&std::path::Path>,
+    fd: Option<i32>,
+    label: &str,
+) -> Result<String> {
+    if let Some(value) = value {
+        return Ok(value.to_string());
+    }
+    if stdin {
+        let mut out = String::new();
+        std::io::stdin()
+            .read_to_string(&mut out)
+            .with_context(|| format!("reading {label} from stdin"))?;
+        return Ok(trim_one_trailing_newline(out));
+    }
+    if let Some(file) = file {
+        return Ok(trim_one_trailing_newline(
+            std::fs::read_to_string(file)
+                .with_context(|| format!("reading {label} from {}", file.display()))?,
+        ));
+    }
+    if let Some(fd) = fd {
+        if fd < 0 {
+            anyhow::bail!("invalid fd {fd} for {label}");
+        }
+        let path = std::path::PathBuf::from(format!("/dev/fd/{fd}"));
+        return Ok(trim_one_trailing_newline(
+            std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {label} from fd {fd}"))?,
+        ));
+    }
+    anyhow::bail!(
+        "missing {label}; pass a value or --{}-stdin/--{}-file/--{}-fd",
+        label.replace(' ', "-"),
+        label.replace(' ', "-"),
+        label.replace(' ', "-")
+    )
+}
+
+fn trim_one_trailing_newline(mut s: String) -> String {
+    if s.ends_with('\n') {
+        s.pop();
+        if s.ends_with('\r') {
+            s.pop();
+        }
+    }
+    s
 }
 
 pub fn parse_address(address: &str) -> Result<(String, u16)> {
@@ -882,7 +1041,7 @@ mod tests {
         );
         assert!(matches!(
             parse(&["rdny", "logs", "--follow"]),
-            Command::Logs(LogsArgs { follow: true })
+            Command::Logs(LogsArgs { follow: true, .. })
         ));
         assert!(matches!(
             parse(&["rdny", "viewport"]),
@@ -961,7 +1120,7 @@ mod tests {
                 command: CookieCommand::Set(args),
             }) => {
                 assert_eq!(args.name, "sid");
-                assert_eq!(args.value, "abc");
+                assert_eq!(args.value.as_deref(), Some("abc"));
                 assert_eq!(args.domain, "example.com");
                 assert_eq!(args.path, "/");
                 assert!(!args.secure);
@@ -1036,7 +1195,8 @@ mod tests {
 
     #[test]
     fn parses_screenshot_height_short() {
-        match parse(&["rdny", "screenshot", "-w", "1280", "-h", "720", "out.png"]) {
+        assert!(Cli::try_parse_from(["rdny", "screenshot", "-h"]).is_err());
+        match parse(&["rdny", "screenshot", "-w", "1280", "-H", "720", "out.png"]) {
             Command::Screenshot(args) => {
                 assert_eq!(args.width, Some(1280));
                 assert_eq!(args.height, Some(720));
