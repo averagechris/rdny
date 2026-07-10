@@ -1,7 +1,6 @@
 //! Browser discovery, launch, and lifecycle (start/connect/stop/status).
 
 use std::ffi::OsStr;
-use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -12,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use crate::cdp::http;
 use crate::config;
 use crate::hint::hint_error;
-use crate::state::SessionState;
+use crate::state::{BrowserStorage, SessionState};
 
 const DEVTOOLS_TIMEOUT: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -48,31 +47,29 @@ pub fn discover() -> Result<PathBuf> {
 }
 
 /// Launch the browser with a remote debugging port and verify it is
-/// reachable (probe /json/version). `data_root` is the rdny state dir
-/// (from `state::state_dir()`); the profile dir and chrome.log live
-/// under it. Returns the session to persist.
-pub fn launch(opts: &LaunchOpts, data_root: &Path) -> Result<SessionState> {
+/// reachable (probe /json/version). Profile and log creation is performed
+/// relative to validated, open state-directory descriptors. Chrome requires a
+/// real directory path for descendant creation, so the profile argument is the
+/// normalized absolute path after validation. Every ancestor is descriptor-
+/// checked as root/current-user owned and non-writable by other users, except
+/// root-owned sticky directories; the state root/profile are current-user 0700.
+/// This prevents cross-UID replacement. Same-UID lifecycle orchestration is
+/// intentionally deferred to #130/#131.
+pub fn launch(opts: &LaunchOpts, storage: BrowserStorage) -> Result<SessionState> {
     let binary = discover()?;
-    fs::create_dir_all(data_root).with_context(|| format!("creating {}", data_root.display()))?;
-    let profile_dir = data_root.join("chrome-profile");
-    fs::create_dir_all(&profile_dir)
-        .with_context(|| format!("creating {}", profile_dir.display()))?;
-    let active_port_path = profile_dir.join("DevToolsActivePort");
-    let _ = fs::remove_file(&active_port_path);
+    let profile_dir = storage.profile.path().to_path_buf();
+    let data_root = profile_dir.parent().context("profile has no state root")?;
+    storage.profile.remove_file("DevToolsActivePort")?;
 
     let mut user_args = opts.extra_args.clone();
     // Split RDNY_CHROME_ARGS on ASCII whitespace. Shell-style quoting is not supported.
     if let Ok(raw) = std::env::var("RDNY_CHROME_ARGS") {
         user_args.extend(raw.split_ascii_whitespace().map(String::from));
     }
+    storage.profile.validate_external_path()?;
     let args = build_args(opts, &profile_dir, &user_args, cfg!(target_os = "macos"));
 
-    let log = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(data_root.join("chrome.log"))
-        .with_context(|| format!("opening {}/chrome.log", data_root.display()))?;
+    let log = storage.log;
     let log_err = log.try_clone().context("cloning chrome log handle")?;
     let mut child = Command::new(&binary)
         .args(&args)
@@ -82,7 +79,7 @@ pub fn launch(opts: &LaunchOpts, data_root: &Path) -> Result<SessionState> {
         .spawn()
         .with_context(|| format!("launching {}", binary.display()))?;
 
-    let port = match wait_for_devtools_port(&active_port_path) {
+    let port = match wait_for_devtools_port(&storage.profile) {
         Ok(port) => port,
         Err(_) => {
             kill_child(&mut child);
@@ -375,11 +372,11 @@ fn parse_devtools_active_port(contents: &str) -> Result<u16> {
     Ok(port)
 }
 
-fn wait_for_devtools_port(path: &Path) -> Result<u16> {
+fn wait_for_devtools_port(profile: &crate::state::SecureDir) -> Result<u16> {
     let deadline = Instant::now() + DEVTOOLS_TIMEOUT;
     let mut last_err = None;
     while Instant::now() < deadline {
-        if let Ok(contents) = fs::read_to_string(path) {
+        if let Ok(contents) = profile.read_string("DevToolsActivePort") {
             match parse_devtools_active_port(&contents) {
                 Ok(port) => return Ok(port),
                 Err(err) => last_err = Some(err),
@@ -440,6 +437,7 @@ fn kill_child(child: &mut std::process::Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn relaunch_example_names_the_discovered_mac_app() {
@@ -632,7 +630,11 @@ mod tests {
     #[ignore]
     fn real_launch_end_to_end() {
         let dir = tempfile::tempdir().unwrap();
-        let state = launch(&LaunchOpts::default(), dir.path()).unwrap_or_else(|err| {
+        let state = launch(
+            &LaunchOpts::default(),
+            crate::state::browser_storage_at(dir.path()).unwrap(),
+        )
+        .unwrap_or_else(|err| {
             let log = fs::read_to_string(dir.path().join("chrome.log")).unwrap_or_default();
             panic!("{err}\nchrome.log:\n{log}");
         });

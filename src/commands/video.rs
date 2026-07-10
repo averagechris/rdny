@@ -2,7 +2,6 @@
 
 use std::cmp::Ordering;
 use std::ffi::OsStr;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -17,10 +16,11 @@ use crate::{session::PageSession, state};
 const LAST_FRAME_DURATION: f64 = 0.1;
 
 pub fn start() -> Result<()> {
-    let mut state = state::require()?;
-    fs::create_dir_all(state::frames_dir()?).context("creating video frames directory")?;
-    state.recording = true;
-    state::save(&state)
+    let _frames = state::frames_dir()?;
+    state::update(|state| {
+        state.recording = true;
+        Ok(())
+    })
 }
 
 pub fn stop(session: Option<&mut PageSession>, output: Option<&Path>) -> Result<()> {
@@ -30,6 +30,7 @@ pub fn stop(session: Option<&mut PageSession>, output: Option<&Path>) -> Result<
     }
 
     let frames_dir = state::frames_dir()?;
+    frames_dir.validate_external_path()?;
     let frames = read_frames(&frames_dir)?;
     if frames.is_empty() {
         return Err(hint_error(
@@ -41,8 +42,10 @@ pub fn stop(session: Option<&mut PageSession>, output: Option<&Path>) -> Result<
 
     let output = output.unwrap_or_else(|| Path::new("recording.mp4"));
     let list = concat_list(&frames);
-    let list_path = frames_dir.join("frames.txt");
-    fs::write(&list_path, list).context("writing ffmpeg concat list")?;
+    frames_dir
+        .write_file("frames.txt", list.as_bytes())
+        .context("writing ffmpeg concat list")?;
+    let list_path = frames_dir.path().join("frames.txt");
 
     let config = config::load()?;
     let ffmpeg = config::resolve_ffmpeg(std::env::var_os("RDNY_FFMPEG"), &config);
@@ -61,11 +64,11 @@ pub fn stop(session: Option<&mut PageSession>, output: Option<&Path>) -> Result<
 
     match status {
         Ok(status) if status.success() => {
-            fs::remove_dir_all(&frames_dir).context("removing video frames directory")?;
-            if let Some(mut state) = state::load()? {
+            state::remove_frames_dir().context("removing video frames directory")?;
+            state::update_if_present(|state| {
                 state.recording = false;
-                state::save(&state)?;
-            }
+                Ok(())
+            })?;
             println!("{}", output.display());
             Ok(())
         }
@@ -73,7 +76,7 @@ pub fn stop(session: Option<&mut PageSession>, output: Option<&Path>) -> Result<
             format!("ffmpeg failed with status {status}"),
             format!(
                 "install/fix ffmpeg and retry; frames are preserved at {}",
-                frames_dir.display()
+                frames_dir.path().display()
             ),
             None,
         )),
@@ -81,14 +84,17 @@ pub fn stop(session: Option<&mut PageSession>, output: Option<&Path>) -> Result<
             format!("could not run {}: {err}", ffmpeg.display()),
             format!(
                 "install ffmpeg, set RDNY_FFMPEG, or set binaries.ffmpeg in the rdny config file; frames are preserved at {}",
-                frames_dir.display()
+                frames_dir.path().display()
             ),
             None,
         )),
     }
 }
 
-pub fn handle_screencast_frame(params: &Value, frames_dir: &Path) -> Result<Option<String>> {
+pub(crate) fn handle_screencast_frame(
+    params: &Value,
+    frames_dir: &state::SecureDir,
+) -> Result<Option<String>> {
     let Some(data) = params.get("data").and_then(Value::as_str) else {
         return Ok(None);
     };
@@ -100,8 +106,8 @@ pub fn handle_screencast_frame(params: &Value, frames_dir: &Path) -> Result<Opti
         return Ok(None);
     };
     let bytes = decode_base64(data)?;
-    fs::create_dir_all(frames_dir).context("creating video frames directory")?;
-    fs::write(frames_dir.join(format!("{timestamp:.6}.jpg")), bytes)
+    frames_dir
+        .write_file(&format!("{timestamp:.6}.jpg"), &bytes)
         .context("writing screencast frame")?;
     Ok(params
         .get("sessionId")
@@ -131,24 +137,17 @@ fn escape_path(path: &Path) -> String {
     path.to_string_lossy().replace('\'', "'\\''")
 }
 
-fn read_frames(frames_dir: &Path) -> Result<Vec<(f64, PathBuf)>> {
+fn read_frames(frames_dir: &state::SecureDir) -> Result<Vec<(f64, PathBuf)>> {
     let mut frames = Vec::new();
-    let entries = match fs::read_dir(frames_dir) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(frames),
-        Err(err) => return Err(err).context("reading video frames directory"),
-    };
-    for entry in entries {
-        let path = entry?.path();
-        if path.extension().and_then(OsStr::to_str) != Some("jpg") {
-            continue;
-        }
+    for path in frames_dir.regular_paths_with_suffix(".jpg")? {
         let Some(stem) = path.file_stem().and_then(OsStr::to_str) else {
             continue;
         };
         let timestamp = stem
             .parse::<f64>()
             .with_context(|| format!("parsing video frame timestamp from {}", path.display()))?;
+        // The path is beneath a descriptor-validated, cross-UID-safe ancestor
+        // chain. Same-UID lifecycle orchestration remains #130/#131 work.
         frames.push((timestamp, path));
     }
     if frames.iter().any(|(timestamp, _)| !timestamp.is_finite()) {
@@ -170,12 +169,30 @@ mod tests {
             "metadata": {"timestamp": 123.4567894},
             "sessionId": 7
         });
-        let ack = handle_screencast_frame(&params, temp.path()).unwrap();
+        let frames = crate::state::open_store_at(temp.path())
+            .unwrap()
+            .subdir("frames")
+            .unwrap();
+        let ack = handle_screencast_frame(&params, &frames).unwrap();
         assert_eq!(ack.as_deref(), Some("7"));
         assert_eq!(
-            fs::read(temp.path().join("123.456789.jpg")).unwrap(),
+            std::fs::read(frames.path().join("123.456789.jpg")).unwrap(),
             vec![0xff, 0xd8, 0xff, 0xd9]
         );
+    }
+
+    #[test]
+    fn ffmpeg_frame_paths_are_stable_real_paths_under_private_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let frames = crate::state::open_store_at(temp.path())
+            .unwrap()
+            .subdir("frames")
+            .unwrap();
+        frames.write_file("1.000000.jpg", b"jpeg").unwrap();
+        let found = read_frames(&frames).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, frames.path().join("1.000000.jpg"));
+        assert!(!found[0].1.to_string_lossy().contains("/dev/fd/"));
     }
 
     #[test]

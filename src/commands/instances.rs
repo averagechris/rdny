@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 
 use crate::browser;
 use crate::cdp::http;
-use crate::state::{self, SessionState};
+use crate::state::{self, Generation, Inspection, SessionState};
 
 /// How an instance relates to a running browser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +48,7 @@ fn probe_liveness(state: &SessionState) -> Liveness {
 pub struct Instance {
     pub dir: PathBuf,
     pub state: SessionState,
+    generation: Generation,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -117,14 +118,21 @@ pub fn discover_from(candidate_dirs: Vec<PathBuf>) -> Result<Vec<Instance>> {
         if found.contains_key(&key) {
             continue;
         }
-        let path = dir.join("state.json");
-        let Ok(raw) = fs::read_to_string(&path) else {
+        let Ok(store) = state::open_store_at(&dir) else {
             continue;
         };
-        let Ok(state) = serde_json::from_str::<SessionState>(&raw) else {
+        let Ok(Inspection::Valid(state, generation)) = store.inspect::<SessionState>("state.json")
+        else {
             continue;
         };
-        found.insert(key, Instance { dir, state });
+        found.insert(
+            key,
+            Instance {
+                dir,
+                state,
+                generation,
+            },
+        );
     }
     Ok(found.into_values().collect())
 }
@@ -161,23 +169,38 @@ pub fn cleanup_instances(
     all: bool,
     liveness: impl Fn(&SessionState) -> Liveness,
 ) -> Result<Vec<Instance>> {
+    cleanup_instances_with_hook(instances, all, liveness, |_| {})
+}
+
+fn cleanup_instances_with_hook(
+    instances: Vec<Instance>,
+    all: bool,
+    liveness: impl Fn(&SessionState) -> Liveness,
+    before_locked_action: impl Fn(&Instance),
+) -> Result<Vec<Instance>> {
     let mut cleaned = Vec::new();
     for instance in instances {
-        let liveness = liveness(&instance.state);
-        if liveness != Liveness::Dead && !all {
+        let current_liveness = liveness(&instance.state);
+        if current_liveness != Liveness::Dead && !all {
             continue;
         }
-        if liveness == Liveness::Alive {
-            browser::stop(&instance.state)
-                .with_context(|| format!("stopping instance in {}", instance.dir.display()))?;
-        }
+        before_locked_action(&instance);
         // Attached sessions are only detached: removing state.json
         // never touches the externally-owned browser.
-        let path = instance.dir.join("state.json");
-        match fs::remove_file(&path) {
-            Ok(()) => cleaned.push(instance),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => cleaned.push(instance),
-            Err(err) => return Err(err).with_context(|| format!("removing {}", path.display())),
+        let removed = state::open_store_at(&instance.dir)
+            .with_context(|| format!("opening {}", instance.dir.display()))?
+            .remove_if_generation::<SessionState, _>("state.json", &instance.generation, |latest| {
+                let latest_liveness = liveness(latest);
+                if latest_liveness == Liveness::Alive {
+                    browser::stop(latest).with_context(|| {
+                        format!("stopping instance in {}", instance.dir.display())
+                    })?;
+                }
+                Ok(all || latest_liveness == Liveness::Dead)
+            })
+            .with_context(|| format!("removing state in {}", instance.dir.display()))?;
+        if removed {
+            cleaned.push(instance);
         }
     }
     Ok(cleaned)
@@ -186,6 +209,7 @@ pub fn cleanup_instances(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     fn state(pid: Option<u32>, label: Option<&str>) -> SessionState {
         SessionState {
@@ -200,6 +224,23 @@ mod tests {
             viewport: None,
             recording: false,
         }
+    }
+
+    #[test]
+    fn cleanup_replacement_helper() {
+        let Some(dir) = std::env::var_os("RDNY_CLEANUP_REPLACE_DIR") else {
+            return;
+        };
+        let go = Path::new(&dir).join("go");
+        while !go.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        fs::write(
+            Path::new(&dir).join("state.json"),
+            serde_json::to_vec(&state(Some(99), Some("replacement"))).unwrap(),
+        )
+        .unwrap();
+        fs::write(Path::new(&dir).join("done"), b"done").unwrap();
     }
 
     #[test]
@@ -282,31 +323,77 @@ mod tests {
         fs::create_dir_all(&dead).unwrap();
         fs::create_dir_all(&live).unwrap();
         fs::create_dir_all(&attached).unwrap();
-        fs::write(dead.join("state.json"), "{}").unwrap();
-        fs::write(live.join("state.json"), "{}").unwrap();
-        fs::write(attached.join("state.json"), "{}").unwrap();
-        let cleaned = cleanup_instances(
-            vec![
-                Instance {
-                    dir: dead.clone(),
-                    state: state(Some(1), None),
-                },
-                Instance {
-                    dir: live.clone(),
-                    state: state(Some(2), None),
-                },
-                Instance {
-                    dir: attached.clone(),
-                    state: state(None, None),
-                },
-            ],
-            false,
-            |st| classify(st, |pid| pid == 2, |_, _| true),
+        fs::write(
+            dead.join("state.json"),
+            serde_json::to_vec(&state(Some(1), None)).unwrap(),
         )
+        .unwrap();
+        fs::write(
+            live.join("state.json"),
+            serde_json::to_vec(&state(Some(2), None)).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            attached.join("state.json"),
+            serde_json::to_vec(&state(None, None)).unwrap(),
+        )
+        .unwrap();
+        let instances = discover_from(vec![dead.clone(), live.clone(), attached.clone()]).unwrap();
+        let cleaned = cleanup_instances(instances, false, |st| {
+            classify(st, |pid| pid == 2, |_, _| true)
+        })
         .unwrap();
         assert_eq!(cleaned.len(), 1);
         assert!(!dead.join("state.json").exists());
         assert!(live.join("state.json").exists());
         assert!(attached.join("state.json").exists());
+    }
+
+    #[test]
+    fn cleanup_never_deletes_a_replacement_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("state.json"),
+            serde_json::to_vec(&state(Some(1), Some("discovered"))).unwrap(),
+        )
+        .unwrap();
+        let discovered = discover_from(vec![temp.path().to_path_buf()]).unwrap();
+        let paused = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let cleanup_thread = {
+            let paused = std::sync::Arc::clone(&paused);
+            let resume = std::sync::Arc::clone(&resume);
+            std::thread::spawn(move || {
+                cleanup_instances_with_hook(
+                    discovered,
+                    false,
+                    |_| Liveness::Dead,
+                    |_| {
+                        paused.wait();
+                        resume.wait();
+                    },
+                )
+                .unwrap()
+            })
+        };
+        // Discovery is complete and cleanup is paused immediately before the
+        // secure store is reopened and locked.
+        paused.wait();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("commands::instances::tests::cleanup_replacement_helper")
+            .arg("--exact")
+            .env("RDNY_CLEANUP_REPLACE_DIR", temp.path())
+            .spawn()
+            .unwrap();
+        fs::write(temp.path().join("go"), b"go").unwrap();
+        while !temp.path().join("done").exists() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(child.wait().unwrap().success());
+        resume.wait();
+        assert!(cleanup_thread.join().unwrap().is_empty());
+        let replacement: SessionState =
+            serde_json::from_slice(&fs::read(temp.path().join("state.json")).unwrap()).unwrap();
+        assert_eq!(replacement.label.as_deref(), Some("replacement"));
     }
 }

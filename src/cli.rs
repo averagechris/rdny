@@ -319,8 +319,8 @@ pub fn run() -> Result<()> {
                 extra_args: vec![],
                 label: args.label,
             };
-            let state = browser::launch(&opts, &crate::state::state_dir()?)?;
-            crate::state::save(&state)?;
+            let state = browser::launch(&opts, crate::state::browser_storage()?)?;
+            crate::state::replace(&state)?;
             let browser = state
                 .browser_path
                 .as_ref()
@@ -336,7 +336,7 @@ pub fn run() -> Result<()> {
             let config = config::load()?;
             let (host, port) = resolve_connect_target(address.as_deref(), &config)?;
             let state = browser::connect(&host, port)?;
-            crate::state::save(&state)?;
+            crate::state::replace(&state)?;
             println!("connected to {host}:{port}");
         }
         Command::Stop => {

@@ -2,7 +2,6 @@
 //! attach to the current page target, and provide the CDP helpers the
 //! command implementations build on.
 
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -17,7 +16,7 @@ use crate::state;
 pub struct PageSession {
     client: CdpClient,
     session_id: String,
-    frames_dir: Option<PathBuf>,
+    frames_dir: Option<state::SecureDir>,
     /// Overall budget for waiting-style commands (from --timeout).
     pub timeout: Duration,
 }
@@ -26,7 +25,7 @@ pub struct PageSession {
 /// If the recorded target is gone, falls back to the first open page
 /// (and persists the switch).
 pub fn connect(timeout_secs: f64) -> Result<PageSession> {
-    let mut state = state::require()?;
+    let state = state::require()?;
     let targets = http::list_targets(&state.host, state.port).map_err(|_| {
         hint_error(
             format!(
@@ -52,8 +51,10 @@ pub fn connect(timeout_secs: f64) -> Result<PageSession> {
         })?;
     let target_id = target.id.clone();
     if state.target_id.as_deref() != Some(target_id.as_str()) {
-        state.target_id = Some(target_id.clone());
-        state::save(&state)?;
+        state::update(|state| {
+            state.target_id = Some(target_id.clone());
+            Ok(())
+        })?;
     }
     let timeout = Duration::from_secs_f64(timeout_secs.max(0.001));
     let mut client = CdpClient::connect(&state.ws_url)
@@ -69,8 +70,6 @@ pub fn connect(timeout_secs: f64) -> Result<PageSession> {
     }
     let frames_dir = if state.recording {
         let frames_dir = state::frames_dir()?;
-        std::fs::create_dir_all(&frames_dir)
-            .with_context(|| format!("creating video frames directory {}", frames_dir.display()))?;
         client.call(
             Some(&session_id),
             "Page.startScreencast",
@@ -147,7 +146,7 @@ impl PageSession {
         {
             return Ok(false);
         }
-        let Some(frames_dir) = self.frames_dir.as_deref() else {
+        let Some(frames_dir) = self.frames_dir.as_ref() else {
             return Ok(false);
         };
         if let Some(ack_id) =
