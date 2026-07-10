@@ -1,6 +1,7 @@
 //! Browser discovery, launch, and lifecycle (start/connect/stop/status).
 
 use std::ffi::OsStr;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -109,6 +110,7 @@ pub(crate) fn launch_armed(opts: &LaunchOpts, storage: BrowserStorage) -> Result
         Ok(version) => version,
         Err(_) => return Err(launch_probe_error(data_root)),
     };
+    crate::cdp::client::validate_debugger_url(&version.ws_url, "127.0.0.1", port)?;
     let target_id = first_page_target("127.0.0.1", port);
 
     let child_id = launch_guard.id();
@@ -141,8 +143,26 @@ pub(crate) fn launch_armed(opts: &LaunchOpts, storage: BrowserStorage) -> Result
     })
 }
 
-/// Attach to an already-running browser at host:port.
-pub fn connect(host: &str, port: u16) -> Result<SessionState> {
+/// Attach with an explicit remote policy. Direct remote CDP remains rejected:
+/// it has no authenticated HTTP discovery transport. `allow_remote` exists as
+/// a deadline-ready policy hook and produces guidance instead of silently
+/// downgrading security.
+pub fn connect_with_policy(host: &str, port: u16, allow_remote: bool) -> Result<SessionState> {
+    // Do not bless arbitrary DNS names merely because one lookup returned a
+    // loopback address: the HTTP and WebSocket lookups could be rebound.
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host.ends_with(".localhost")
+        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    if !loopback {
+        let opt_in = if allow_remote {
+            "direct remote CDP is still refused because its HTTP/WS transport is unauthenticated and unencrypted"
+        } else {
+            "non-loopback CDP requires explicit --allow-remote, but direct insecure transport is not supported"
+        };
+        bail!(
+            "refusing Chrome DevTools endpoint {host}:{port}: {opt_in}; create a verified SSH tunnel (for example `ssh -N -L 9222:127.0.0.1:{port} HOST`) and connect to 127.0.0.1:9222"
+        );
+    }
     let version = http::version(host, port).map_err(|_| {
         let relaunch = relaunch_example(discover().ok().as_deref(), port, cfg!(target_os = "macos"));
         hint_error(
@@ -151,6 +171,7 @@ pub fn connect(host: &str, port: u16) -> Result<SessionState> {
             Some("chromium-remote-debugging"),
         )
     })?;
+    crate::cdp::client::validate_debugger_url(&version.ws_url, host, port)?;
     Ok(SessionState {
         instance_id: None,
         ws_url: version.ws_url,
@@ -577,6 +598,14 @@ mod tests {
     }
 
     #[test]
+    fn remote_connect_is_rejected_with_or_without_opt_in() {
+        let error = connect_with_policy("192.0.2.1", 9222, false).unwrap_err();
+        assert!(format!("{error}").contains("--allow-remote"));
+        let error = connect_with_policy("192.0.2.1", 9222, true).unwrap_err();
+        assert!(format!("{error}").contains("SSH tunnel"));
+    }
+
+    #[test]
     fn relaunch_example_names_the_discovered_mac_app() {
         assert_eq!(
             relaunch_example(
@@ -855,7 +884,7 @@ mod tests {
         });
         crate::state::replace(&managed).unwrap();
         assert!(crate::state::load().unwrap().unwrap().instance_id.is_some());
-        let attached = connect(&managed.host, managed.port).unwrap();
+        let attached = connect_with_policy(&managed.host, managed.port, false).unwrap();
         assert_eq!(attached.ws_url, managed.ws_url);
         assert!(attached.pid.is_none());
         assert_eq!(stop(&managed).unwrap(), StopOutcome::Stopped);

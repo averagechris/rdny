@@ -7,11 +7,68 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
+use tungstenite::protocol::WebSocketConfig;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
 /// Default per-call response timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+pub const MAX_WEBSOCKET_FRAME_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_WEBSOCKET_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_QUEUED_EVENTS: usize = 1024;
+
+fn url_host_is_loopback(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(host)) => {
+            host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost")
+        }
+        None => false,
+    }
+}
+
+/// Ensure discovery cannot redirect the WebSocket to a different authority.
+/// Plain WS is intentionally supported only for loopback endpoints; remote CDP
+/// must be carried through a verified SSH tunnel terminating on loopback.
+pub fn validate_debugger_url(ws_url: &str, approved_host: &str, approved_port: u16) -> Result<()> {
+    use std::net::IpAddr;
+
+    let parsed = url::Url::parse(ws_url).context("malformed webSocketDebuggerUrl")?;
+    if parsed.scheme() != "ws" {
+        bail!(
+            "unsupported debugger URL scheme `{}`; rdny supports ws:// only through a loopback endpoint",
+            parsed.scheme()
+        );
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() || parsed.fragment().is_some() {
+        bail!("debugger URL must not contain credentials or a fragment");
+    }
+    let actual_host = parsed
+        .host_str()
+        .context("debugger URL is missing a host")?;
+    let actual_port = parsed
+        .port_or_known_default()
+        .context("debugger URL is missing a port")?;
+    if actual_port != approved_port {
+        bail!(
+            "debugger URL port {actual_port} does not match approved endpoint port {approved_port}"
+        );
+    }
+    let approved_is_loopback = approved_host.eq_ignore_ascii_case("localhost")
+        || approved_host.ends_with(".localhost")
+        || approved_host
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if !(actual_host.eq_ignore_ascii_case(approved_host)
+        || url_host_is_loopback(&parsed) && approved_is_loopback)
+    {
+        bail!(
+            "debugger URL host `{actual_host}` does not match approved endpoint `{approved_host}`"
+        );
+    }
+    Ok(())
+}
 
 /// A CDP event received out-of-band.
 #[derive(Debug, Clone)]
@@ -33,9 +90,18 @@ pub struct CdpClient {
 }
 
 impl CdpClient {
-    /// Connect to a ws:// debugger URL (browser-level endpoint).
+    /// Connect to a bounded ws:// debugger URL (browser-level endpoint).
     pub fn connect(ws_url: &str) -> Result<Self> {
-        let (socket, _) = tungstenite::connect(ws_url)
+        let parsed = url::Url::parse(ws_url).context("malformed browser WebSocket URL")?;
+        if parsed.scheme() != "ws" || !url_host_is_loopback(&parsed) {
+            bail!(
+                "browser WebSocket must be a loopback ws:// URL; use a verified SSH tunnel for remote CDP"
+            );
+        }
+        let config = WebSocketConfig::default()
+            .max_frame_size(Some(MAX_WEBSOCKET_FRAME_BYTES))
+            .max_message_size(Some(MAX_WEBSOCKET_MESSAGE_BYTES));
+        let (socket, _) = tungstenite::client::connect_with_config(ws_url, Some(config), 0)
             .with_context(|| format!("connecting to browser WebSocket at {ws_url}"))?;
         match socket.get_ref() {
             MaybeTlsStream::Plain(_) => Ok(Self {
@@ -100,6 +166,9 @@ impl CdpClient {
                 continue;
             };
             if value.get("method").is_some() {
+                if self.events.len() >= MAX_QUEUED_EVENTS {
+                    bail!("CDP event queue exceeds {MAX_QUEUED_EVENTS} events");
+                }
                 self.events.push_back(event_from_value(value)?);
                 continue;
             }
@@ -485,6 +554,47 @@ mod tests {
         client.set_timeout(Duration::from_millis(300));
         let err = client.call(None, "Slow.method", json!({})).unwrap_err();
         assert!(format!("{err}").contains("timed out"));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn debugger_url_is_bound_to_approved_authority() {
+        validate_debugger_url("ws://localhost:9222/devtools/browser/1", "127.0.0.1", 9222).unwrap();
+        assert!(validate_debugger_url("ws://evil.example:9222/x", "127.0.0.1", 9222).is_err());
+        assert!(validate_debugger_url("ws://127.0.0.1:9333/x", "127.0.0.1", 9222).is_err());
+        assert!(validate_debugger_url("wss://127.0.0.1:9222/x", "127.0.0.1", 9222).is_err());
+        assert!(CdpClient::connect("ws://192.0.2.1:9222/x").is_err());
+    }
+
+    #[test]
+    fn event_queue_is_bounded() {
+        let (url, handle) = serve(|mut socket| {
+            let _ = read_json(&mut socket);
+            for index in 0..=MAX_QUEUED_EVENTS {
+                socket
+                    .send(Message::Text(
+                        format!(r#"{{"method":"Test.event","params":{{"index":{index}}}}}"#).into(),
+                    ))
+                    .unwrap();
+            }
+        });
+        let mut client = CdpClient::connect(&url).unwrap();
+        let error = client.call(None, "Never.responds", json!({})).unwrap_err();
+        assert!(format!("{error:#}").contains("event queue"));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn oversized_websocket_message_is_rejected() {
+        let (url, handle) = serve(|mut socket| {
+            let _ = read_json(&mut socket);
+            let oversized = "x".repeat(MAX_WEBSOCKET_MESSAGE_BYTES + 1);
+            let _ = socket.send(Message::Text(oversized.into()));
+        });
+        let mut client = CdpClient::connect(&url).unwrap();
+        let error = client.call(None, "Never.responds", json!({})).unwrap_err();
+        assert!(format!("{error:#}").contains("Message too long"));
+        drop(client);
         handle.join().unwrap();
     }
 }

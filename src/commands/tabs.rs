@@ -36,9 +36,15 @@ pub fn page(index: usize) -> Result<()> {
 }
 
 /// Open a new page/tab, optionally at a URL, and make it current.
-pub fn newpage(url: Option<&str>, timeout_secs: f64) -> Result<()> {
+pub fn newpage_with_policy(
+    url: Option<&str>,
+    timeout_secs: f64,
+    policy: &crate::commands::nav::UrlPolicy,
+) -> Result<()> {
     let state = crate::state::require()?;
-    let normalized = url.map(crate::commands::nav::normalize_url);
+    let normalized = url
+        .map(|url| crate::commands::nav::normalize_url(url, policy))
+        .transpose()?;
     let target = http::new_tab(&state.host, state.port, None)?;
     crate::state::update(|state| {
         state.target_id = Some(target.id.clone());

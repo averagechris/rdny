@@ -221,6 +221,42 @@ Both sessions coexist because state is separated. Attached sessions record no
 browser pid, so `rdny stop` and `rdny cleanup` never kill your personal browser;
 they only detach rdny from it or clear rdny state.
 
+For security, debugger connections are loopback-only. `localhost`, names below
+`.localhost`, and literal loopback addresses retain the convenient plaintext
+HTTP/WS workflow above. rdny does not support direct remote CDP because Chrome's
+discovery endpoint is unauthenticated and plaintext; even `--allow-remote` will
+reject that downgrade and print tunnel guidance. Use an authenticated SSH
+tunnel instead, then connect rdny to its local end:
+
+```sh
+ssh -N -L 9222:127.0.0.1:9222 browser-host.example
+rdny connect 127.0.0.1:9222
+```
+
+The WebSocket URL returned by Chrome must use `ws://` and match the approved
+host and port (equivalent loopback spellings are accepted). Redirects and
+cross-host/cross-port debugger URLs are rejected.
+
+## Transport and URL safety limits
+
+DevTools HTTP responses are bounded to 32 KiB of headers and 8 MiB of decoded
+body data, with bounded chunk metadata/trailers and a 10-second overall request
+deadline. CDP WebSockets allow at most 2 MiB per frame, 8 MiB per message, and
+1,024 events buffered while waiting for a command response. The internal HTTP
+and CDP APIs accept absolute deadlines so commands can share an overall budget
+without changing the global `--timeout` interface.
+
+Navigation uses standards-based URL parsing. Bare `localhost` and
+`*.localhost` targets intentionally become `http://` for local development;
+other bare hosts become `https://`. Control characters, malformed URLs,
+embedded credentials, and unsupported schemes are rejected. `file:`, `data:`,
+RFC1918/ULA literals, link-local literals, and `.local` names require their
+corresponding explicit flags: `--allow-file-url`, `--allow-data-url`,
+`--allow-private-url`, `--allow-link-local-url`, or `--allow-local-url`.
+Loopback remains allowed by default. The policy is checked before navigation;
+pages can still redirect, and hostname DNS can change after validation, so use
+an isolated browser profile/network when automating untrusted pages.
+
 ## Wait semantics
 
 `rdny waitstable` waits for a quiet DOM window, not for two equal DOM snapshots.

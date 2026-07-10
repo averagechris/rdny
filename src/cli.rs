@@ -1,7 +1,7 @@
 //! Command-line surface and dispatch.
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 
@@ -44,6 +44,10 @@ pub enum Command {
         /// `<host>:<port>`, or a named `[connect.targets]` entry;
         /// omitted: the configured `[connect] default`
         address: Option<String>,
+        /// Acknowledge remote-CDP risk. Direct plaintext remote transport is
+        /// still rejected; use a verified SSH tunnel to a loopback address.
+        #[arg(long)]
+        allow_remote: bool,
     },
     /// Stop the current browser session.
     Stop,
@@ -54,7 +58,11 @@ pub enum Command {
     /// Clean up stale instance state files.
     Cleanup(CleanupArgs),
     /// Open a URL in the current page.
-    Open { url: String },
+    Open {
+        url: String,
+        #[command(flatten)]
+        policy: UrlPolicyArgs,
+    },
     /// Go back in page history.
     Back,
     /// Go forward in page history.
@@ -135,11 +143,47 @@ pub enum Command {
     /// Switch to a page by index.
     Page { index: usize },
     /// Open a new page.
-    Newpage { url: Option<String> },
+    Newpage {
+        url: Option<String>,
+        #[command(flatten)]
+        policy: UrlPolicyArgs,
+    },
     /// Start collecting video frames from commands.
     StartVideo,
     /// Stop collecting frames and assemble a video file.
     StopVideo(ArtifactArgs),
+}
+
+/// Opt-ins for navigation targets that can expose local browser privileges.
+#[derive(Debug, Clone, Default, Args)]
+pub struct UrlPolicyArgs {
+    /// Permit file: URLs.
+    #[arg(long)]
+    allow_file_url: bool,
+    /// Permit data: URLs.
+    #[arg(long)]
+    allow_data_url: bool,
+    /// Permit RFC1918/ULA literal addresses (loopback stays enabled).
+    #[arg(long)]
+    allow_private_url: bool,
+    /// Permit link-local literal addresses.
+    #[arg(long)]
+    allow_link_local_url: bool,
+    /// Permit mDNS/local hostnames such as printer.local.
+    #[arg(long)]
+    allow_local_url: bool,
+}
+
+impl From<&UrlPolicyArgs> for commands::nav::UrlPolicy {
+    fn from(args: &UrlPolicyArgs) -> Self {
+        Self {
+            allow_file: args.allow_file_url,
+            allow_data: args.allow_data_url,
+            allow_private: args.allow_private_url,
+            allow_link_local: args.allow_link_local_url,
+            allow_local: args.allow_local_url,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -361,12 +405,15 @@ pub fn run() -> Result<()> {
                 .unwrap_or_else(|| "attached".to_string());
             println!("started {browser} pid {pid} on port {}", state.port);
         }
-        Command::Connect { address } => {
+        Command::Connect {
+            address,
+            allow_remote,
+        } => {
             let _lifecycle = crate::state::lifecycle_lock()?;
             refuse_occupied_lifecycle(&_lifecycle, "connect")?;
             let config = config::load()?;
             let (host, port) = resolve_connect_target(address.as_deref(), &config)?;
-            let state = browser::connect(&host, port)?;
+            let state = browser::connect_with_policy(&host, port, allow_remote)?;
             crate::state::replace_lifecycle(&_lifecycle, &state)
                 .context("publishing attached browser ownership; previous state preserved")?;
             println!("connected to {host}:{port}");
@@ -427,7 +474,9 @@ pub fn run() -> Result<()> {
         },
         Command::List => commands::instances::list()?,
         Command::Cleanup(args) => commands::instances::cleanup(args.all)?,
-        Command::Open { url } => commands::nav::open(sess!(), &url)?,
+        Command::Open { url, policy } => {
+            commands::nav::open_with_policy(sess!(), &url, &(&policy).into())?
+        }
         Command::Back => commands::nav::back(sess!())?,
         Command::Forward => commands::nav::forward(sess!())?,
         Command::Reload(args) => commands::nav::reload(sess!(), args.hard)?,
@@ -528,7 +577,9 @@ pub fn run() -> Result<()> {
         } => commands::shot::screenshot_el(sess!(), &selector, file.as_deref(), force)?,
         Command::Pages => commands::tabs::pages()?,
         Command::Page { index } => commands::tabs::page(index)?,
-        Command::Newpage { url } => commands::tabs::newpage(url.as_deref(), cli.timeout)?,
+        Command::Newpage { url, policy } => {
+            commands::tabs::newpage_with_policy(url.as_deref(), cli.timeout, &(&policy).into())?
+        }
         Command::StartVideo => commands::video::start()?,
         Command::StopVideo(args) => {
             // Assemble even when the browser is gone: frames on disk
@@ -596,14 +647,17 @@ fn refuse_occupied_lifecycle(lock: &crate::state::LifecycleLock, action: &str) -
 }
 
 pub fn parse_address(address: &str) -> Result<(String, u16)> {
-    let (host, port) = address.split_once(':').ok_or_else(|| {
+    if let Ok(socket) = address.parse::<std::net::SocketAddr>() {
+        return Ok((socket.ip().to_string(), socket.port()));
+    }
+    let (host, port) = address.rsplit_once(':').ok_or_else(|| {
         crate::hint::hint_error(
             format!("invalid address `{address}`"),
             "use `<host>:<port>`, for example `127.0.0.1:9222`",
             None,
         )
     })?;
-    if host.is_empty() || port.is_empty() || port.contains(':') {
+    if host.is_empty() || port.is_empty() || host.contains(':') {
         return Err(crate::hint::hint_error(
             format!("invalid address `{address}`"),
             "use `<host>:<port>`, for example `127.0.0.1:9222`",
@@ -764,13 +818,13 @@ mod tests {
     fn parses_required_commands() {
         assert!(matches!(
             parse(&["rdny", "connect"]),
-            Command::Connect { address: None }
+            Command::Connect { address: None, .. }
         ));
         assert!(
-            matches!(parse(&["rdny", "connect", "helium"]), Command::Connect { address: Some(address) } if address == "helium")
+            matches!(parse(&["rdny", "connect", "helium"]), Command::Connect { address: Some(address), .. } if address == "helium")
         );
         assert!(
-            matches!(parse(&["rdny", "connect", "127.0.0.1:9222"]), Command::Connect { address: Some(address) } if address == "127.0.0.1:9222")
+            matches!(parse(&["rdny", "connect", "127.0.0.1:9222"]), Command::Connect { address: Some(address), .. } if address == "127.0.0.1:9222")
         );
         assert!(
             matches!(parse(&["rdny", "sleep", "1.5"]), Command::Sleep { seconds } if seconds == 1.5)
@@ -991,6 +1045,10 @@ mod tests {
             parse_address("127.0.0.1:9222").unwrap(),
             ("127.0.0.1".to_string(), 9222)
         );
+        assert_eq!(
+            parse_address("[::1]:9222").unwrap(),
+            ("::1".to_string(), 9222)
+        );
         assert!(parse_address("9222").is_err());
         assert!(parse_address("foo:bar").is_err());
     }
@@ -1000,7 +1058,7 @@ mod tests {
         let cli = parse_cli(&["rdny", "--state-dir", "/tmp/x", "connect", "foo"]);
         assert_eq!(cli.state_dir, Some(PathBuf::from("/tmp/x")));
         assert!(
-            matches!(cli.command, Command::Connect { address: Some(address) } if address == "foo")
+            matches!(cli.command, Command::Connect { address: Some(address), .. } if address == "foo")
         );
     }
 
