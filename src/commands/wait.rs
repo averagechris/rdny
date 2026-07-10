@@ -384,12 +384,8 @@ mod tests {
             .args(["--timeout", "0.2", "waitstable", "--quiet-ms", "300"])
             .output()
             .unwrap();
-        assert!(!stable.status.success());
-        assert!(start.elapsed() < Duration::from_secs(2));
-        assert!(
-            String::from_utf8_lossy(&stable.stderr)
-                .contains("timed out after 0.200s waiting for the dom to stabilize")
-        );
+        let stable_elapsed = start.elapsed();
+        assert_dom_stability_timeout(&stable, stable_elapsed);
 
         assert!(
             browser_cmd(&rdny, temp.path())
@@ -556,6 +552,36 @@ mod tests {
                 .success()
         );
         let _ = browser_cmd(&rdny, temp.path()).arg("stop").status();
+    }
+
+    fn assert_dom_stability_timeout(output: &std::process::Output, elapsed: Duration) {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "waitstable unexpectedly succeeded; stdout: {:?}; stderr: {:?}",
+            String::from_utf8_lossy(&output.stdout),
+            stderr
+        );
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "waitstable failed too quickly ({elapsed:?}), likely before exercising the DOM-stability deadline path; stderr: {stderr:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "waitstable exceeded the bounded deadline window ({elapsed:?}); stderr: {stderr:?}"
+        );
+        assert!(
+            stderr.contains("timed out"),
+            "waitstable failure was not a timeout; stderr: {stderr:?}"
+        );
+        assert!(
+            stderr.contains("dom") && stderr.contains("stabil"),
+            "waitstable timeout lost the DOM-stability semantic category; stderr: {stderr:?}"
+        );
+        assert!(
+            !stderr.contains("broker") && !stderr.contains("auth"),
+            "unrelated broker/auth failure satisfied waitstable timeout assertion; stderr: {stderr:?}"
+        );
     }
 
     fn browser_test_bin() -> std::ffi::OsString {

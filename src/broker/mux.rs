@@ -712,12 +712,16 @@ mod tests {
                     json!({"id":20,"method":method,"sessionId":"owned","params":{"targetId":"child-target","flatten":true}}),
                 )
                 .unwrap();
-            mux.upstream_message(json!({"id":request["id"],"result":{"sessionId":"child-from-response"}}))
-                .unwrap();
+            mux.upstream_message(
+                json!({"id":request["id"],"result":{"sessionId":"child-from-response"}}),
+            )
+            .unwrap();
             assert!(mux.client_request(1, json!({"id":21,"method":"Runtime.evaluate","sessionId":"child-from-response","params":{}})).is_ok());
 
             let routed = mux
-                .upstream_message(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"owned"}}))
+                .upstream_message(
+                    json!({"method":"Target.detachedFromTarget","params":{"sessionId":"owned"}}),
+                )
                 .unwrap()
                 .unwrap();
             assert_eq!(routed.client_id, 1);
@@ -740,9 +744,17 @@ mod tests {
             .unwrap();
         mux.upstream_message(json!({"id":request["id"],"result":{"sessionId":"child"}}))
             .unwrap();
-        mux.upstream_message(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"owned"}}))
-            .unwrap();
-        assert!(mux.client_request(1, json!({"id":31,"method":"Runtime.evaluate","sessionId":"child","params":{}})).is_err());
+        mux.upstream_message(
+            json!({"method":"Target.detachedFromTarget","params":{"sessionId":"owned"}}),
+        )
+        .unwrap();
+        assert!(
+            mux.client_request(
+                1,
+                json!({"id":31,"method":"Runtime.evaluate","sessionId":"child","params":{}})
+            )
+            .is_err()
+        );
 
         // Response first in a parent session, then event: both orders keep the
         // child linked to the parent and recursively released.
@@ -757,8 +769,16 @@ mod tests {
             .unwrap();
         mux.upstream_message(json!({"method":"Target.attachedToTarget","sessionId":"owned","params":{"sessionId":"child"}}))
             .unwrap();
-        mux.upstream_message(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"owned"}}))
-            .unwrap();
-        assert!(mux.client_request(1, json!({"id":33,"method":"Runtime.evaluate","sessionId":"child","params":{}})).is_err());
+        mux.upstream_message(
+            json!({"method":"Target.detachedFromTarget","params":{"sessionId":"owned"}}),
+        )
+        .unwrap();
+        assert!(
+            mux.client_request(
+                1,
+                json!({"id":33,"method":"Runtime.evaluate","sessionId":"child","params":{}})
+            )
+            .is_err()
+        );
     }
 }
