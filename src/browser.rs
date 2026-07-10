@@ -124,6 +124,7 @@ pub(crate) fn launch_armed_until(
     );
     let state = SessionState {
         instance_id: None,
+        endpoint: None,
         ws_url: version.ws_url,
         host: "127.0.0.1".into(),
         port,
@@ -193,6 +194,7 @@ pub fn connect_with_policy_until(
     crate::cdp::client::validate_debugger_url(&version.ws_url, host, port)?;
     Ok(SessionState {
         instance_id: None,
+        endpoint: None,
         ws_url: version.ws_url,
         host: host.into(),
         port,
@@ -230,6 +232,10 @@ pub fn stop(state: &SessionState) -> Result<StopOutcome> {
 }
 
 pub fn stop_until(state: &SessionState, deadline: Deadline) -> Result<StopOutcome> {
+    if state.endpoint.is_some() {
+        crate::broker::stop(state, deadline).context("requesting authenticated broker stop")?;
+        return Ok(StopOutcome::Stopped);
+    }
     if let Some(id) = &state.process_identity {
         process_identity::validate_persisted(
             state.pid,
@@ -304,6 +310,18 @@ pub fn status(state: &SessionState) -> Result<BrowserStatus> {
 }
 
 pub fn status_until(state: &SessionState, deadline: Deadline) -> Result<BrowserStatus> {
+    if state.endpoint.is_some() {
+        return match crate::broker::ping(state, deadline) {
+            Ok(()) => Ok(BrowserStatus::Running {
+                browser: state
+                    .browser_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "Chrome".into()),
+            }),
+            Err(_) => Ok(BrowserStatus::Stale),
+        };
+    }
     if let Some(id) = &state.process_identity {
         process_identity::validate_persisted(
             state.pid,
@@ -476,6 +494,34 @@ fn build_args(
         }
     }));
     args
+}
+
+pub(crate) fn build_managed_pipe_args(
+    opts: &LaunchOpts,
+    user_data_dir: &Path,
+    user_args: &[String],
+    macos: bool,
+) -> Result<Vec<String>> {
+    for arg in user_args {
+        if arg == "--remote-debugging-port"
+            || arg.starts_with("--remote-debugging-port=")
+            || arg == "--remote-debugging-pipe"
+            || arg.starts_with("--remote-debugging-pipe=")
+        {
+            bail!(
+                "managed sessions reject user-supplied `{arg}`: rdny exclusively owns --remote-debugging-pipe; remove every remote-debugging flag from RDNY_CHROME_ARGS/configuration"
+            );
+        }
+    }
+    let mut args = build_args(opts, user_data_dir, user_args, macos);
+    args[0] = "--remote-debugging-pipe".to_string();
+    debug_assert_eq!(
+        args.iter()
+            .filter(|arg| arg.as_str() == "--remote-debugging-pipe")
+            .count(),
+        1
+    );
+    Ok(args)
 }
 
 fn parse_devtools_active_port(contents: &str) -> Result<u16> {
@@ -826,6 +872,45 @@ mod tests {
         );
         assert!(args.contains(&"--user-data-dir=/tmp/profile".to_string()));
         assert!(args.ends_with(&["--foo".into(), "--bar".into()]));
+    }
+
+    #[test]
+    fn managed_args_reject_all_remote_debugging_overrides() {
+        for hostile in [
+            vec!["--remote-debugging-port=9222"],
+            vec!["--remote-debugging-port", "9222"],
+            vec!["--remote-debugging-pipe"],
+            vec!["--remote-debugging-pipe=true"],
+        ] {
+            let args: Vec<String> = hostile.into_iter().map(str::to_string).collect();
+            let error = build_managed_pipe_args(
+                &LaunchOpts::default(),
+                Path::new("/tmp/profile"),
+                &args,
+                false,
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("exclusively owns"));
+        }
+
+        let args = build_managed_pipe_args(
+            &LaunchOpts::default(),
+            Path::new("/tmp/profile"),
+            &["--disable-gpu".into()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            args.iter()
+                .filter(|arg| arg.as_str() == "--remote-debugging-pipe")
+                .count(),
+            1
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("--remote-debugging-port"))
+        );
     }
 
     #[test]

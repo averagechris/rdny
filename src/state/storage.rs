@@ -68,6 +68,16 @@ pub(crate) struct StateStore {
     dir: File,
 }
 
+impl StateStore {
+    pub(crate) fn secure_root(&self) -> Result<SecureDir> {
+        Ok(SecureDir {
+            state_root: self.root.clone(),
+            path: self.root.clone(),
+            dir: self.dir.try_clone()?,
+        })
+    }
+}
+
 /// A directory kept open so all creation and writes remain relative to the
 /// validated inode. The path is only for programs (Chrome/ffmpeg) that require
 /// a pathname; rdny itself never uses it to create children.

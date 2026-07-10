@@ -65,13 +65,7 @@ pub(crate) enum BrokerMessage {
         reason: Option<String>,
     },
     Cdp {
-        client_id: u64,
-        session_id: Option<String>,
-        id: Option<u64>,
-        method: Option<String>,
-        params: Option<Value>,
-        result: Option<Value>,
-        error: Option<Value>,
+        message: Value,
     },
 }
 
@@ -99,6 +93,7 @@ pub(crate) fn write_frame_until<T: Serialize>(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn read_frame<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> Result<T> {
     read_frame_until(stream, Deadline::after(DEFAULT_DEADLINE))
 }
@@ -203,6 +198,7 @@ fn read_exact_until(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn client_handshake(
     stream: &mut UnixStream,
     instance_id: &str,
@@ -310,6 +306,15 @@ mod tests {
             server_handshake(&mut b, "i", &Token::from_bytes([1; TOKEN_LEN]))
         });
         assert!(client_handshake(&mut a, "i", &Token::from_bytes([2; TOKEN_LEN])).is_err());
+        assert!(t.join().unwrap().is_err());
+
+        let (mut a, mut b) = UnixStream::pair().unwrap();
+        let t = thread::spawn(move || {
+            server_handshake(&mut b, "right-instance", &Token::from_bytes([3; TOKEN_LEN]))
+        });
+        assert!(
+            client_handshake(&mut a, "wrong-instance", &Token::from_bytes([3; TOKEN_LEN])).is_err()
+        );
         assert!(t.join().unwrap().is_err());
     }
 

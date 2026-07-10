@@ -581,6 +581,7 @@ mod tests {
     fn sample_state() -> state::SessionState {
         state::SessionState {
             instance_id: None,
+            endpoint: None,
             ws_url: "ws://127.0.0.1:9222/devtools/browser/abc".to_string(),
             host: "127.0.0.1".to_string(),
             port: 9222,

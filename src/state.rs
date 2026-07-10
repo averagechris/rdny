@@ -62,6 +62,10 @@ pub struct SessionState {
     /// Stable lifecycle identity used to couple state and registry entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_id: Option<String>,
+    /// Authenticated local broker endpoint for new managed sessions. Absent for
+    /// legacy managed TCP state and externally attached sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<BrokerEndpoint>,
     /// Browser-level WebSocket debugger URL from /json/version.
     pub ws_url: String,
     pub host: String,
@@ -101,6 +105,15 @@ pub struct SessionState {
     pub recoverable_recordings: Vec<RecoverableRecording>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instrumentation: Option<Box<InstrumentationState>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrokerEndpoint {
+    pub socket: PathBuf,
+    pub token: Vec<u8>,
+    pub version: u32,
+    pub broker_pid: u32,
+    pub broker_identity: ProcessIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -157,6 +170,7 @@ pub(crate) struct BrowserStorage {
     // Keep both validated directory descriptors alive throughout launch.
     _store: StateStore,
     pub(crate) profile: SecureDir,
+    pub(crate) broker: SecureDir,
     pub(crate) log: File,
 }
 
@@ -167,10 +181,12 @@ pub(crate) fn browser_storage() -> Result<BrowserStorage> {
 pub(crate) fn browser_storage_at(path: &Path) -> Result<BrowserStorage> {
     let store = StateStore::open(path)?;
     let profile = store.subdir("chrome-profile")?;
+    let broker = store.secure_root()?;
     let log = store.create_file("chrome.log", true)?;
     Ok(BrowserStorage {
         _store: store,
         profile,
+        broker,
         log,
     })
 }
@@ -327,10 +343,28 @@ pub(crate) fn replace_lifecycle(lifecycle: &LifecycleLock, state: &SessionState)
     replace_lifecycle_with_hook(lifecycle, state, || Ok(()))
 }
 
+pub(crate) fn replace_lifecycle_and_commit(
+    lifecycle: &LifecycleLock,
+    state: &SessionState,
+    commit: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    replace_lifecycle_with_hook(lifecycle, state, commit)
+}
+
 fn replace_lifecycle_with_hook(
     lifecycle: &LifecycleLock,
     state: &SessionState,
+    after_publication: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    replace_lifecycle_with_injections(lifecycle, state, || Ok(()), || Ok(()), after_publication)
+}
+
+fn replace_lifecycle_with_injections(
+    lifecycle: &LifecycleLock,
+    state: &SessionState,
     after_state_write: impl FnOnce() -> Result<()>,
+    after_registry_write: impl FnOnce() -> Result<()>,
+    after_publication: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     lifecycle_transaction(lifecycle, |tx| {
         // Repair is part of the transaction: malformed prior bytes are restored
@@ -346,7 +380,7 @@ fn replace_lifecycle_with_hook(
                 anyhow::bail!("state file has incompatible schema: {e}")
             }
         };
-        let instance_id = new_instance_id();
+        let instance_id = state.instance_id.clone().unwrap_or_else(new_instance_id);
         let mut next = state.clone();
         next.instance_id = Some(instance_id.clone());
         let merged = merge_state(current, &next)?;
@@ -361,6 +395,12 @@ fn replace_lifecycle_with_hook(
         registry.dirs.clear();
         tx.registry
             .write_json_locked_normal(REGISTRY_FILE, &registry)?;
+        after_registry_write()?;
+        // Both ownership records are durable while the broker is still armed.
+        // This is deliberately the final fallible transaction action: a failed
+        // commit/ack restores both exact snapshots before dropping the armed
+        // broker guard, while success has no later operation that can roll back.
+        after_publication()?;
         Ok(())
     })
 }
@@ -553,7 +593,7 @@ pub fn replace(state: &SessionState) -> Result<()> {
     replace_lifecycle(&lifecycle, state)
 }
 
-fn new_instance_id() -> String {
+pub(crate) fn new_instance_id() -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -772,6 +812,7 @@ fn merge_state(current: Option<Value>, state: &SessionState) -> Result<Value> {
         for key in [
             "ws_url",
             "instance_id",
+            "endpoint",
             "host",
             "port",
             "pid",
@@ -886,6 +927,7 @@ mod tests {
     fn sample_state() -> SessionState {
         SessionState {
             instance_id: None,
+            endpoint: None,
             ws_url: "ws://127.0.0.1:9222/devtools/browser/abc".to_string(),
             host: "127.0.0.1".to_string(),
             port: 9222,
@@ -902,6 +944,71 @@ mod tests {
             recoverable_recording: None,
             recoverable_recordings: Vec::new(),
             instrumentation: None,
+        }
+    }
+
+    #[test]
+    fn publication_failures_rollback_exact_state_and_registry_before_commit() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let old_state = env::var_os("RDNY_STATE_DIR");
+        let old_xdg = env::var_os("XDG_STATE_HOME");
+        for stage in 0..3 {
+            let temp = tempfile::tempdir().unwrap();
+            let state_dir = temp.path().join("state");
+            let xdg = temp.path().join("xdg");
+            unsafe {
+                env::set_var("RDNY_STATE_DIR", &state_dir);
+                env::set_var("XDG_STATE_HOME", &xdg);
+            }
+            let lifecycle = lifecycle_lock().unwrap();
+            let state_path = state_dir.join(STATE_FILE);
+            let registry_path = xdg.join("rdny").join(REGISTRY_FILE);
+            let result = replace_lifecycle_with_injections(
+                &lifecycle,
+                &sample_state(),
+                || {
+                    if stage == 0 {
+                        anyhow::bail!("injected state write failure")
+                    }
+                    Ok(())
+                },
+                || {
+                    if stage == 1 {
+                        anyhow::bail!("injected registry write failure")
+                    }
+                    Ok(())
+                },
+                || {
+                    assert!(state_path.is_file(), "state must precede broker commit");
+                    assert!(
+                        registry_path.is_file(),
+                        "registry must precede broker commit"
+                    );
+                    if stage == 2 {
+                        anyhow::bail!("injected broker commit failure")
+                    }
+                    Ok(())
+                },
+            );
+            assert!(result.is_err());
+            assert!(
+                !state_path.exists(),
+                "state rollback failed at stage {stage}"
+            );
+            assert!(
+                !registry_path.exists(),
+                "registry rollback failed at stage {stage}"
+            );
+        }
+        unsafe {
+            match old_state {
+                Some(value) => env::set_var("RDNY_STATE_DIR", value),
+                None => env::remove_var("RDNY_STATE_DIR"),
+            }
+            match old_xdg {
+                Some(value) => env::set_var("XDG_STATE_HOME", value),
+                None => env::remove_var("XDG_STATE_HOME"),
+            }
         }
     }
 

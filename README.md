@@ -86,6 +86,47 @@ rdny stop
 
 ## Browser provisioning
 
+### Managed-session isolation
+
+`rdny start` does **not** open a DevTools TCP port. It starts the exact current
+`rdny` executable in a hidden broker mode through an inherited anonymous startup
+socket, then launches Chrome with `--remote-debugging-pipe`. The broker keeps the
+Chrome child handle and both pipe ends for the browser's lifetime. Commands use
+an owner-only Unix socket and authenticate its filesystem owner/mode, OS peer
+UID, broker process identity, protocol version, instance id, and a random token
+stored only in the private state file. There is no managed TCP or WebSocket
+fallback and no `DevToolsActivePort` file.
+
+Startup is armed until state and the instance registry are atomically published:
+the CLI then sends commit and requires the broker's explicit acknowledgement as
+the transaction's final fallible action. If the starting CLI exits, either
+publication write fails, or commit/ack fails, exact state and registry snapshots
+are restored and the armed guard closes Chrome and removes its socket. Killing a later CLI does not stop the browser;
+killing the broker closes Chrome's sole debugging pipe and the broker-owned child
+is fail-closed. `stop` authenticates to the broker, asks Chrome to close, and the
+broker escalates through its owned `Child` handle if needed. Multiple command
+processes, including `logs --follow`, may connect concurrently; per-client event
+queues are bounded and target sessions are private to their creating client.
+Queue-full, EOF, authentication, and socket-write disconnect paths all remove
+routing and detach client-owned target sessions, including late attach replies.
+
+Managed launch rejects every user-provided `--remote-debugging-port` or
+`--remote-debugging-pipe` argument. Remove those flags from `RDNY_CHROME_ARGS` or
+configuration; only the single broker-owned pipe flag is permitted.
+
+Legacy managed state containing a loopback debug port remains readable and can
+be stopped or cleaned during migration. Newly started sessions never use it.
+External `rdny connect` intentionally remains the separately hardened loopback
+HTTP/WebSocket mode described below.
+
+The broker is detached from the invoking terminal session with `setsid`, and its
+stdout/stderr share the owner-only `chrome.log`. Terminal interrupt or a client
+logout therefore affects that client, not the managed browser. This is not a
+promise that every OS login-session manager will preserve detached processes:
+administrative logout cleanup, reboot, SIGKILL, or resource pressure can kill the
+broker, in which case Chrome is expected to exit when its pipe closes. See
+[`docs/threat-model.md`](docs/threat-model.md).
+
 The default `rdny` package does not bundle a browser. At runtime rdny looks for
 Chrome/Chromium in this order:
 

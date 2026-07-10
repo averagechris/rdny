@@ -14,6 +14,15 @@ use std::process::ExitCode;
 /// Exit codes follow the rodney convention:
 /// 0 success, 1 reserved for check-failures, 2 error.
 fn main() -> ExitCode {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__broker")) {
+        return match broker::run_hidden() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("rdny broker: {err:#}");
+                ExitCode::from(2)
+            }
+        };
+    }
     if let Err(err) = state::capture_initial_cwd() {
         eprintln!("rdny: could not capture initial working directory: {err:#}");
         return ExitCode::from(2);

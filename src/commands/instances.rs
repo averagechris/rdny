@@ -45,6 +45,13 @@ fn classify(
 }
 
 fn probe_liveness_until(state: &SessionState, deadline: Deadline) -> Liveness {
+    if state.endpoint.is_some() {
+        return if crate::broker::ping(state, deadline).is_ok() {
+            Liveness::Alive
+        } else {
+            Liveness::Dead
+        };
+    }
     if let Some(id) = &state.process_identity
         && process_identity::validate_persisted(
             state.pid,
@@ -382,6 +389,14 @@ fn cleanup_instances_with_hook(
         if !all && latest_liveness != Liveness::Dead {
             continue;
         }
+        if latest_liveness == Liveness::Dead && latest.endpoint.is_some() {
+            crate::broker::remove_stale_socket(&latest).with_context(|| {
+                format!(
+                    "validating stale broker socket in {}",
+                    instance.dir.display()
+                )
+            })?;
+        }
         // Attached sessions are only detached. Managed live sessions selected
         // by --all are stopped while lifecycle ownership remains exclusive.
         if latest_liveness == Liveness::Alive {
@@ -411,6 +426,7 @@ mod tests {
     fn state(pid: Option<u32>, label: Option<&str>) -> SessionState {
         SessionState {
             instance_id: label.map(|l| format!("id-{l}")),
+            endpoint: None,
             ws_url: "ws://x".into(),
             host: "127.0.0.1".into(),
             port: 1,

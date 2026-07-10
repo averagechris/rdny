@@ -184,6 +184,24 @@ impl CdpClient {
         })
     }
 
+    /// Select the authenticated local broker for managed state, retaining the
+    /// hardened loopback WebSocket transport only for legacy/external state.
+    pub fn connect_state_until(
+        state: &crate::state::SessionState,
+        deadline: Deadline,
+    ) -> Result<Self> {
+        if state.endpoint.is_some() {
+            let stream = crate::broker::connect(state, deadline)?;
+            return Ok(Self {
+                transport: Box::new(BrokerTransport { stream }),
+                next_id: 1,
+                events: VecDeque::new(),
+                timeout: DEFAULT_TIMEOUT,
+            });
+        }
+        Self::connect_until(&state.ws_url, deadline)
+    }
+
     #[cfg(unix)]
     pub fn from_pipe_fds(read_fd: std::os::fd::OwnedFd, write_fd: std::os::fd::OwnedFd) -> Self {
         Self {
@@ -198,8 +216,9 @@ impl CdpClient {
     #[allow(dead_code)]
     pub unsafe fn from_inherited_pipe_fds() -> Self {
         use std::os::fd::FromRawFd;
-        // Chrome remote-debugging-pipe uses inherited fd3 for browser->client
-        // reads and fd4 for client->browser writes.
+        // This constructor is for a parent-side process whose fd3 receives
+        // browser output and fd4 sends browser input (tests/helpers may arrange
+        // that shape explicitly; Chromium itself receives the inverse ends).
         Self::from_pipe_fds(unsafe { std::os::fd::OwnedFd::from_raw_fd(3) }, unsafe {
             std::os::fd::OwnedFd::from_raw_fd(4)
         })
@@ -334,6 +353,48 @@ impl CdpClient {
     /// Return one already-buffered event without reading the socket.
     pub fn next_buffered_event(&mut self) -> Option<Event> {
         self.events.pop_front()
+    }
+}
+
+struct BrokerTransport {
+    stream: std::os::unix::net::UnixStream,
+}
+
+impl CdpTransport for BrokerTransport {
+    fn send_json(&mut self, value: &Value, deadline: Deadline) -> Result<()> {
+        crate::broker::protocol::write_frame_until(
+            &mut self.stream,
+            &crate::broker::protocol::BrokerMessage::Cdp {
+                message: value.clone(),
+            },
+            deadline,
+        )
+    }
+
+    fn recv_json(&mut self, deadline: Deadline) -> Result<Value> {
+        let message = crate::broker::protocol::read_frame_until(&mut self.stream, deadline)
+            .map_err(|error| {
+                if format!("{error:#}").contains("timed out") {
+                    anyhow!(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "broker read deadline elapsed"
+                    ))
+                } else {
+                    error
+                }
+            })?;
+        match message {
+            crate::broker::protocol::BrokerMessage::Cdp { message } => Ok(message),
+            crate::broker::protocol::BrokerMessage::Error { message } => {
+                bail!("broker rejected CDP message: {message}")
+            }
+            other => bail!("unexpected broker message while reading CDP: {other:?}"),
+        }
+    }
+
+    fn close(&mut self) -> Result<()> {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        Ok(())
     }
 }
 

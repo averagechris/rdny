@@ -118,6 +118,7 @@ mod tests {
             .unwrap();
         crate::state::replace(&crate::state::SessionState {
             instance_id: None,
+            endpoint: None,
             ws_url: "ws://unused".into(),
             host: "127.0.0.1".into(),
             port: 1,
@@ -258,17 +259,16 @@ pub struct PageSession {
 /// (and persists the switch).
 pub fn connect(deadline: Deadline, timeout: Duration) -> Result<PageSession> {
     let state = state::require()?;
-    let targets =
-        http::list_targets_until(&state.host, state.port, deadline.instant()).map_err(|_| {
-            hint_error(
-                format!(
-                    "cannot reach the browser for this session at {}:{}",
-                    state.host, state.port
-                ),
-                "run `rdny status`; if it reports stale, run `rdny stop` then `rdny start`",
-                None,
-            )
-        })?;
+    let targets = targets_until(&state, deadline).map_err(|_| {
+        hint_error(
+            format!(
+                "cannot reach the browser for this session at {}:{}",
+                state.host, state.port
+            ),
+            "run `rdny status`; if it reports stale, run `rdny stop` then `rdny start`",
+            None,
+        )
+    })?;
     let pages: Vec<_> = targets.iter().filter(|t| t.target_type == "page").collect();
     let target = state
         .target_id
@@ -289,8 +289,8 @@ pub fn connect(deadline: Deadline, timeout: Duration) -> Result<PageSession> {
             Ok(())
         })?;
     }
-    let mut client = CdpClient::connect_until(&state.ws_url, deadline)
-        .with_context(|| format!("connecting to browser websocket {}", state.ws_url))?;
+    let mut client = CdpClient::connect_state_until(&state, deadline)
+        .context("connecting to browser CDP transport")?;
     client.set_timeout(timeout);
     let session_id = client.attach_to_target_until(&target_id, deadline)?;
     // Enable Network once per attached page session so waitidle can observe
@@ -328,6 +328,56 @@ pub fn connect(deadline: Deadline, timeout: Duration) -> Result<PageSession> {
     };
     session.ensure_page_instrumentation_until(deadline)?;
     Ok(session)
+}
+
+pub(crate) fn targets_until(
+    state: &state::SessionState,
+    deadline: Deadline,
+) -> Result<Vec<http::TargetInfo>> {
+    if state.endpoint.is_none() {
+        return http::list_targets_until(&state.host, state.port, deadline.instant());
+    }
+    let mut client = CdpClient::connect_state_until(state, deadline)?;
+    let result = client.call_until(None, "Target.getTargets", json!({}), deadline)?;
+    Ok(result["targetInfos"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| {
+            Some(http::TargetInfo {
+                id: value["targetId"].as_str()?.to_string(),
+                target_type: value["type"].as_str()?.to_string(),
+                title: value["title"].as_str().unwrap_or_default().to_string(),
+                url: value["url"].as_str().unwrap_or_default().to_string(),
+            })
+        })
+        .collect())
+}
+
+pub(crate) fn create_target_until(
+    state: &state::SessionState,
+    deadline: Deadline,
+) -> Result<http::TargetInfo> {
+    if state.endpoint.is_none() {
+        return http::new_tab_until(&state.host, state.port, None, deadline.instant());
+    }
+    let mut client = CdpClient::connect_state_until(state, deadline)?;
+    let result = client.call_until(
+        None,
+        "Target.createTarget",
+        json!({"url":"about:blank"}),
+        deadline,
+    )?;
+    let id = result["targetId"]
+        .as_str()
+        .context("Target.createTarget response missing targetId")?
+        .to_string();
+    Ok(http::TargetInfo {
+        id,
+        target_type: "page".into(),
+        title: String::new(),
+        url: "about:blank".into(),
+    })
 }
 
 /// Quote a string as a JavaScript string literal.

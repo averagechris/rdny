@@ -537,13 +537,35 @@ pub fn run() -> Result<()> {
                 extra_args: vec![],
                 label: args.label,
             };
-            let mut launched =
-                browser::launch_armed_until(&opts, crate::state::browser_storage()?, deadline)?;
-            if let Err(err) = crate::state::replace_lifecycle(&_lifecycle, &launched.state) {
-                return Err(err.context("publishing launched browser ownership; child was terminated and previous state preserved"));
+            let instance_id = crate::state::new_instance_id();
+            let mut launched = crate::broker::launch_armed(
+                &opts,
+                crate::state::browser_storage()?,
+                instance_id,
+                deadline,
+            )?;
+            #[cfg(debug_assertions)]
+            if let Some(marker) = std::env::var_os("RDNY_TEST_CRASH_BEFORE_BROKER_COMMIT") {
+                // Test-only abrupt client death: do not run destructors, so the
+                // broker must observe startup-socket EOF and clean itself up.
+                let endpoint = launched.state.endpoint.as_ref().expect("managed endpoint");
+                let evidence = json!({
+                    "broker": endpoint.broker_pid,
+                    "browser": launched.state.pid,
+                    "socket": endpoint.socket,
+                });
+                std::fs::write(marker, serde_json::to_vec(&evidence)?)?;
+                unsafe { libc::_exit(86) }
             }
-            launched.commit();
-            let state = launched.state;
+            let publish_state = launched.state.clone();
+            if let Err(err) =
+                crate::state::replace_lifecycle_and_commit(&_lifecycle, &publish_state, || {
+                    launched.commit()
+                })
+            {
+                return Err(err.context("publishing and committing managed broker ownership; browser was terminated and previous state preserved"));
+            }
+            let state = launched.state.clone();
             let browser = state
                 .browser_path
                 .as_ref()
@@ -553,7 +575,7 @@ pub fn run() -> Result<()> {
                 .pid
                 .map(|pid| pid.to_string())
                 .unwrap_or_else(|| "attached".to_string());
-            println!("started {browser} pid {pid} on port {}", state.port);
+            println!("started {browser} pid {pid} via authenticated local broker");
         }
         Command::Connect {
             address,
@@ -622,10 +644,16 @@ pub fn run() -> Result<()> {
                         .map(|label| format!(" label={label}"))
                         .unwrap_or_default();
                     if cli.format == OutputFormat::Human {
-                        println!(
-                            "running: {browser} on {}:{} (pid {pid}){label}",
-                            state.host, state.port
-                        );
+                        if state.endpoint.is_some() {
+                            println!(
+                                "running: {browser} via authenticated local broker (pid {pid}){label}"
+                            );
+                        } else {
+                            println!(
+                                "running: {browser} on {}:{} (pid {pid}){label}",
+                                state.host, state.port
+                            );
+                        }
                     } else {
                         cli.format.emit(&json!({"schemaVersion":1,"kind":"status","status":"running","healthy":true,"browser":browser,"host":state.host,"port":state.port,"pid":state.pid,"instance":state.instance_id,"target":state.target_id,"label":state.label}))?;
                     }
@@ -814,6 +842,18 @@ fn refuse_occupied_lifecycle(
             "refusing to {action}: state file has incompatible schema: {e}; upgrade rdny or inspect/remove the state explicitly"
         ),
         crate::state::Inspection::Valid(state, _) => {
+            if state.endpoint.is_some() {
+                if crate::broker::ping(&state, deadline).is_ok() {
+                    return Err(crate::hint::hint_error(
+                        format!(
+                            "refusing to {action}: live managed broker already owns this state dir"
+                        ),
+                        "run `rdny stop` first, or use a different --state-dir",
+                        None,
+                    ));
+                }
+                return Ok(());
+            }
             if let Some(id) = &state.process_identity {
                 crate::process_identity::validate_persisted(
                     state.pid,

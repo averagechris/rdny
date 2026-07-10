@@ -12,16 +12,12 @@ use crate::state::SecureDir;
 
 pub(crate) trait CredentialProvider: Send + Sync {
     fn current_uid(&self) -> u32;
-    fn current_gid(&self) -> u32;
 }
 #[derive(Debug, Default)]
 pub(crate) struct OsCredentialProvider;
 impl CredentialProvider for OsCredentialProvider {
     fn current_uid(&self) -> u32 {
         unsafe { libc::geteuid() }
-    }
-    fn current_gid(&self) -> u32 {
-        unsafe { libc::getegid() }
     }
 }
 
@@ -39,10 +35,18 @@ pub(crate) fn socket_path(dir: &SecureDir, instance_id: &str) -> Result<PathBuf>
     {
         bail!("invalid broker instance id");
     }
-    let path = dir.path().join(format!("broker-{instance_id}.sock"));
+    // The full lifecycle id remains in the authenticated handshake/state. A
+    // The compact 64-bit pathname suffix keeps normal macOS state roots below
+    // sun_path's unusually small limit. A collision fails closed; the full id
+    // and 256-bit token remain the authentication boundary.
+    let socket_id: String = instance_id.chars().take(16).collect();
+    let path = dir.path().join(format!("b-{socket_id}.s"));
     let bytes = path.as_os_str().as_encoded_bytes().len();
     if bytes >= sockaddr_un_path_cap() {
-        bail!("broker socket path too long for Unix socket");
+        bail!(
+            "broker socket path is {bytes} bytes but this platform permits fewer than {} bytes; choose a shorter absolute --state-dir or RDNY_STATE_DIR (no TCP fallback is used)",
+            sockaddr_un_path_cap()
+        );
     }
     Ok(path)
 }
@@ -58,17 +62,23 @@ pub(crate) fn bind(
 ) -> Result<(UnixListener, PathBuf)> {
     dir.validate_external_path()?;
     let path = socket_path(dir, instance_id)?;
-    match fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).context("removing stale broker socket"),
+    // A pathname here is ownership evidence, not disposable debris. Lifecycle
+    // code must explicitly validate and remove stale sockets before spawning.
+    if fs::symlink_metadata(&path).is_ok() {
+        bail!(
+            "broker socket already exists at {}; run `rdny status` and `rdny cleanup` after verifying the recorded broker identity",
+            path.display()
+        );
     }
     let old = unsafe { libc::umask(0o177) };
     let listener = UnixListener::bind(&path)
         .with_context(|| format!("binding broker socket {}", path.display()));
     unsafe { libc::umask(old) };
     let listener = listener?;
-    validate_socket_path(&path, creds)?;
+    if let Err(error) = validate_socket_path(&path, creds) {
+        let _ = fs::remove_file(&path);
+        return Err(error);
+    }
     Ok((listener, path))
 }
 
@@ -79,12 +89,33 @@ pub(crate) fn connect(path: &Path, creds: &dyn CredentialProvider) -> Result<Uni
     Ok(stream)
 }
 
+pub(crate) fn verify_peer(
+    stream: &UnixStream,
+    expected_uid: u32,
+    expected_pid: Option<u32>,
+) -> Result<()> {
+    let peer = peer_credentials(stream)?;
+    if peer.uid != expected_uid {
+        bail!("broker peer UID mismatch");
+    }
+    if let (Some(expected), Some(actual)) = (expected_pid, peer.pid)
+        && expected != actual
+    {
+        bail!("broker peer PID mismatch");
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_socket_path(path: &Path, creds: &dyn CredentialProvider) -> Result<()> {
     let md = fs::symlink_metadata(path).context("stat broker socket")?;
     if !md.file_type().is_socket() {
         bail!("broker path is not a socket");
     }
-    if md.uid() != creds.current_uid() || md.gid() != creds.current_gid() {
+    // Mode 0600 makes the owning UID the authorization boundary. macOS may
+    // assign a state-directory socket the directory's inherited group (for
+    // example wheel) rather than the process egid, so group equality is not a
+    // portable security invariant.
+    if md.uid() != creds.current_uid() {
         bail!("broker socket owner mismatch");
     }
     if md.permissions().mode() & 0o777 != 0o600 {
@@ -141,20 +172,15 @@ mod tests {
 
     struct FakeCreds {
         uid: u32,
-        gid: u32,
     }
     impl CredentialProvider for FakeCreds {
         fn current_uid(&self) -> u32 {
             self.uid
         }
-        fn current_gid(&self) -> u32 {
-            self.gid
-        }
     }
     fn real() -> FakeCreds {
         FakeCreds {
             uid: unsafe { libc::geteuid() },
-            gid: unsafe { libc::getegid() },
         }
     }
 
@@ -183,7 +209,6 @@ mod tests {
                 &path,
                 &FakeCreds {
                     uid: real().uid + 1,
-                    gid: real().gid
                 }
             )
             .is_err()
@@ -194,5 +219,23 @@ mod tests {
         let client_seen = peer_credentials(&stream).unwrap();
         assert_eq!(server_seen.uid, real().uid);
         assert_eq!(client_seen.uid, real().uid);
+    }
+
+    #[test]
+    fn bind_never_unlinks_an_existing_socket() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = crate::state::browser_storage_at(temp.path()).unwrap();
+        let (_, path) = bind(&storage.profile, "instance", &real()).unwrap();
+        assert!(bind(&storage.profile, "instance", &real()).is_err());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn overlong_state_path_is_rejected_before_bind() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("x".repeat(100));
+        let storage = crate::state::browser_storage_at(&root).unwrap();
+        let error = socket_path(&storage.profile, "instance").unwrap_err();
+        assert!(format!("{error:#}").contains("shorter absolute --state-dir"));
     }
 }

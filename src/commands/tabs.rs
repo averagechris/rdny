@@ -18,7 +18,7 @@ pub fn pages_format(structured: bool) -> Result<()> {
 
 pub fn pages_format_until(structured: bool, deadline: Deadline) -> Result<()> {
     let state = crate::state::require()?;
-    let pages = page_targets(&state.host, state.port, deadline)?;
+    let pages = page_targets(&state, deadline)?;
     if structured {
         let rows: Vec<_> = pages.iter().enumerate().map(|(index, target)| serde_json::json!({
             "index": index, "current": state.target_id.as_deref() == Some(target.id.as_str()),
@@ -51,7 +51,7 @@ pub fn page(index: usize) -> Result<()> {
 
 pub fn page_until(index: usize, deadline: Deadline) -> Result<()> {
     let state = crate::state::require()?;
-    let pages = page_targets(&state.host, state.port, deadline)?;
+    let pages = page_targets(&state, deadline)?;
     let target = pages
         .get(index)
         .ok_or_else(|| anyhow::anyhow!("no page at index {index} (see `rdny pages`)"))?;
@@ -74,7 +74,7 @@ pub fn newpage_with_policy(
     let normalized = url
         .map(|url| crate::commands::nav::normalize_url(url, policy))
         .transpose()?;
-    let target = http::new_tab_until(&state.host, state.port, None, deadline.instant())?;
+    let target = crate::session::create_target_until(&state, deadline)?;
     crate::state::update(|state| {
         state.target_id = Some(target.id.clone());
         Ok(())
@@ -92,8 +92,8 @@ pub fn newpage_with_policy(
     Ok(())
 }
 
-fn page_targets(host: &str, port: u16, deadline: Deadline) -> Result<Vec<TargetInfo>> {
-    let mut pages: Vec<_> = http::list_targets_until(host, port, deadline.instant())?
+fn page_targets(state: &crate::state::SessionState, deadline: Deadline) -> Result<Vec<TargetInfo>> {
+    let mut pages: Vec<_> = crate::session::targets_until(state, deadline)?
         .into_iter()
         .filter(|target| target.target_type == "page")
         .collect();
