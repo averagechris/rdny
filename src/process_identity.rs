@@ -90,7 +90,7 @@ pub fn matches_identity(pid: u32, id: &ProcessIdentity) -> Result<bool> {
         return Ok(false);
     };
     Ok(observed.start_time == id.start_time
-        && normalize(&observed.exe) == normalize(&id.exe)
+        && executable_matches(&observed.exe, &id.exe)
         && observed.argv == id.argv
         && validate_profile_arg(&observed.argv, id.user_data_dir.as_deref()).is_ok())
 }
@@ -118,6 +118,10 @@ fn validate_profile_arg(argv: &[OsString], profile: Option<&Path>) -> Result<()>
 
 pub fn terminate(id: &ProcessIdentity) -> Result<()> {
     terminate_with(id, &RealOps, Duration::from_secs(5), Duration::from_secs(2))
+}
+
+pub fn wait_for_exit(id: &ProcessIdentity, timeout: Duration) -> Result<bool> {
+    wait_dead_with(id, timeout, &RealOps)
 }
 
 fn terminate_with(
@@ -174,10 +178,12 @@ fn signal_checked_with(
             }
         }
     }
-    if !matches_identity_with(id.pid, id, ops)? {
-        bail!("refusing to signal non-matching process identity");
-    }
-    ops.kill(id.pid, sig).context("kill failed")
+    let _ = sig;
+    let _ = ops;
+    bail!(
+        "pidfd is unavailable; refusing unsafe numeric signaling of PID {}",
+        id.pid
+    )
 }
 
 fn matches_identity_with(pid: u32, id: &ProcessIdentity, ops: &impl ProcessOps) -> Result<bool> {
@@ -185,7 +191,7 @@ fn matches_identity_with(pid: u32, id: &ProcessIdentity, ops: &impl ProcessOps) 
         return Ok(false);
     };
     Ok(observed.start_time == id.start_time
-        && normalize(&observed.exe) == normalize(&id.exe)
+        && executable_matches(&observed.exe, &id.exe)
         && observed.argv == id.argv
         && validate_profile_arg(&observed.argv, id.user_data_dir.as_deref()).is_ok())
 }
@@ -193,7 +199,6 @@ fn matches_identity_with(pid: u32, id: &ProcessIdentity, ops: &impl ProcessOps) 
 trait ProcessOps {
     fn observe(&self, pid: u32) -> Result<Option<Observed>>;
     fn reap_if_child(&self, pid: u32);
-    fn kill(&self, pid: u32, sig: libc::c_int) -> std::io::Result<()>;
     #[cfg(target_os = "linux")]
     fn pidfd_open(&self, pid: u32) -> std::io::Result<PidFd>;
     #[cfg(target_os = "linux")]
@@ -207,14 +212,6 @@ impl ProcessOps for RealOps {
     }
     fn reap_if_child(&self, pid: u32) {
         reap_if_child(pid)
-    }
-    fn kill(&self, pid: u32, sig: libc::c_int) -> std::io::Result<()> {
-        let rc = unsafe { libc::kill(pid as libc::pid_t, sig) };
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
     }
     #[cfg(target_os = "linux")]
     fn pidfd_open(&self, pid: u32) -> std::io::Result<PidFd> {
@@ -367,6 +364,26 @@ fn normalize(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
+fn executable_matches(observed: &Path, recorded: &Path) -> bool {
+    if normalize(observed) == normalize(recorded) {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Chromium's hardened-runtime launcher can execute from a temporary
+        // code_sign_clone path and later report the original app path through
+        // proc_pidpath. PID start time, complete argv, and the private profile
+        // argument remain exact; only accept this known path transition for an
+        // identical executable basename.
+        let is_clone = |path: &Path| path.to_string_lossy().contains("code_sign_clone");
+        (is_clone(observed) || is_clone(recorded))
+            && observed.file_name().is_some()
+            && observed.file_name() == recorded.file_name()
+    }
+    #[cfg(not(target_os = "macos"))]
+    false
+}
+
 #[cfg(target_os = "linux")]
 fn parse_nul_argv(raw: &[u8]) -> Vec<OsString> {
     use std::os::unix::ffi::OsStringExt;
@@ -407,8 +424,10 @@ fn parse_macos_procargs2(raw: &[u8], argc: usize) -> Result<Vec<OsString>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::{cell::RefCell, collections::VecDeque};
 
+    #[cfg(target_os = "linux")]
     fn id() -> ProcessIdentity {
         ProcessIdentity {
             pid: 42,
@@ -422,6 +441,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[derive(Default)]
     struct MockOps {
         events: RefCell<Vec<String>>,
@@ -430,8 +450,8 @@ mod tests {
         pidfd_open: RefCell<Option<std::io::Error>>,
         #[cfg(target_os = "linux")]
         pidfd_send: RefCell<Option<std::io::Error>>,
-        kill: RefCell<Option<std::io::Error>>,
     }
+    #[cfg(target_os = "linux")]
     impl MockOps {
         #[cfg(target_os = "linux")]
         fn matching() -> Self {
@@ -447,6 +467,7 @@ mod tests {
             self.observes.borrow_mut().push_back(o);
         }
     }
+    #[cfg(target_os = "linux")]
     impl ProcessOps for MockOps {
         fn observe(&self, _: u32) -> Result<Option<Observed>> {
             self.events.borrow_mut().push("observe".into());
@@ -454,14 +475,6 @@ mod tests {
         }
         fn reap_if_child(&self, _: u32) {
             self.events.borrow_mut().push("reap".into());
-        }
-        fn kill(&self, _: u32, sig: libc::c_int) -> std::io::Result<()> {
-            self.events.borrow_mut().push(format!("kill:{sig}"));
-            if let Some(e) = self.kill.borrow_mut().take() {
-                Err(e)
-            } else {
-                Ok(())
-            }
         }
         #[cfg(target_os = "linux")]
         fn pidfd_open(&self, _: u32) -> std::io::Result<PidFd> {
@@ -516,11 +529,15 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn pidfd_fallback_only_for_unsupported_and_propagates_errors() {
+    fn pidfd_unavailable_refuses_numeric_kill_and_propagates_other_errors() {
         let ops = MockOps::matching();
         *ops.pidfd_open.borrow_mut() = Some(std::io::Error::from_raw_os_error(libc::ENOSYS));
-        signal_checked_with(&id(), libc::SIGTERM, &ops).unwrap();
-        assert_eq!(&*ops.events.borrow(), &["pidfd_open", "observe", "kill:15"]);
+        let err = signal_checked_with(&id(), libc::SIGTERM, &ops).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("refusing unsafe numeric signaling")
+        );
+        assert_eq!(&*ops.events.borrow(), &["pidfd_open"]);
         let ops = MockOps::matching();
         *ops.pidfd_open.borrow_mut() = Some(std::io::Error::from_raw_os_error(libc::EPERM));
         assert!(
@@ -532,16 +549,17 @@ mod tests {
         );
         let ops = MockOps::matching();
         *ops.pidfd_open.borrow_mut() = Some(std::io::Error::from_raw_os_error(libc::EINVAL));
-        *ops.kill.borrow_mut() = Some(std::io::Error::from_raw_os_error(libc::ESRCH));
         assert!(
             format!(
                 "{:#}",
                 signal_checked_with(&id(), libc::SIGTERM, &ops).unwrap_err()
             )
-            .contains("kill failed")
+            .contains("refusing unsafe numeric signaling")
         );
+        assert_eq!(&*ops.events.borrow(), &["pidfd_open"]);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn terminate_term_success_escalation_and_survivor() {
         let ops = MockOps::default();
@@ -744,5 +762,19 @@ mod tests {
                 OsString::from("arg2")
             ]
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_code_sign_clone_matches_original_executable_only() {
+        let clone = Path::new(
+            "/private/var/folders/x/X/net.example.code_sign_clone/code_sign_clone.abc/Helium.app.bundle/Contents/MacOS/Helium",
+        );
+        let original = Path::new("/Applications/Helium.app/Contents/MacOS/Helium");
+        assert!(executable_matches(clone, original));
+        assert!(!executable_matches(
+            clone,
+            Path::new("/Applications/Other.app/Contents/MacOS/Other")
+        ));
     }
 }

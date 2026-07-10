@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::process_identity::ProcessIdentity;
+use storage::AdvisoryLockMode;
 use storage::StateStore;
 pub(crate) use storage::{AdvisoryLock, Generation, Inspection, SecureDir};
 
@@ -216,8 +217,55 @@ pub(crate) struct RecordingLease {
 pub(crate) fn try_recording_lease(frames_path: &Path) -> Result<Option<RecordingLease>> {
     let frames = open_frames_dir_from_path(frames_path)?;
     Ok(frames
-        .try_advisory_lock(".assembling.lock")?
+        .try_advisory_lock(".recording.lock", AdvisoryLockMode::Exclusive)?
         .map(|lock| RecordingLease { _lock: lock }))
+}
+
+pub(crate) fn recording_lease(frames_path: &Path) -> Result<RecordingLease> {
+    let frames = open_frames_dir_from_path(frames_path)?;
+    frames
+        .advisory_lock(
+            ".recording.lock",
+            AdvisoryLockMode::Exclusive,
+            Duration::from_secs(5),
+        )
+        .map(|lock| RecordingLease { _lock: lock })
+}
+
+/// Acquire a writer lease while holding the state lock and only if this frame
+/// directory is still the active recording. This state -> recording-lease
+/// ordering is shared with deactivation: once deactivation owns the state lock,
+/// no stale page session can begin another write.
+pub(crate) fn active_recording_writer_lease(frames_path: &Path) -> Result<Option<RecordingLease>> {
+    let frames = open_frames_dir_from_path(frames_path)?;
+    let expected = storage::normalize_absolute(frames.path())?;
+    let legacy = frames_dir()?.path().to_path_buf();
+    let store = open_store()?;
+    let mut selected = None;
+    store.inspect_transaction::<SessionState, _>(
+        STATE_FILE,
+        Duration::from_secs(5),
+        |inspection| {
+            let Inspection::Valid(state, _) = inspection else {
+                return Ok(None);
+            };
+            let active_path = state
+                .recording_frames_dir
+                .as_deref()
+                .unwrap_or(legacy.as_path());
+            if state.recording && storage::normalize_absolute(active_path)? == expected {
+                selected = Some(RecordingLease {
+                    _lock: frames.advisory_lock(
+                        ".recording.lock",
+                        AdvisoryLockMode::Shared,
+                        Duration::from_secs(5),
+                    )?,
+                });
+            }
+            Ok(None)
+        },
+    )?;
+    Ok(selected)
 }
 
 /// Resolve the rdny state directory (created if missing).
@@ -1084,6 +1132,41 @@ mod tests {
         }
         if let Some(previous) = previous_xdg {
             unsafe { env::set_var("XDG_STATE_HOME", previous) };
+        } else {
+            unsafe { env::remove_var("XDG_STATE_HOME") };
+        }
+    }
+
+    #[test]
+    fn default_state_lifecycle_does_not_reenter_registry_lock() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let previous_state = env::var_os("RDNY_STATE_DIR");
+        let previous_xdg = env::var_os("XDG_STATE_HOME");
+        let temp = tempfile::tempdir().unwrap();
+        unsafe {
+            env::remove_var("RDNY_STATE_DIR");
+            env::set_var("XDG_STATE_HOME", temp.path());
+        }
+
+        let started = std::time::Instant::now();
+        replace(&sample_state()).unwrap();
+        let loaded = load().unwrap().unwrap();
+        assert!(loaded.instance_id.is_some());
+        let default = default_state_dir().unwrap();
+        assert!(default.join("state.json").is_file());
+        assert!(default.join("instances.json").is_file());
+        assert!(default.join(".state.lock").is_file());
+        assert!(default.join(".registry.lock").is_file());
+        clear().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        if let Some(value) = previous_state {
+            unsafe { env::set_var("RDNY_STATE_DIR", value) };
+        } else {
+            unsafe { env::remove_var("RDNY_STATE_DIR") };
+        }
+        if let Some(value) = previous_xdg {
+            unsafe { env::set_var("XDG_STATE_HOME", value) };
         } else {
             unsafe { env::remove_var("XDG_STATE_HOME") };
         }

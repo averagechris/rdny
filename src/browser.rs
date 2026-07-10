@@ -7,7 +7,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use serde_json::json;
 
+use crate::cdp::client::CdpClient;
 use crate::cdp::http;
 use crate::config;
 use crate::hint::hint_error;
@@ -175,9 +177,36 @@ pub fn stop(state: &SessionState) -> Result<StopOutcome> {
         ProcessClass::AttachedReachable | ProcessClass::AttachedDead => Ok(StopOutcome::Detached),
         ProcessClass::ManagedDead => Ok(StopOutcome::Stopped),
         ProcessClass::ManagedMatching => {
-            process_identity::terminate(
-                state.process_identity.as_ref().expect("classified managed"),
-            )?;
+            let identity = state.process_identity.as_ref().expect("classified managed");
+            let close_result = close_browser(&state.ws_url);
+            if process_identity::wait_for_exit(identity, Duration::from_secs(5))? {
+                return Ok(StopOutcome::Stopped);
+            }
+
+            // Linux can safely escalate only through a pidfd, which binds the
+            // signal to the already-open process identity. Other platforms and
+            // kernels without pidfd must never validate and then numeric-kill.
+            if let Err(signal_error) = process_identity::terminate(identity) {
+                let close_detail = close_result
+                    .err()
+                    .map(|err| format!("Browser.close failed: {err:#}; "))
+                    .unwrap_or_default();
+                bail!(
+                    "{close_detail}managed browser PID {} is still running; {signal_error:#}. Close it manually, verify the profile {}, then retry `rdny stop`; session state was preserved",
+                    identity.pid,
+                    state
+                        .user_data_dir
+                        .as_deref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "(unknown)".to_string())
+                );
+            }
+            if !process_identity::wait_for_exit(identity, Duration::from_secs(2))? {
+                bail!(
+                    "managed browser PID {} did not exit after safe pidfd escalation; close it manually and retry `rdny stop`; session state was preserved",
+                    identity.pid
+                );
+            }
             Ok(StopOutcome::Stopped)
         }
         ProcessClass::LegacyUnverifiable => bail!(
@@ -187,6 +216,15 @@ pub fn stop(state: &SessionState) -> Result<StopOutcome> {
             bail!("refusing to signal PID that does not match rdny's managed process identity")
         }
     }
+}
+
+fn close_browser(ws_url: &str) -> Result<()> {
+    let mut client = CdpClient::connect(ws_url)?;
+    client.set_timeout(Duration::from_secs(5));
+    client
+        .call(None, "Browser.close", json!({}))
+        .context("sending Browser.close")?;
+    Ok(())
 }
 
 /// Health of the recorded session.
@@ -441,9 +479,8 @@ fn first_page_target(host: &str, port: u16) -> Option<String> {
 }
 
 fn kill_child(child: &mut std::process::Child) {
-    unsafe {
-        libc::kill(child.id() as libc::pid_t, libc::SIGKILL);
-    }
+    // This is the owned launch handle, not a persisted numeric PID.
+    let _ = child.kill();
     let _ = child.wait();
 }
 
@@ -482,6 +519,41 @@ fn pid_exists(pid: libc::pid_t) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+    use std::net::TcpListener;
+    use tungstenite::{Message, accept};
+
+    fn fake_close_server(response: &'static str) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = accept(stream).unwrap();
+            let Message::Text(raw) = socket.read().unwrap() else {
+                panic!("expected text request")
+            };
+            let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(request["method"], "Browser.close");
+            assert_eq!(request["params"], json!({}));
+            socket.send(Message::Text(response.into())).unwrap();
+        });
+        (url, handle)
+    }
+
+    #[test]
+    fn graceful_close_uses_browser_level_cdp() {
+        let (url, handle) = fake_close_server(r#"{"id":1,"result":{}}"#);
+        close_browser(&url).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn graceful_close_surfaces_cdp_rejection() {
+        let (url, handle) =
+            fake_close_server(r#"{"id":1,"error":{"code":-32000,"message":"close denied"}}"#);
+        let err = close_browser(&url).unwrap_err().to_string();
+        assert!(err.contains("Browser.close"), "{err}");
+        handle.join().unwrap();
+    }
 
     #[test]
     fn relaunch_example_names_the_discovered_mac_app() {
@@ -730,6 +802,53 @@ mod tests {
                 process_identity::classify(Some(pid), state.process_identity.as_ref(), false),
                 ProcessClass::ManagedMatching
             );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn real_default_state_start_connect_stop_lifecycle() {
+        let _guard = crate::state::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let previous_state = std::env::var_os("RDNY_STATE_DIR");
+        let previous_xdg = std::env::var_os("XDG_STATE_HOME");
+        let temp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::remove_var("RDNY_STATE_DIR");
+            std::env::set_var("XDG_STATE_HOME", temp.path());
+        }
+
+        let managed = launch(
+            &LaunchOpts::default(),
+            crate::state::browser_storage().unwrap(),
+        )
+        .unwrap_or_else(|err| {
+            let log = fs::read_to_string(
+                crate::state::default_state_dir()
+                    .unwrap()
+                    .join("chrome.log"),
+            )
+            .unwrap_or_default();
+            panic!("{err}\nchrome.log:\n{log}");
+        });
+        crate::state::replace(&managed).unwrap();
+        assert!(crate::state::load().unwrap().unwrap().instance_id.is_some());
+        let attached = connect(&managed.host, managed.port).unwrap();
+        assert_eq!(attached.ws_url, managed.ws_url);
+        assert!(attached.pid.is_none());
+        assert_eq!(stop(&managed).unwrap(), StopOutcome::Stopped);
+        crate::state::clear().unwrap();
+
+        if let Some(value) = previous_state {
+            unsafe { std::env::set_var("RDNY_STATE_DIR", value) };
+        } else {
+            unsafe { std::env::remove_var("RDNY_STATE_DIR") };
+        }
+        if let Some(value) = previous_xdg {
+            unsafe { std::env::set_var("XDG_STATE_HOME", value) };
+        } else {
+            unsafe { std::env::remove_var("XDG_STATE_HOME") };
         }
     }
 }

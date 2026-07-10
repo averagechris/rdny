@@ -79,6 +79,12 @@ pub(crate) struct SecureDir {
 
 pub(crate) struct AdvisoryLock(File);
 
+#[derive(Clone, Copy)]
+pub(crate) enum AdvisoryLockMode {
+    Shared,
+    Exclusive,
+}
+
 impl SecureDir {
     pub(crate) fn path(&self) -> &Path {
         &self.path
@@ -206,7 +212,11 @@ impl SecureDir {
         }
     }
 
-    pub(crate) fn try_advisory_lock(&self, name: &str) -> Result<Option<AdvisoryLock>> {
+    pub(crate) fn try_advisory_lock(
+        &self,
+        name: &str,
+        mode: AdvisoryLockMode,
+    ) -> Result<Option<AdvisoryLock>> {
         validate_name(name)?;
         let file = file_from_openat(
             self.dir.as_raw_fd(),
@@ -215,7 +225,11 @@ impl SecureDir {
             0o600,
         )?;
         validate_regular(&file, 0o600)?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        let operation = match mode {
+            AdvisoryLockMode::Shared => libc::LOCK_SH,
+            AdvisoryLockMode::Exclusive => libc::LOCK_EX,
+        };
+        if unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) } == 0 {
             Ok(Some(AdvisoryLock(file)))
         } else {
             let err = std::io::Error::last_os_error();
@@ -224,6 +238,27 @@ impl SecureDir {
             } else {
                 Err(err.into())
             }
+        }
+    }
+
+    pub(crate) fn advisory_lock(
+        &self,
+        name: &str,
+        mode: AdvisoryLockMode,
+        timeout: Duration,
+    ) -> Result<AdvisoryLock> {
+        let start = Instant::now();
+        loop {
+            if let Some(lock) = self.try_advisory_lock(name, mode)? {
+                return Ok(lock);
+            }
+            let Some(remaining) = timeout.checked_sub(start.elapsed()) else {
+                bail!("timed out after {timeout:?} waiting for recording lease")
+            };
+            if remaining.is_zero() {
+                bail!("timed out after {timeout:?} waiting for recording lease")
+            }
+            thread::sleep(remaining.min(Duration::from_millis(10)));
         }
     }
 
@@ -401,7 +436,7 @@ impl StateStore {
         F: FnOnce(Option<Value>) -> Result<Value>,
     {
         validate_name(name)?;
-        let _lock = self.lock(timeout)?;
+        let _lock = self.lock_for(name, timeout)?;
         let next = update(self.read_value(name)?)?;
         self.write_json_locked(name, &next, FailurePoint::None)
             .map(|_| ())
@@ -417,7 +452,7 @@ impl StateStore {
         F: FnOnce(Option<Value>) -> Result<Value>,
     {
         validate_name(name)?;
-        let _lock = self.lock(timeout)?;
+        let _lock = self.lock_for(name, timeout)?;
         let next = update(self.read_value(name)?)?;
         self.write_json_locked(name, &next, FailurePoint::None)
     }
@@ -432,7 +467,7 @@ impl StateStore {
         F: FnOnce(Option<Value>) -> Result<Option<Value>>,
     {
         validate_name(name)?;
-        let _lock = self.lock(timeout)?;
+        let _lock = self.lock_for(name, timeout)?;
         if let Some(next) = update(self.read_value(name)?)? {
             self.write_json_locked(name, &next, FailurePoint::None)?;
         }
@@ -450,7 +485,7 @@ impl StateStore {
         F: FnOnce(Inspection<T>) -> Result<Option<Value>>,
     {
         validate_name(name)?;
-        let _lock = self.lock(timeout)?;
+        let _lock = self.lock_for(name, timeout)?;
         let mut quarantine_before_write = false;
         let inspection = match self.read_bytes(name)? {
             None => Inspection::Missing,
@@ -492,7 +527,7 @@ impl StateStore {
     }
 
     pub(crate) fn write_json<T: Serialize>(&self, name: &str, value: &T) -> Result<()> {
-        let _lock = self.lock(DEFAULT_TIMEOUT)?;
+        let _lock = self.lock_for(name, DEFAULT_TIMEOUT)?;
         self.write_json_locked(name, value, FailurePoint::None)
             .map(|_| ())
     }
@@ -535,7 +570,7 @@ impl StateStore {
 
     pub(crate) fn remove(&self, name: &str) -> Result<()> {
         validate_name(name)?;
-        let _lock = self.lock(DEFAULT_TIMEOUT)?;
+        let _lock = self.lock_for(name, DEFAULT_TIMEOUT)?;
         match unlinkat(self.dir.as_raw_fd(), name, 0) {
             Ok(()) => self.dir.sync_all().context("syncing state directory"),
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
@@ -554,7 +589,7 @@ impl StateStore {
         F: FnOnce(&T) -> Result<bool>,
     {
         validate_name(name)?;
-        let _lock = self.lock(DEFAULT_TIMEOUT)?;
+        let _lock = self.lock_for(name, DEFAULT_TIMEOUT)?;
         let Some(raw) = self.read_bytes(name)? else {
             return Ok(false);
         };
@@ -572,7 +607,7 @@ impl StateStore {
 
     pub(crate) fn remove_subdir(&self, name: &str) -> Result<()> {
         validate_name(name)?;
-        let _lock = self.lock(DEFAULT_TIMEOUT)?;
+        let _lock = self.lock_for("state.json", DEFAULT_TIMEOUT)?;
         let dir = match file_from_openat(
             self.dir.as_raw_fd(),
             name,
@@ -613,7 +648,7 @@ impl StateStore {
         observed: &Malformed,
     ) -> Result<Option<PathBuf>> {
         validate_name(name)?;
-        let _lock = self.lock(DEFAULT_TIMEOUT)?;
+        let _lock = self.lock_for(name, DEFAULT_TIMEOUT)?;
         let Some(current) = self.read_bytes(name)? else {
             return Ok(None);
         };
@@ -640,15 +675,25 @@ impl StateStore {
         bail!("could not allocate unique quarantine name")
     }
 
-    fn lock(&self, timeout: Duration) -> Result<LockGuard> {
+    fn lock_for(&self, data_name: &str, timeout: Duration) -> Result<LockGuard> {
+        let lock_name = if data_name == "instances.json" {
+            ".registry.lock"
+        } else {
+            ".state.lock"
+        };
+        self.lock_named(lock_name, timeout)
+    }
+
+    fn lock_named(&self, lock_name: &str, timeout: Duration) -> Result<LockGuard> {
+        validate_name(lock_name)?;
         let file = file_from_openat(
             self.dir.as_raw_fd(),
-            ".lock",
+            lock_name,
             libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW,
             0o600,
         )
-        .context("opening state lock file")?;
-        validate_regular(&file, 0o600).context("validating state lock file")?;
+        .with_context(|| format!("opening {lock_name} lock file"))?;
+        validate_regular(&file, 0o600).with_context(|| format!("validating {lock_name}"))?;
         let start = Instant::now();
         loop {
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
@@ -663,12 +708,12 @@ impl StateStore {
             let elapsed = start.elapsed();
             let Some(remaining) = timeout.checked_sub(elapsed) else {
                 bail!(
-                    "timed out after {timeout:?} waiting for rdny state lock; another rdny process may be updating state"
+                    "timed out after {timeout:?} waiting for rdny lock {lock_name}; another rdny process may be updating state"
                 )
             };
             if remaining.is_zero() {
                 bail!(
-                    "timed out after {timeout:?} waiting for rdny state lock; another rdny process may be updating state"
+                    "timed out after {timeout:?} waiting for rdny lock {lock_name}; another rdny process may be updating state"
                 )
             }
             thread::sleep(remaining.min(Duration::from_millis(25)));
@@ -1147,7 +1192,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        for (name, mode) in [("state.json", 0o600), (".lock", 0o600)] {
+        for (name, mode) in [("state.json", 0o600), (".state.lock", 0o600)] {
             assert_eq!(
                 fs::metadata(root.join(name)).unwrap().permissions().mode() & 0o777,
                 mode
@@ -1165,7 +1210,7 @@ mod tests {
         fs::remove_file(t.path().join("state.json")).unwrap();
         fs::hard_link(t.path().join("target"), t.path().join("state.json")).unwrap();
         assert!(s.read_value("state.json").is_err());
-        fs::hard_link(t.path().join("target"), t.path().join(".lock")).unwrap();
+        fs::hard_link(t.path().join("target"), t.path().join(".state.lock")).unwrap();
         assert!(s.write_json("other", &1).is_err());
     }
 
@@ -1208,7 +1253,7 @@ mod tests {
         let t = tempdir();
         let s = Arc::new(StateStore::open(t.path()).unwrap());
         s.write_json("state.json", &1).unwrap();
-        let guard = s.lock(Duration::from_secs(1)).unwrap();
+        let guard = s.lock_named(".state.lock", Duration::from_secs(1)).unwrap();
         let worker = {
             let s = Arc::clone(&s);
             thread::spawn(move || s.remove("state.json").unwrap())
@@ -1260,12 +1305,27 @@ mod tests {
     fn timeout_respects_remaining_duration() {
         let t = tempdir();
         let s = StateStore::open(t.path()).unwrap();
-        let _g = s.lock(Duration::from_secs(1)).unwrap();
+        let _g = s.lock_named(".state.lock", Duration::from_secs(1)).unwrap();
         let start = Instant::now();
-        assert!(s.lock(Duration::from_millis(7)).is_err());
+        assert!(
+            s.lock_named(".state.lock", Duration::from_millis(7))
+                .is_err()
+        );
         let elapsed = start.elapsed();
         assert!(elapsed >= Duration::from_millis(7));
         assert!(elapsed < Duration::from_millis(40), "{elapsed:?}");
+    }
+
+    #[test]
+    fn state_and_registry_use_distinct_lock_domains() {
+        let t = tempdir();
+        let s = StateStore::open(t.path()).unwrap();
+        let _state = s.lock_for("state.json", Duration::from_millis(50)).unwrap();
+        let _registry = s
+            .lock_for("instances.json", Duration::from_millis(50))
+            .unwrap();
+        assert!(t.path().join(".state.lock").is_file());
+        assert!(t.path().join(".registry.lock").is_file());
     }
 
     #[test]
@@ -1280,7 +1340,7 @@ mod tests {
             FailurePoint::AfterFileSync,
             FailurePoint::BeforeRename,
         ] {
-            let _g = s.lock(Duration::from_secs(1)).unwrap();
+            let _g = s.lock_named(".state.lock", Duration::from_secs(1)).unwrap();
             assert!(
                 s.write_json_locked("state.json", &serde_json::json!({"new":true}), point)
                     .is_err()
@@ -1289,7 +1349,7 @@ mod tests {
             let v: Value = s.read_json("state.json").unwrap().unwrap();
             assert_eq!(v["old"], true);
         }
-        let _g = s.lock(Duration::from_secs(1)).unwrap();
+        let _g = s.lock_named(".state.lock", Duration::from_secs(1)).unwrap();
         assert!(
             s.write_json_locked(
                 "state.json",

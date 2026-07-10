@@ -205,13 +205,9 @@ fn deactivate_or_recover_recording() -> Result<(String, PathBuf, state::Recordin
                 .recording_frames_dir
                 .clone()
                 .unwrap_or_else(|| legacy_frames.clone());
-            let Some(lease) = state::try_recording_lease(&frames)? else {
-                return Err(hint_error(
-                    "video recording is already being assembled",
-                    "wait for the running `rdny stop-video` to finish, then retry if needed",
-                    None,
-                ));
-            };
+            // The state lock prevents new frame writers while this exclusive
+            // lease waits for already-started writes to finish.
+            let lease = state::recording_lease(&frames)?;
             state.recording = false;
             state.recording_id = None;
             state.recording_frames_dir = None;
@@ -346,24 +342,31 @@ pub(crate) fn handle_screencast_frame(
     params: &Value,
     frames_dir: &state::SecureDir,
 ) -> Result<Option<String>> {
+    let ack = params
+        .get("sessionId")
+        .and_then(Value::as_i64)
+        .map(|id| id.to_string());
     let Some(data) = params.get("data").and_then(Value::as_str) else {
-        return Ok(None);
+        return Ok(ack);
     };
     let Some(timestamp) = params
         .get("metadata")
         .and_then(|m| m.get("timestamp"))
         .and_then(Value::as_f64)
     else {
-        return Ok(None);
+        return Ok(ack);
+    };
+    let Some(_lease) = state::active_recording_writer_lease(frames_dir.path())? else {
+        // A cached PageSession can still receive a frame after stop-video has
+        // deactivated this recording. Acknowledge it, but never repopulate the
+        // directory being assembled or cleaned up.
+        return Ok(ack);
     };
     let bytes = decode_base64(data)?;
     frames_dir
         .write_file(&format!("{timestamp:.6}.jpg"), &bytes)
         .context("writing screencast frame")?;
-    Ok(params
-        .get("sessionId")
-        .and_then(Value::as_i64)
-        .map(|id| id.to_string()))
+    Ok(ack)
 }
 
 pub fn concat_list(frames: &[(f64, PathBuf)]) -> String {
@@ -416,6 +419,7 @@ mod tests {
 
     struct EnvGuard {
         state_dir: Option<std::ffi::OsString>,
+        xdg_state_home: Option<std::ffi::OsString>,
         ffmpeg: Option<std::ffi::OsString>,
         config: Option<std::ffi::OsString>,
         cwd: PathBuf,
@@ -425,6 +429,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 state_dir: env::var_os("RDNY_STATE_DIR"),
+                xdg_state_home: env::var_os("XDG_STATE_HOME"),
                 ffmpeg: env::var_os("RDNY_FFMPEG"),
                 config: env::var_os("RDNY_CONFIG"),
                 cwd: env::current_dir().unwrap(),
@@ -443,6 +448,11 @@ mod tests {
                 unsafe { env::set_var("RDNY_FFMPEG", value) };
             } else {
                 unsafe { env::remove_var("RDNY_FFMPEG") };
+            }
+            if let Some(value) = &self.xdg_state_home {
+                unsafe { env::set_var("XDG_STATE_HOME", value) };
+            } else {
+                unsafe { env::remove_var("XDG_STATE_HOME") };
             }
             if let Some(value) = &self.config {
                 unsafe { env::set_var("RDNY_CONFIG", value) };
@@ -480,8 +490,15 @@ mod tests {
             .unwrap_or_else(|err| err.into_inner());
         let _env = EnvGuard::new();
         let temp = tempfile::tempdir().unwrap();
-        unsafe { env::set_var("RDNY_STATE_DIR", temp.path()) };
+        configure_test_state(temp.path(), temp.path());
         f(temp.path())
+    }
+
+    fn configure_test_state(state_dir: &Path, writable_root: &Path) {
+        unsafe {
+            env::set_var("RDNY_STATE_DIR", state_dir);
+            env::set_var("XDG_STATE_HOME", writable_root.join("xdg-state"));
+        }
     }
 
     fn assert_recoverable(id: &str) {
@@ -546,6 +563,55 @@ mod tests {
                 }
                 Ok("claimed".to_string())
             }
+            "writer-hold" => {
+                let frames = PathBuf::from(env::var_os("RDNY_VIDEO_FRAMES_PATH").unwrap());
+                let _lease = state::active_recording_writer_lease(&frames)
+                    .unwrap()
+                    .expect("recording is active");
+                fs::write(root.join("writer-held"), b"held").unwrap();
+                while !root.join("release-writer").exists() {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                state::open_frames_dir_from_path(&frames)
+                    .unwrap()
+                    .write_file("1.000000.jpg", b"first")
+                    .unwrap();
+                Ok("written".to_string())
+            }
+            "assembler-hold" => {
+                let frames = PathBuf::from(env::var_os("RDNY_VIDEO_FRAMES_PATH").unwrap());
+                let mut lease = None;
+                state::update(|current| {
+                    fs::write(root.join("assembler-state-locked"), b"locked").unwrap();
+                    lease = Some(state::recording_lease(&frames)?);
+                    current.recording = false;
+                    current.recording_id = None;
+                    current.recording_frames_dir = None;
+                    Ok(())
+                })
+                .unwrap();
+                fs::write(root.join("assembler-exclusive"), b"held").unwrap();
+                while !root.join("release-assembler").exists() {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                drop(lease);
+                Ok("assembled".to_string())
+            }
+            "late-frame" => {
+                let frames = PathBuf::from(env::var_os("RDNY_VIDEO_FRAMES_PATH").unwrap());
+                let frames = state::open_frames_dir_from_path(&frames).unwrap();
+                let ack = handle_screencast_frame(
+                    &serde_json::json!({
+                        "data": "/9j/2Q==",
+                        "metadata": {"timestamp": 2.0},
+                        "sessionId": 19
+                    }),
+                    &frames,
+                )
+                .unwrap();
+                fs::write(root.join("late-ack"), ack.unwrap()).unwrap();
+                Ok("acked".to_string())
+            }
             _ => unreachable!(),
         }
         .unwrap();
@@ -563,6 +629,22 @@ mod tests {
             .unwrap()
     }
 
+    fn spawn_video_helper_with_frames(
+        root: &Path,
+        role: &str,
+        frames: &Path,
+    ) -> std::process::Child {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("commands::video::tests::video_process_helper")
+            .arg("--exact")
+            .env("RDNY_STATE_DIR", root)
+            .env("RDNY_VIDEO_PROCESS_ROOT", root)
+            .env("RDNY_VIDEO_PROCESS_ROLE", role)
+            .env("RDNY_VIDEO_FRAMES_PATH", frames)
+            .spawn()
+            .unwrap()
+    }
+
     fn wait_ready(root: &Path, roles: &[&str]) {
         while roles
             .iter()
@@ -574,22 +656,23 @@ mod tests {
 
     #[test]
     fn handles_screencast_frame() {
-        let temp = tempfile::tempdir().unwrap();
-        let params = serde_json::json!({
-            "data": "/9j/2Q==",
-            "metadata": {"timestamp": 123.4567894},
-            "sessionId": 7
+        with_state_dir(|_| {
+            state::replace(&sample_state()).unwrap();
+            start().unwrap();
+            let current = state::load().unwrap().unwrap();
+            let frames = state::recording_frames_dir(&current).unwrap();
+            let params = serde_json::json!({
+                "data": "/9j/2Q==",
+                "metadata": {"timestamp": 123.4567894},
+                "sessionId": 7
+            });
+            let ack = handle_screencast_frame(&params, &frames).unwrap();
+            assert_eq!(ack.as_deref(), Some("7"));
+            assert_eq!(
+                std::fs::read(frames.path().join("123.456789.jpg")).unwrap(),
+                vec![0xff, 0xd8, 0xff, 0xd9]
+            );
         });
-        let frames = crate::state::open_store_at(temp.path())
-            .unwrap()
-            .subdir("frames")
-            .unwrap();
-        let ack = handle_screencast_frame(&params, &frames).unwrap();
-        assert_eq!(ack.as_deref(), Some("7"));
-        assert_eq!(
-            std::fs::read(frames.path().join("123.456789.jpg")).unwrap(),
-            vec![0xff, 0xd8, 0xff, 0xd9]
-        );
     }
 
     #[test]
@@ -717,7 +800,7 @@ mod tests {
             .unwrap_or_else(|err| err.into_inner());
         let _env = EnvGuard::new();
         let temp = tempfile::tempdir_in(".").unwrap();
-        unsafe { env::set_var("RDNY_STATE_DIR", temp.path()) };
+        configure_test_state(temp.path(), temp.path());
         state::replace(&sample_state()).unwrap();
         let mut a = spawn_video_helper(temp.path(), "start-a");
         let mut b = spawn_video_helper(temp.path(), "start-b");
@@ -757,14 +840,61 @@ mod tests {
     }
 
     #[test]
-    fn relative_state_dir_survives_changed_cwd_retry() {
+    fn multiprocess_writer_and_assembly_barrier_prevents_stale_frames() {
+        let _lock = state::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env = EnvGuard::new();
+        let temp = tempfile::tempdir_in(".").unwrap();
+        configure_test_state(temp.path(), temp.path());
+        state::replace(&sample_state()).unwrap();
+        start().unwrap();
+        let frames = state::load()
+            .unwrap()
+            .unwrap()
+            .recording_frames_dir
+            .unwrap();
+
+        let mut writer = spawn_video_helper_with_frames(temp.path(), "writer-hold", &frames);
+        wait_ready(temp.path(), &["writer-hold"]);
+        fs::write(temp.path().join("go"), b"go").unwrap();
+        while !temp.path().join("writer-held").exists() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        let mut assembler = spawn_video_helper_with_frames(temp.path(), "assembler-hold", &frames);
+        while !temp.path().join("assembler-state-locked").exists() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let mut late = spawn_video_helper_with_frames(temp.path(), "late-frame", &frames);
+        wait_ready(temp.path(), &["late-frame"]);
+
+        fs::write(temp.path().join("release-writer"), b"go").unwrap();
+        assert!(writer.wait().unwrap().success());
+        while !temp.path().join("assembler-exclusive").exists() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(late.wait().unwrap().success());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("late-ack")).unwrap(),
+            "19"
+        );
+        assert!(!frames.join("2.000000.jpg").exists());
+        assert_eq!(fs::read(frames.join("1.000000.jpg")).unwrap(), b"first");
+
+        fs::write(temp.path().join("release-assembler"), b"go").unwrap();
+        assert!(assembler.wait().unwrap().success());
+    }
+
+    #[test]
+    fn recording_path_survives_changed_cwd_retry() {
         let _lock = state::ENV_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let _env = EnvGuard::new();
         let root = tempfile::tempdir().unwrap();
         env::set_current_dir(root.path()).unwrap();
-        unsafe { env::set_var("RDNY_STATE_DIR", "relative state") };
+        configure_test_state(&root.path().join("state"), root.path());
         state::replace(&sample_state()).unwrap();
         start().unwrap();
         let st = state::load().unwrap().unwrap();
@@ -1006,7 +1136,7 @@ mod tests {
             .unwrap_or_else(|err| err.into_inner());
         let _env = EnvGuard::new();
         let temp = tempfile::tempdir_in(".").unwrap();
-        unsafe { env::set_var("RDNY_STATE_DIR", temp.path()) };
+        configure_test_state(temp.path(), temp.path());
         state::replace(&sample_state()).unwrap();
         start().unwrap();
         let st = state::load().unwrap().unwrap();
@@ -1052,7 +1182,7 @@ mod tests {
             .unwrap_or_else(|err| err.into_inner());
         let _env = EnvGuard::new();
         let temp = tempfile::tempdir_in(".").unwrap();
-        unsafe { env::set_var("RDNY_STATE_DIR", temp.path()) };
+        configure_test_state(temp.path(), temp.path());
         state::replace(&sample_state()).unwrap();
         start().unwrap();
         let a = state::load().unwrap().unwrap();
@@ -1104,7 +1234,7 @@ mod tests {
             .unwrap_or_else(|err| err.into_inner());
         let _env = EnvGuard::new();
         let temp = tempfile::tempdir_in(".").unwrap();
-        unsafe { env::set_var("RDNY_STATE_DIR", temp.path()) };
+        configure_test_state(temp.path(), temp.path());
         state::replace(&sample_state()).unwrap();
 
         start().unwrap();
@@ -1194,7 +1324,7 @@ mod tests {
             .unwrap_or_else(|err| err.into_inner());
         let _env = EnvGuard::new();
         let temp = tempfile::tempdir_in(".").unwrap();
-        unsafe { env::set_var("RDNY_STATE_DIR", temp.path()) };
+        configure_test_state(temp.path(), temp.path());
         state::replace(&sample_state()).unwrap();
         let (id, _) = start_with_frame();
         let mut child = spawn_video_helper(temp.path(), "claim");
@@ -1236,7 +1366,7 @@ mod tests {
             .unwrap_or_else(|err| err.into_inner());
         let _env = EnvGuard::new();
         let temp = tempfile::tempdir_in(".").unwrap();
-        unsafe { env::set_var("RDNY_STATE_DIR", temp.path()) };
+        configure_test_state(temp.path(), temp.path());
         state::replace(&sample_state()).unwrap();
         let (id, _) = start_with_frame();
         let mut child = spawn_video_helper(temp.path(), "claim");
