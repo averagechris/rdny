@@ -110,11 +110,6 @@ fn history_target(current: usize, len: usize, delta: i64) -> Option<usize> {
     }
 }
 
-/// Navigate the current page and wait for the load event.
-pub fn open(sess: &mut PageSession, url: &str) -> Result<()> {
-    open_with_policy(sess, url, &UrlPolicy::default())
-}
-
 pub fn open_with_policy(sess: &mut PageSession, url: &str, policy: &UrlPolicy) -> Result<()> {
     let url = normalize_url(url, policy)?;
     sess.ensure_page_instrumentation()?;
@@ -132,9 +127,12 @@ pub fn open_with_policy(sess: &mut PageSession, url: &str, policy: &UrlPolicy) -
 /// the session timeout. Tolerates the event having already fired by
 /// also polling document.readyState.
 pub fn wait_for_load_event(sess: &mut PageSession) -> Result<()> {
-    let deadline = Instant::now() + sess.timeout;
+    let deadline = sess.deadline();
     loop {
-        while let Some(event) = sess.next_event(Duration::from_millis(200))? {
+        let poll_deadline = crate::session::Deadline::at(
+            (Instant::now() + Duration::from_millis(200)).min(deadline.instant()),
+        );
+        while let Some(event) = sess.next_event_until(poll_deadline)? {
             if event.method == "Page.loadEventFired" {
                 return Ok(());
             }
@@ -143,7 +141,7 @@ pub fn wait_for_load_event(sess: &mut PageSession) -> Result<()> {
         if ready == json!("complete") {
             return Ok(());
         }
-        if Instant::now() >= deadline {
+        if deadline.expired() {
             bail!(
                 "timed out after {:.0?} waiting for the page to load",
                 sess.timeout

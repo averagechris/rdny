@@ -12,7 +12,7 @@ const DEFAULT_QUIET_WINDOW: Duration = Duration::from_millis(500);
 
 /// Wait for a selector to match an element.
 pub fn wait(sess: &mut PageSession, selector: &str) -> Result<()> {
-    let deadline = Instant::now() + sess.timeout;
+    let deadline = sess.deadline();
     let expression = format!(
         "document.querySelector({}) !== null",
         crate::session::js_string(selector)
@@ -21,13 +21,13 @@ pub fn wait(sess: &mut PageSession, selector: &str) -> Result<()> {
         if sess.eval(&expression)? == json!(true) {
             return Ok(());
         }
-        if Instant::now() >= deadline {
+        if deadline.expired() {
             bail!(
                 "timed out after {:.3}s waiting for selector {selector}",
                 sess.timeout.as_secs_f64()
             );
         }
-        std::thread::sleep(Duration::from_millis(100));
+        deadline.sleep(Duration::from_millis(100));
     }
 }
 
@@ -46,7 +46,7 @@ pub fn waitstable(sess: &mut PageSession) -> Result<()> {
 }
 
 pub fn waitstable_quiet(sess: &mut PageSession, quiet_window: Duration) -> Result<()> {
-    let deadline = Deadline::after(sess.timeout);
+    let deadline = sess.deadline();
     install_mutation_clock(sess, deadline)?;
     loop {
         if deadline.expired() {
@@ -71,12 +71,7 @@ pub fn waitstable_quiet(sess: &mut PageSession, quiet_window: Duration) -> Resul
                 sess.timeout.as_secs_f64()
             );
         }
-        std::thread::sleep(
-            deadline
-                .remaining()
-                .unwrap_or_default()
-                .min(Duration::from_millis(50)),
-        );
+        deadline.sleep(Duration::from_millis(50));
     }
 }
 
@@ -110,7 +105,7 @@ pub fn waitidle(sess: &mut PageSession) -> Result<()> {
 }
 
 pub fn waitidle_quiet(sess: &mut PageSession, quiet_window: Duration) -> Result<()> {
-    let deadline = Deadline::after(sess.timeout);
+    let deadline = sess.deadline();
     sess.ensure_page_instrumentation_until(deadline)?;
     sess.call_until("Network.enable", json!({}), deadline)?;
     // Network is also enabled when rdny attaches to the page, so this wait can
@@ -261,11 +256,8 @@ fn apply_network_event(inflight: &mut HashSet<String>, method: &str, request_id:
 }
 
 /// Sleep for a number of seconds (fractions allowed).
-pub fn sleep(seconds: f64) -> Result<()> {
-    if !seconds.is_finite() || seconds < 0.0 {
-        bail!("sleep: seconds must be a non-negative number");
-    }
-    std::thread::sleep(std::time::Duration::from_secs_f64(seconds));
+pub fn sleep(deadline: Deadline) -> Result<()> {
+    deadline.sleep(deadline.remaining().unwrap_or_default());
     Ok(())
 }
 

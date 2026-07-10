@@ -2,11 +2,13 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
+use tungstenite::client::IntoClientRequest;
+use tungstenite::handshake::HandshakeError;
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
@@ -91,7 +93,13 @@ pub struct CdpClient {
 
 impl CdpClient {
     /// Connect to a bounded ws:// debugger URL (browser-level endpoint).
+    #[cfg(test)]
     pub fn connect(ws_url: &str) -> Result<Self> {
+        Self::connect_until(ws_url, Instant::now() + DEFAULT_TIMEOUT)
+    }
+
+    /// Connect TCP and complete the WebSocket handshake before `deadline`.
+    pub fn connect_until(ws_url: &str, deadline: Instant) -> Result<Self> {
         let parsed = url::Url::parse(ws_url).context("malformed browser WebSocket URL")?;
         if parsed.scheme() != "ws" || !url_host_is_loopback(&parsed) {
             bail!(
@@ -101,17 +109,71 @@ impl CdpClient {
         let config = WebSocketConfig::default()
             .max_frame_size(Some(MAX_WEBSOCKET_FRAME_BYTES))
             .max_message_size(Some(MAX_WEBSOCKET_MESSAGE_BYTES));
-        let (socket, _) = tungstenite::client::connect_with_config(ws_url, Some(config), 0)
-            .with_context(|| format!("connecting to browser WebSocket at {ws_url}"))?;
-        match socket.get_ref() {
-            MaybeTlsStream::Plain(_) => Ok(Self {
-                socket,
-                next_id: 1,
-                events: VecDeque::new(),
-                timeout: DEFAULT_TIMEOUT,
-            }),
-            _ => bail!("CDP client supports ws:// only"),
+        let host = parsed
+            .host_str()
+            .context("browser WebSocket URL is missing a host")?;
+        let port = parsed
+            .port_or_known_default()
+            .context("browser WebSocket URL is missing a port")?;
+        let addresses = (host, port)
+            .to_socket_addrs()
+            .with_context(|| format!("resolving browser WebSocket host {host}"))?
+            .collect::<Vec<_>>();
+        if addresses.is_empty() {
+            bail!("browser WebSocket host resolved to no addresses");
         }
+        let mut last_error = None;
+        let mut stream = None;
+        for address in addresses {
+            let remaining = remaining(deadline, "connecting browser WebSocket")?;
+            match TcpStream::connect_timeout(&address, remaining) {
+                Ok(connected) => {
+                    stream = Some(connected);
+                    break;
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        let stream = stream.ok_or_else(|| {
+            anyhow!(last_error.unwrap_or_else(|| io::Error::new(
+                io::ErrorKind::TimedOut,
+                "WebSocket connect deadline elapsed"
+            )))
+        })?;
+        remaining(deadline, "performing browser WebSocket handshake")?;
+        stream.set_nonblocking(true)?;
+        let request = ws_url
+            .into_client_request()
+            .context("building WebSocket request")?;
+        let mut handshake = tungstenite::client::client_with_config(
+            request,
+            MaybeTlsStream::Plain(stream),
+            Some(config),
+        );
+        let (mut socket, _) = loop {
+            match handshake {
+                Ok(connected) => break connected,
+                Err(HandshakeError::Interrupted(mid)) => {
+                    let wait = remaining(deadline, "performing browser WebSocket handshake")?
+                        .min(Duration::from_millis(1));
+                    std::thread::sleep(wait);
+                    handshake = mid.handshake();
+                }
+                Err(HandshakeError::Failure(error)) => {
+                    return Err(error)
+                        .with_context(|| format!("connecting to browser WebSocket at {ws_url}"));
+                }
+            }
+        };
+        if let MaybeTlsStream::Plain(stream) = socket.get_mut() {
+            stream.set_nonblocking(false)?;
+        }
+        Ok(Self {
+            socket,
+            next_id: 1,
+            events: VecDeque::new(),
+            timeout: DEFAULT_TIMEOUT,
+        })
     }
 
     /// Override the per-call response timeout.
@@ -124,6 +186,7 @@ impl CdpClient {
     /// session (flat protocol). CDP error responses become Err with the
     /// method name and remote message. Events received while waiting
     /// are buffered for `next_event`.
+    #[cfg(test)]
     pub fn call(&mut self, session_id: Option<&str>, method: &str, params: Value) -> Result<Value> {
         self.call_until(session_id, method, params, Instant::now() + self.timeout)
     }
@@ -148,9 +211,29 @@ impl CdpClient {
             request["sessionId"] = Value::String(session_id.to_string());
         }
 
-        self.socket
-            .send(Message::Text(request.to_string().into()))
-            .with_context(|| format!("sending CDP command {method}"))?;
+        remaining(deadline, "sending CDP command")?;
+        self.set_nonblocking(true)?;
+        let send_result = self.socket.send(Message::Text(request.to_string().into()));
+        let send_result = match send_result {
+            Ok(()) => Ok(()),
+            Err(tungstenite::Error::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+                loop {
+                    remaining(deadline, "sending CDP command")?;
+                    match self.socket.flush() {
+                        Ok(()) => break Ok(()),
+                        Err(tungstenite::Error::Io(error))
+                            if error.kind() == io::ErrorKind::WouldBlock =>
+                        {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => break Err(error),
+                    }
+                }
+            }
+            Err(error) => Err(error),
+        };
+        self.set_nonblocking(false)?;
+        send_result.with_context(|| format!("sending CDP command {method}"))?;
 
         loop {
             let msg = match self.read_with_deadline(deadline) {
@@ -162,7 +245,7 @@ impl CdpClient {
                     return Err(err).with_context(|| format!("reading response for {method}"));
                 }
             };
-            let Some(value) = self.message_to_json(msg)? else {
+            let Some(value) = self.message_to_json(msg, deadline)? else {
                 continue;
             };
             if value.get("method").is_some() {
@@ -188,11 +271,17 @@ impl CdpClient {
     }
 
     /// Attach to a target with `flatten: true`; returns the sessionId.
+    #[cfg(test)]
     pub fn attach_to_target(&mut self, target_id: &str) -> Result<String> {
-        let result = self.call(
+        self.attach_to_target_until(target_id, Instant::now() + self.timeout)
+    }
+
+    pub fn attach_to_target_until(&mut self, target_id: &str, deadline: Instant) -> Result<String> {
+        let result = self.call_until(
             None,
             "Target.attachToTarget",
             json!({"targetId": target_id, "flatten": true}),
+            deadline,
         )?;
         result
             .get("sessionId")
@@ -226,7 +315,7 @@ impl CdpClient {
                 Err(err) if is_timeout_error(&err) => return Ok(None),
                 Err(err) => return Err(err).context("reading next CDP event"),
             };
-            let Some(value) = self.message_to_json(msg)? else {
+            let Some(value) = self.message_to_json(msg, deadline)? else {
                 continue;
             };
             if value.get("method").is_some() {
@@ -250,6 +339,7 @@ impl CdpClient {
         }
         let remaining = deadline - now;
         self.set_read_timeout(Some(remaining))?;
+        self.set_write_timeout(Some(remaining))?;
         self.socket.read().map_err(Into::into)
     }
 
@@ -260,12 +350,27 @@ impl CdpClient {
         }
     }
 
-    fn message_to_json(&mut self, msg: Message) -> Result<Option<Value>> {
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        match self.socket.get_mut() {
+            MaybeTlsStream::Plain(stream) => stream.set_write_timeout(timeout),
+            _ => Ok(()),
+        }
+    }
+
+    fn set_nonblocking(&mut self, nonblocking: bool) -> io::Result<()> {
+        match self.socket.get_mut() {
+            MaybeTlsStream::Plain(stream) => stream.set_nonblocking(nonblocking),
+            _ => Ok(()),
+        }
+    }
+
+    fn message_to_json(&mut self, msg: Message, deadline: Instant) -> Result<Option<Value>> {
         match msg {
             Message::Text(text) => Ok(Some(
                 serde_json::from_str(&text).context("parsing CDP JSON frame")?,
             )),
             Message::Ping(_) => {
+                self.set_write_timeout(Some(remaining(deadline, "replying to WebSocket ping")?))?;
                 let _ = self.socket.flush();
                 Ok(None)
             }
@@ -273,6 +378,13 @@ impl CdpClient {
             Message::Close(_) => bail!("connection closed by browser"),
         }
     }
+}
+
+fn remaining(deadline: Instant, operation: &str) -> Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .with_context(|| format!("deadline elapsed while {operation}"))
 }
 
 fn event_from_value(value: Value) -> Result<Event> {
@@ -455,6 +567,53 @@ mod tests {
             )
             .unwrap_err();
         assert!(format!("{err}").contains("deadline"));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn websocket_handshake_respects_absolute_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(200));
+        });
+        let started = Instant::now();
+        let result = CdpClient::connect_until(
+            &format!("ws://127.0.0.1:{port}"),
+            started + Duration::from_millis(60),
+        );
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_millis(250));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn nested_calls_share_budget_without_resetting_it() {
+        let (url, handle) = serve(|mut socket| {
+            let first = read_json(&mut socket);
+            thread::sleep(Duration::from_millis(55));
+            socket
+                .send(Message::Text(
+                    format!(r#"{{"id":{},"result":{{}}}}"#, first["id"]).into(),
+                ))
+                .unwrap();
+            let _second = read_json(&mut socket);
+            thread::sleep(Duration::from_millis(55));
+        });
+        let mut client = CdpClient::connect(&url).unwrap();
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(85);
+        client
+            .call_until(None, "First", json!({}), deadline)
+            .unwrap();
+        assert!(
+            client
+                .call_until(None, "Second", json!({}), deadline)
+                .is_err()
+        );
+        assert!(started.elapsed() >= Duration::from_millis(70));
+        assert!(started.elapsed() < Duration::from_millis(250));
         handle.join().unwrap();
     }
 

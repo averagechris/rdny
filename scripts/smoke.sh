@@ -80,7 +80,7 @@ HTML
 expect_contains "status running" "running:" "$("${RDNY[@]}" status)"
 
 # --- navigation + waiting -------------------------------------------
-"${RDNY[@]}" open "file://$page"
+"${RDNY[@]}" open "file://$page" --allow-file-url
 "${RDNY[@]}" wait "#heading"
 "${RDNY[@]}" waitload
 "${RDNY[@]}" waitstable
@@ -123,7 +123,7 @@ echo "smoke: ok: pdf"
 
 # --- video ------------------------------------------------------------
 "${RDNY[@]}" start-video
-"${RDNY[@]}" open "file://$page"
+"${RDNY[@]}" open "file://$page" --allow-file-url
 "${RDNY[@]}" wait "#heading"
 "${RDNY[@]}" click "#btn"
 "${RDNY[@]}" screenshot "$workdir/video-frame.png" >/dev/null
@@ -133,7 +133,7 @@ LC_ALL=C grep -a -q 'ftyp' "$workdir/smoke.mp4" || fail "video is not an MP4"
 echo "smoke: ok: video"
 
 # --- tabs ------------------------------------------------------------
-"${RDNY[@]}" newpage "file://$page" >/dev/null
+"${RDNY[@]}" newpage "file://$page" --allow-file-url >/dev/null
 expect_contains "pages lists two" "1: " "$("${RDNY[@]}" pages)"
 "${RDNY[@]}" page 0 >/dev/null
 expect_contains "pages marker moved" "* 0:" "$("${RDNY[@]}" pages)"

@@ -1,6 +1,6 @@
 //! Console and browser log capture.
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -11,22 +11,17 @@ use crate::session::PageSession;
 /// Enable log domains and print console/log events.
 #[allow(dead_code)]
 pub fn logs(sess: &mut PageSession, follow: bool) -> Result<()> {
-    logs_format(sess, follow, None, false)
+    logs_format(sess, follow, false)
 }
 
-pub fn logs_format(
-    sess: &mut PageSession,
-    follow: bool,
-    duration_secs: Option<f64>,
-    structured: bool,
-) -> Result<()> {
+pub fn logs_format(sess: &mut PageSession, follow: bool, structured: bool) -> Result<()> {
     sess.call("Runtime.enable", json!({}))?;
     sess.call("Log.enable", json!({}))?;
 
     let session_id = sess.session_id().to_string();
     if follow {
         loop {
-            if let Some(event) = sess.next_event(Duration::from_secs(1))?
+            if let Some(event) = sess.next_event_follow(Duration::from_secs(1))?
                 && event.session_id.as_deref() == Some(session_id.as_str())
                 && let Some(line) = event_line_format(&event, structured)
             {
@@ -35,14 +30,9 @@ pub fn logs_format(
         }
     }
 
-    let timeout = duration_secs
-        .map(Duration::from_secs_f64)
-        .unwrap_or(sess.timeout);
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let poll = remaining.min(Duration::from_millis(100));
-        if let Some(event) = sess.next_event(poll)?
+    let deadline = sess.deadline();
+    while !deadline.expired() {
+        if let Some(event) = sess.next_event_until(deadline)?
             && event.session_id.as_deref() == Some(session_id.as_str())
             && let Some(line) = event_line_format(&event, structured)
         {

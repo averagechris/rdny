@@ -185,6 +185,7 @@ mod tests {
             frames_dir: Some(frames),
             instrumentation_registered: true,
             timeout: Duration::from_secs(1),
+            deadline: Deadline::after(Duration::from_secs(1)),
         };
         assert!(session.is_recording());
         assert_eq!(session.eval("'command'").unwrap(), json!("ok"));
@@ -232,6 +233,12 @@ impl Deadline {
     pub fn instant(self) -> Instant {
         self.at
     }
+
+    pub fn sleep(self, maximum: Duration) {
+        if let Some(remaining) = self.remaining() {
+            std::thread::sleep(remaining.min(maximum));
+        }
+    }
 }
 
 /// A live connection to the session's current page target.
@@ -243,23 +250,25 @@ pub struct PageSession {
     instrumentation_registered: bool,
     /// Overall budget for waiting-style commands (from --timeout).
     pub timeout: Duration,
+    deadline: Deadline,
 }
 
 /// Load the session state, connect, and attach to the current page.
 /// If the recorded target is gone, falls back to the first open page
 /// (and persists the switch).
-pub fn connect(timeout_secs: f64) -> Result<PageSession> {
+pub fn connect(deadline: Deadline, timeout: Duration) -> Result<PageSession> {
     let state = state::require()?;
-    let targets = http::list_targets(&state.host, state.port).map_err(|_| {
-        hint_error(
-            format!(
-                "cannot reach the browser for this session at {}:{}",
-                state.host, state.port
-            ),
-            "run `rdny status`; if it reports stale, run `rdny stop` then `rdny start`",
-            None,
-        )
-    })?;
+    let targets =
+        http::list_targets_until(&state.host, state.port, deadline.instant()).map_err(|_| {
+            hint_error(
+                format!(
+                    "cannot reach the browser for this session at {}:{}",
+                    state.host, state.port
+                ),
+                "run `rdny status`; if it reports stale, run `rdny stop` then `rdny start`",
+                None,
+            )
+        })?;
     let pages: Vec<_> = targets.iter().filter(|t| t.target_type == "page").collect();
     let target = state
         .target_id
@@ -280,28 +289,34 @@ pub fn connect(timeout_secs: f64) -> Result<PageSession> {
             Ok(())
         })?;
     }
-    let timeout = Duration::from_secs_f64(timeout_secs.max(0.001));
-    let mut client = CdpClient::connect(&state.ws_url)
+    let mut client = CdpClient::connect_until(&state.ws_url, deadline.instant())
         .with_context(|| format!("connecting to browser websocket {}", state.ws_url))?;
-    client.set_timeout(timeout.max(Duration::from_secs(5)));
-    let session_id = client.attach_to_target(&target_id)?;
+    client.set_timeout(timeout);
+    let session_id = client.attach_to_target_until(&target_id, deadline.instant())?;
     // Enable Network once per attached page session so waitidle can observe
     // requests that began before the wait command but after rdny attached.
-    let _ = client.call(Some(&session_id), "Network.enable", json!({}));
+    let _ = client.call_until(
+        Some(&session_id),
+        "Network.enable",
+        json!({}),
+        deadline.instant(),
+    );
     if let Some(viewport) = &state.viewport {
-        client.call(
+        client.call_until(
             Some(&session_id),
             "Emulation.setDeviceMetricsOverride",
             viewport.cdp_params(),
+            deadline.instant(),
         )?;
     }
     let frames_dir = if state.recording {
         let frames_dir = state::recording_frames_dir(&state)?;
         frames_dir.validate_external_path()?;
-        client.call(
+        client.call_until(
             Some(&session_id),
             "Page.startScreencast",
             json!({"format": "jpeg", "quality": 70, "everyNthFrame": 1}),
+            deadline.instant(),
         )?;
         Some(frames_dir)
     } else {
@@ -314,8 +329,9 @@ pub fn connect(timeout_secs: f64) -> Result<PageSession> {
         frames_dir,
         instrumentation_registered: false,
         timeout,
+        deadline,
     };
-    session.ensure_page_instrumentation()?;
+    session.ensure_page_instrumentation_until(deadline)?;
     Ok(session)
 }
 
@@ -343,7 +359,7 @@ impl PageSession {
 
     /// Send a CDP command to the page session.
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value> {
-        self.client.call(Some(&self.session_id), method, params)
+        self.call_until(method, params, self.deadline)
     }
 
     /// Send a CDP command to the page session within an absolute deadline.
@@ -427,8 +443,8 @@ impl PageSession {
         })
     }
 
-    /// Pull the next buffered/incoming CDP event.
-    pub fn next_event(&mut self, timeout: Duration) -> Result<Option<Event>> {
+    /// Poll the explicitly unbounded `logs --follow` stream after bounded setup.
+    pub fn next_event_follow(&mut self, timeout: Duration) -> Result<Option<Event>> {
         self.next_event_until(Deadline::after(timeout))
     }
 
@@ -469,7 +485,7 @@ impl PageSession {
 
     /// Drain buffered and briefly-arriving events, capturing screencast frames.
     pub fn drain_events(&mut self, max_wait: Duration) -> Result<()> {
-        let deadline = Instant::now() + max_wait;
+        let deadline = (Instant::now() + max_wait).min(self.deadline.instant());
         loop {
             let now = Instant::now();
             if now >= deadline {
@@ -481,12 +497,8 @@ impl PageSession {
             else {
                 return Ok(());
             };
-            let _ = self.process_recording_event(&event)?;
+            let _ = self.process_recording_event_until(&event, Deadline::at(deadline))?;
         }
-    }
-
-    fn process_recording_event(&mut self, event: &Event) -> Result<bool> {
-        self.process_recording_event_until(event, Deadline::after(self.timeout))
     }
 
     fn process_recording_event_until(&mut self, event: &Event, deadline: Deadline) -> Result<bool> {
@@ -528,6 +540,10 @@ impl PageSession {
         )?;
         check_exception(&result, "js exception")?;
         Ok(result["result"]["value"].clone())
+    }
+
+    pub fn deadline(&self) -> Deadline {
+        self.deadline
     }
 
     /// Evaluate JavaScript within an absolute deadline.

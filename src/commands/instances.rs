@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use crate::browser;
 use crate::cdp::http;
 use crate::process_identity::{self, ProcessClass};
+use crate::session::Deadline;
 use crate::state::{self, Generation, Inspection, SessionState};
 
 type CandidateDir = (PathBuf, Option<String>);
@@ -43,7 +44,7 @@ fn classify(
     }
 }
 
-fn probe_liveness(state: &SessionState) -> Liveness {
+fn probe_liveness_until(state: &SessionState, deadline: Deadline) -> Liveness {
     if let Some(id) = &state.process_identity
         && process_identity::validate_persisted(
             state.pid,
@@ -55,7 +56,7 @@ fn probe_liveness(state: &SessionState) -> Liveness {
     {
         return Liveness::Unrelated;
     }
-    let reachable = http::version(&state.host, state.port).is_ok();
+    let reachable = http::version_until(&state.host, state.port, deadline.instant()).is_ok();
     match process_identity::classify(state.pid, state.process_identity.as_ref(), reachable) {
         ProcessClass::ManagedMatching => Liveness::Alive,
         ProcessClass::ManagedDead | ProcessClass::AttachedDead => Liveness::Dead,
@@ -96,13 +97,17 @@ pub fn list() -> Result<()> {
 }
 
 pub fn list_format(structured: bool) -> Result<()> {
+    list_format_until(structured, Deadline::after(http::HTTP_TIMEOUT))
+}
+
+pub fn list_format_until(structured: bool, deadline: Deadline) -> Result<()> {
     let discovery = discover()?;
     for diagnostic in &discovery.diagnostics {
         eprintln!("warning: {diagnostic}");
     }
     let mut rows = Vec::new();
     for instance in discovery.instances {
-        let liveness = probe_liveness(&instance.state);
+        let liveness = probe_liveness_until(&instance.state, deadline);
         if structured {
             rows.push(serde_json::json!({"dir":instance.dir,"pid":instance.state.pid,"liveness":format!("{:?}", liveness).to_lowercase(),"label":instance.state.label,"instance":instance.state.instance_id,"target":instance.state.target_id,"host":instance.state.host,"port":instance.state.port}));
         } else {
@@ -128,7 +133,7 @@ pub fn list_format(structured: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn cleanup(all: bool) -> Result<()> {
+pub fn cleanup_until(all: bool, deadline: Deadline) -> Result<()> {
     let discovery = discover()?;
     for diagnostic in &discovery.diagnostics {
         eprintln!("warning: {diagnostic}");
@@ -146,7 +151,12 @@ pub fn cleanup(all: bool) -> Result<()> {
             .with_context(|| format!("locking lifecycle in {}", dir.display()))?;
         state::prune_stale_registry_locked(&lifecycle, instance_id)?;
     }
-    let cleaned = cleanup_instances(discovery.instances, all, probe_liveness)?;
+    let cleaned = cleanup_instances_with_deadline(
+        discovery.instances,
+        all,
+        |state| probe_liveness_until(state, deadline),
+        Some(deadline),
+    )?;
     for instance in cleaned {
         println!(
             "cleaned: {} (pid={} label={})",
@@ -319,12 +329,22 @@ fn display_label(label: Option<&str>) -> String {
     label.unwrap_or("-").to_string()
 }
 
+#[cfg(test)]
 pub fn cleanup_instances(
     instances: Vec<Instance>,
     all: bool,
     liveness: impl Fn(&SessionState) -> Liveness,
 ) -> Result<Vec<Instance>> {
-    cleanup_instances_with_hook(instances, all, liveness, |_| {})
+    cleanup_instances_with_deadline(instances, all, liveness, None)
+}
+
+fn cleanup_instances_with_deadline(
+    instances: Vec<Instance>,
+    all: bool,
+    liveness: impl Fn(&SessionState) -> Liveness,
+    deadline: Option<Deadline>,
+) -> Result<Vec<Instance>> {
+    cleanup_instances_with_hook(instances, all, liveness, |_| {}, deadline)
 }
 
 fn cleanup_instances_with_hook(
@@ -332,6 +352,7 @@ fn cleanup_instances_with_hook(
     all: bool,
     liveness: impl Fn(&SessionState) -> Liveness,
     before_locked_action: impl Fn(&Instance),
+    deadline: Option<Deadline>,
 ) -> Result<Vec<Instance>> {
     let mut cleaned = Vec::new();
     for instance in instances {
@@ -364,8 +385,11 @@ fn cleanup_instances_with_hook(
         // Attached sessions are only detached. Managed live sessions selected
         // by --all are stopped while lifecycle ownership remains exclusive.
         if latest_liveness == Liveness::Alive {
-            browser::stop(&latest)
-                .with_context(|| format!("stopping instance in {}", instance.dir.display()))?;
+            match deadline {
+                Some(deadline) => browser::stop_until(&latest, deadline),
+                None => browser::stop(&latest),
+            }
+            .with_context(|| format!("stopping instance in {}", instance.dir.display()))?;
         }
         let removed = state::clear_observed_lifecycle(
             &_lifecycle,
@@ -606,6 +630,7 @@ mod tests {
                         paused.wait();
                         resume.wait();
                     },
+                    None,
                 )
                 .unwrap()
             })
@@ -660,6 +685,7 @@ mod tests {
                 )
                 .unwrap();
             },
+            None,
         )
         .unwrap();
         assert!(cleaned.is_empty());

@@ -116,14 +116,39 @@ fn validate_profile_arg(argv: &[OsString], profile: Option<&Path>) -> Result<()>
     Ok(())
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 pub fn terminate(id: &ProcessIdentity) -> Result<()> {
     terminate_with(id, &RealOps, Duration::from_secs(5), Duration::from_secs(2))
+}
+
+pub fn terminate_until(id: &ProcessIdentity, deadline: Instant) -> Result<()> {
+    signal_checked_with(id, libc::SIGTERM, &RealOps)?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if wait_dead_with(id, remaining / 2, &RealOps)? {
+        return Ok(());
+    }
+    if Instant::now() >= deadline {
+        bail!("deadline elapsed while terminating process {}", id.pid);
+    }
+    signal_checked_with(id, libc::SIGKILL, &RealOps)?;
+    if wait_dead_with(
+        id,
+        deadline.saturating_duration_since(Instant::now()),
+        &RealOps,
+    )? {
+        Ok(())
+    } else {
+        bail!("process {} survived SIGKILL before deadline", id.pid)
+    }
 }
 
 pub fn wait_for_exit(id: &ProcessIdentity, timeout: Duration) -> Result<bool> {
     wait_dead_with(id, timeout, &RealOps)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn terminate_with(
     id: &ProcessIdentity,
     ops: &impl ProcessOps,
@@ -149,7 +174,11 @@ fn wait_dead_with(id: &ProcessIdentity, timeout: Duration, ops: &impl ProcessOps
         if !matches_identity_with(id.pid, id, ops)? {
             return Ok(true);
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(100)),
+        );
     }
     Ok(false)
 }

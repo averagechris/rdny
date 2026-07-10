@@ -70,11 +70,18 @@ fn request_until(
     }
     let addr = authority(host, port);
     let mut stream = connect_until(host, port, deadline)?;
-    stream.set_write_timeout(Some(remaining(deadline, "writing request")?))?;
-    write!(
-        stream,
+    let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
-    )?;
+    );
+    let mut unwritten = request.as_bytes();
+    while !unwritten.is_empty() {
+        stream.set_write_timeout(Some(remaining(deadline, "writing request")?))?;
+        let written = stream.write(unwritten).context("writing HTTP request")?;
+        if written == 0 {
+            bail!("connection to {addr} closed while writing request");
+        }
+        unwritten = &unwritten[written..];
+    }
 
     let mut raw = Vec::new();
     let mut buf = [0u8; 8192];
@@ -303,12 +310,9 @@ pub fn put_json_until(host: &str, port: u16, path: &str, deadline: Instant) -> R
     request_until(host, port, "PUT", path, deadline)
 }
 
+#[cfg(test)]
 pub fn get_json(host: &str, port: u16, path: &str) -> Result<Value> {
     get_json_until(host, port, path, Instant::now() + HTTP_TIMEOUT)
-}
-
-pub fn put_json(host: &str, port: u16, path: &str) -> Result<Value> {
-    put_json_until(host, port, path, Instant::now() + HTTP_TIMEOUT)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -317,10 +321,6 @@ pub struct VersionInfo {
     pub browser: String,
     #[serde(rename = "webSocketDebuggerUrl")]
     pub ws_url: String,
-}
-
-pub fn version(host: &str, port: u16) -> Result<VersionInfo> {
-    version_until(host, port, Instant::now() + HTTP_TIMEOUT)
 }
 
 pub fn version_until(host: &str, port: u16, deadline: Instant) -> Result<VersionInfo> {
@@ -339,11 +339,22 @@ pub struct TargetInfo {
     pub url: String,
 }
 
-pub fn list_targets(host: &str, port: u16) -> Result<Vec<TargetInfo>> {
-    serde_json::from_value(get_json(host, port, "/json/list")?).context("parsing /json/list")
+pub fn list_targets_until(host: &str, port: u16, deadline: Instant) -> Result<Vec<TargetInfo>> {
+    serde_json::from_value(get_json_until(host, port, "/json/list", deadline)?)
+        .context("parsing /json/list")
 }
 
+#[cfg(test)]
 pub fn new_tab(host: &str, port: u16, url: Option<&str>) -> Result<TargetInfo> {
+    new_tab_until(host, port, url, Instant::now() + HTTP_TIMEOUT)
+}
+
+pub fn new_tab_until(
+    host: &str,
+    port: u16,
+    url: Option<&str>,
+    deadline: Instant,
+) -> Result<TargetInfo> {
     let path = match url {
         Some(url) => {
             if url.bytes().any(|byte| byte.is_ascii_control()) {
@@ -357,7 +368,8 @@ pub fn new_tab(host: &str, port: u16, url: Option<&str>) -> Result<TargetInfo> {
         }
         None => "/json/new".to_string(),
     };
-    serde_json::from_value(put_json(host, port, &path)?).context("parsing /json/new")
+    serde_json::from_value(put_json_until(host, port, &path, deadline)?)
+        .context("parsing /json/new")
 }
 
 fn validate_percent_escapes(value: &str) -> Result<()> {
@@ -453,8 +465,19 @@ mod tests {
                 thread::sleep(Duration::from_millis(15));
             }
         });
-        let deadline = Instant::now() + Duration::from_millis(80);
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(80);
         assert!(get_json_until("127.0.0.1", port, "/", deadline).is_err());
+        assert!(started.elapsed() >= Duration::from_millis(60));
+        assert!(started.elapsed() < Duration::from_millis(300));
+    }
+
+    #[test]
+    fn unroutable_connect_respects_deadline_tolerance() {
+        let started = Instant::now();
+        let result = get_json_until("192.0.2.1", 9, "/", started + Duration::from_millis(80));
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_millis(350));
     }
 
     #[test]

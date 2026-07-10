@@ -5,6 +5,8 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
+use std::str::FromStr;
+use std::time::Duration;
 
 use crate::browser::{self, BrowserStatus, LaunchOpts};
 use crate::{commands, config, session};
@@ -18,8 +20,8 @@ use crate::{commands, config, session};
 )]
 pub struct Cli {
     /// Seconds to wait for slow operations before giving up.
-    #[arg(long, global = true, default_value_t = 30.0)]
-    pub timeout: f64,
+    #[arg(long, global = true, default_value_t = BoundedDuration::default())]
+    pub timeout: BoundedDuration,
 
     /// State directory to use, equivalent to RDNY_STATE_DIR and taking precedence over it.
     #[arg(long, global = true)]
@@ -31,6 +33,57 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// A user-supplied duration which is safe to convert to `Duration`.
+///
+/// One day is intentionally generous for interactive automation while still
+/// preventing accidental effectively-unbounded commands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BoundedDuration(Duration);
+
+impl BoundedDuration {
+    pub const MIN: Duration = Duration::from_millis(1);
+    pub const MAX: Duration = Duration::from_secs(24 * 60 * 60);
+
+    pub fn get(self) -> Duration {
+        self.0
+    }
+}
+
+impl Default for BoundedDuration {
+    fn default() -> Self {
+        Self(Duration::from_secs(30))
+    }
+}
+
+impl std::fmt::Display for BoundedDuration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0.as_secs_f64())
+    }
+}
+
+impl FromStr for BoundedDuration {
+    type Err = String;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        let seconds: f64 = raw
+            .parse()
+            .map_err(|_| "duration must be a number of seconds".to_string())?;
+        if !seconds.is_finite() || seconds < Self::MIN.as_secs_f64() {
+            return Err(format!(
+                "duration must be finite and at least {} seconds",
+                Self::MIN.as_secs_f64()
+            ));
+        }
+        if seconds > Self::MAX.as_secs_f64() {
+            return Err(format!(
+                "duration must not exceed {} seconds",
+                Self::MAX.as_secs()
+            ));
+        }
+        Ok(Self(Duration::from_secs_f64(seconds)))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -156,7 +209,7 @@ pub enum Command {
     /// Wait for browser idleness.
     Waitidle(WaitQuietArgs),
     /// Sleep for a number of seconds.
-    Sleep { seconds: f64 },
+    Sleep { seconds: BoundedDuration },
     /// Capture a screenshot.
     Screenshot(ScreenshotArgs),
     /// Capture an element screenshot.
@@ -274,19 +327,19 @@ pub struct LogsArgs {
     pub follow: bool,
     /// Capture duration in seconds when not following (default: global --timeout).
     #[arg(long)]
-    pub duration: Option<f64>,
+    pub duration: Option<BoundedDuration>,
 }
 
 #[derive(Debug, Parser)]
 pub struct ViewportArgs {
     /// Viewport width.
-    #[arg(conflicts_with = "reset", requires = "height")]
+    #[arg(conflicts_with = "reset", requires = "height", value_parser = parse_dimension)]
     pub width: Option<u32>,
     /// Viewport height.
-    #[arg(conflicts_with = "reset", requires = "width")]
+    #[arg(conflicts_with = "reset", requires = "width", value_parser = parse_dimension)]
     pub height: Option<u32>,
     /// Device scale factor.
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = 1.0, value_parser = parse_scale)]
     pub scale: f64,
     /// Enable mobile emulation.
     #[arg(long)]
@@ -395,16 +448,44 @@ pub struct CookieDeleteArgs {
 #[derive(Debug, Parser)]
 pub struct ScreenshotArgs {
     /// Screenshot width.
-    #[arg(short = 'w')]
+    #[arg(short = 'w', value_parser = parse_dimension)]
     pub width: Option<u32>,
     /// Screenshot height. Short -H replaces legacy -h so -h shows help.
-    #[arg(short = 'H', long, alias = "legacy-height")]
+    #[arg(short = 'H', long, alias = "legacy-height", value_parser = parse_dimension)]
     pub height: Option<u32>,
     /// Replace an existing output file.
     #[arg(long)]
     pub force: bool,
     /// Output file.
     pub file: Option<PathBuf>,
+}
+
+const MAX_DIMENSION: u32 = 16_384;
+const MIN_SCALE: f64 = 0.1;
+const MAX_SCALE: f64 = 10.0;
+
+fn parse_dimension(raw: &str) -> std::result::Result<u32, String> {
+    let value: u32 = raw
+        .parse()
+        .map_err(|_| "dimension must be a positive integer".to_string())?;
+    if (1..=MAX_DIMENSION).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!("dimension must be between 1 and {MAX_DIMENSION}"))
+    }
+}
+
+fn parse_scale(raw: &str) -> std::result::Result<f64, String> {
+    let value: f64 = raw
+        .parse()
+        .map_err(|_| "scale must be a number".to_string())?;
+    if value.is_finite() && (MIN_SCALE..=MAX_SCALE).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "scale must be finite and between {MIN_SCALE} and {MAX_SCALE}"
+        ))
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -419,6 +500,13 @@ pub struct ArtifactArgs {
 /// Parse argv and execute the selected command.
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
+    let timeout = cli.timeout.get();
+    let command_budget = match &cli.command {
+        Command::Logs(args) if !args.follow => args.duration.unwrap_or(cli.timeout).get(),
+        Command::Sleep { seconds } => seconds.get(),
+        _ => timeout,
+    };
+    let deadline = session::Deadline::after(command_budget);
     if let Some(state_dir) = &cli.state_dir {
         // SAFETY: rdny is still single-threaded here, before any command dispatch or
         // background work, so mutating the process environment cannot race other threads.
@@ -431,7 +519,7 @@ pub fn run() -> Result<()> {
     macro_rules! sess {
         () => {{
             if page_session.is_none() {
-                page_session = Some(session::connect(cli.timeout)?);
+                page_session = Some(session::connect(deadline, timeout)?);
                 drain_after_dispatch = page_session
                     .as_ref()
                     .is_some_and(session::PageSession::is_recording);
@@ -442,14 +530,15 @@ pub fn run() -> Result<()> {
     match cli.command {
         Command::Start(args) => {
             let _lifecycle = crate::state::lifecycle_lock()?;
-            refuse_occupied_lifecycle(&_lifecycle, "start")?;
+            refuse_occupied_lifecycle(&_lifecycle, "start", deadline)?;
             let opts = LaunchOpts {
                 show: args.show,
                 insecure: args.insecure,
                 extra_args: vec![],
                 label: args.label,
             };
-            let mut launched = browser::launch_armed(&opts, crate::state::browser_storage()?)?;
+            let mut launched =
+                browser::launch_armed_until(&opts, crate::state::browser_storage()?, deadline)?;
             if let Err(err) = crate::state::replace_lifecycle(&_lifecycle, &launched.state) {
                 return Err(err.context("publishing launched browser ownership; child was terminated and previous state preserved"));
             }
@@ -471,10 +560,10 @@ pub fn run() -> Result<()> {
             allow_remote,
         } => {
             let _lifecycle = crate::state::lifecycle_lock()?;
-            refuse_occupied_lifecycle(&_lifecycle, "connect")?;
+            refuse_occupied_lifecycle(&_lifecycle, "connect", deadline)?;
             let config = config::load()?;
             let (host, port) = resolve_connect_target(address.as_deref(), &config)?;
-            let state = browser::connect_with_policy(&host, port, allow_remote)?;
+            let state = browser::connect_with_policy_until(&host, port, allow_remote, deadline)?;
             crate::state::replace_lifecycle(&_lifecycle, &state)
                 .context("publishing attached browser ownership; previous state preserved")?;
             println!("connected to {host}:{port}");
@@ -495,7 +584,7 @@ pub fn run() -> Result<()> {
                 ),
             };
             let observed_id = state.instance_id.clone();
-            let outcome = browser::stop(&state)?;
+            let outcome = browser::stop_until(&state, deadline)?;
             if !crate::state::clear_observed_lifecycle(
                 &_lifecycle,
                 observed_id.as_deref(),
@@ -521,7 +610,7 @@ pub fn run() -> Result<()> {
                     std::process::exit(1);
                 }
             }
-            Some(state) => match browser::status(&state)? {
+            Some(state) => match browser::status_until(&state, deadline)? {
                 BrowserStatus::Running { browser } => {
                     let pid = state
                         .pid
@@ -553,12 +642,14 @@ pub fn run() -> Result<()> {
                 }
             },
         },
-        Command::List => commands::instances::list_format(cli.format != OutputFormat::Human)?,
+        Command::List => {
+            commands::instances::list_format_until(cli.format != OutputFormat::Human, deadline)?
+        }
         Command::Completion { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "rdny", &mut std::io::stdout());
         }
-        Command::Cleanup(args) => commands::instances::cleanup(args.all)?,
+        Command::Cleanup(args) => commands::instances::cleanup_until(args.all, deadline)?,
         Command::Open { url, policy } => {
             commands::nav::open_with_policy(sess!(), &url, &(&policy).into())?
         }
@@ -608,12 +699,9 @@ pub fn run() -> Result<()> {
             let expression = resolve_js_expression(expression, stdin, stdin_is_tty)?;
             commands::interact::js(sess!(), &expression)?
         }
-        Command::Logs(args) => commands::logs::logs_format(
-            sess!(),
-            args.follow,
-            args.duration,
-            cli.format != OutputFormat::Human,
-        )?,
+        Command::Logs(args) => {
+            commands::logs::logs_format(sess!(), args.follow, cli.format != OutputFormat::Human)?
+        }
         Command::Viewport(args) => commands::viewport::viewport_format(
             sess!(),
             args.width,
@@ -670,7 +758,7 @@ pub fn run() -> Result<()> {
                 )?
             }
         }
-        Command::Sleep { seconds } => commands::wait::sleep(seconds)?,
+        Command::Sleep { .. } => commands::wait::sleep(deadline)?,
         Command::Screenshot(args) => {
             let state = crate::state::require()?;
             commands::shot::screenshot(
@@ -687,16 +775,21 @@ pub fn run() -> Result<()> {
             force,
             file,
         } => commands::shot::screenshot_el(sess!(), &selector, file.as_deref(), force)?,
-        Command::Pages => commands::tabs::pages_format(cli.format != OutputFormat::Human)?,
-        Command::Page { index } => commands::tabs::page(index)?,
-        Command::Newpage { url, policy } => {
-            commands::tabs::newpage_with_policy(url.as_deref(), cli.timeout, &(&policy).into())?
+        Command::Pages => {
+            commands::tabs::pages_format_until(cli.format != OutputFormat::Human, deadline)?
         }
+        Command::Page { index } => commands::tabs::page_until(index, deadline)?,
+        Command::Newpage { url, policy } => commands::tabs::newpage_with_policy(
+            url.as_deref(),
+            timeout,
+            deadline,
+            &(&policy).into(),
+        )?,
         Command::StartVideo => commands::video::start()?,
         Command::StopVideo(args) => {
             // Assemble even when the browser is gone: frames on disk
             // should never be stranded behind a dead session.
-            let mut live = session::connect(cli.timeout).ok();
+            let mut live = session::connect(deadline, timeout).ok();
             commands::video::stop(live.as_mut(), args.file.as_deref(), args.force)?
         }
     }
@@ -706,7 +799,11 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn refuse_occupied_lifecycle(lock: &crate::state::LifecycleLock, action: &str) -> Result<()> {
+fn refuse_occupied_lifecycle(
+    lock: &crate::state::LifecycleLock,
+    action: &str,
+    deadline: session::Deadline,
+) -> Result<()> {
     match crate::state::inspect_for_lifecycle(lock)? {
         crate::state::Inspection::Missing => Ok(()),
         crate::state::Inspection::Malformed(m) => anyhow::bail!(
@@ -728,7 +825,9 @@ fn refuse_occupied_lifecycle(lock: &crate::state::LifecycleLock, action: &str) -
                     format!("refusing to {action}: existing managed state identity is inconsistent")
                 })?;
             }
-            let reachable = crate::cdp::http::version(&state.host, state.port).is_ok();
+            let reachable =
+                crate::cdp::http::version_until(&state.host, state.port, deadline.instant())
+                    .is_ok();
             match crate::process_identity::classify(
                 state.pid,
                 state.process_identity.as_ref(),
@@ -978,6 +1077,48 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unsafe_duration_values_during_clap_parsing() {
+        for value in [
+            "NaN", "inf", "-inf", "0", "-1", "0.0001", "86400.1", "1e300",
+        ] {
+            let error =
+                Cli::try_parse_from(["rdny", "--timeout", value, "status"]).expect_err(value);
+            assert_eq!(error.exit_code(), 2, "{value}");
+        }
+        assert_eq!(
+            Cli::try_parse_from(["rdny", "--timeout", "0.001", "status"])
+                .unwrap()
+                .timeout
+                .get(),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            Cli::try_parse_from(["rdny", "--timeout", "86400", "status"])
+                .unwrap()
+                .timeout
+                .get(),
+            BoundedDuration::MAX
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_explicit_durations_dimensions_and_scales() {
+        for value in ["NaN", "inf", "0", "-1", "86401"] {
+            assert!(Cli::try_parse_from(["rdny", "logs", "--duration", value]).is_err());
+            assert!(Cli::try_parse_from(["rdny", "sleep", value]).is_err());
+        }
+        for value in ["0", "16385"] {
+            assert!(Cli::try_parse_from(["rdny", "viewport", value, "100"]).is_err());
+            assert!(Cli::try_parse_from(["rdny", "screenshot", "--width", value]).is_err());
+        }
+        for value in ["NaN", "inf", "0", "0.01", "-1", "10.1"] {
+            assert!(
+                Cli::try_parse_from(["rdny", "viewport", "100", "100", "--scale", value]).is_err()
+            );
+        }
+    }
+
+    #[test]
     fn parses_required_commands() {
         assert!(matches!(
             parse(&["rdny", "connect"]),
@@ -990,7 +1131,7 @@ mod tests {
             matches!(parse(&["rdny", "connect", "127.0.0.1:9222"]), Command::Connect { address: Some(address), .. } if address == "127.0.0.1:9222")
         );
         assert!(
-            matches!(parse(&["rdny", "sleep", "1.5"]), Command::Sleep { seconds } if seconds == 1.5)
+            matches!(parse(&["rdny", "sleep", "1.5"]), Command::Sleep { seconds } if seconds.get() == Duration::from_secs_f64(1.5))
         );
         assert!(
             matches!(parse(&["rdny", "attr", "a", "href"]), Command::Attr { selector, name } if selector == "a" && name == "href")

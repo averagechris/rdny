@@ -4,8 +4,7 @@ use std::ffi::OsStr;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::json;
@@ -15,6 +14,7 @@ use crate::cdp::http;
 use crate::config;
 use crate::hint::hint_error;
 use crate::process_identity::{self, ProcessClass};
+use crate::session::Deadline;
 use crate::state::{BrowserStorage, SessionState};
 
 const DEVTOOLS_TIMEOUT: Duration = Duration::from_secs(15);
@@ -61,7 +61,7 @@ pub fn discover() -> Result<PathBuf> {
 /// intentionally deferred to #130/#131.
 #[allow(dead_code)]
 pub fn launch(opts: &LaunchOpts, storage: BrowserStorage) -> Result<SessionState> {
-    let mut launched = launch_armed(opts, storage)?;
+    let mut launched = launch_armed_until(opts, storage, Deadline::after(DEVTOOLS_TIMEOUT))?;
     launched.commit();
     Ok(launched.state)
 }
@@ -77,7 +77,11 @@ impl LaunchedBrowser {
     }
 }
 
-pub(crate) fn launch_armed(opts: &LaunchOpts, storage: BrowserStorage) -> Result<LaunchedBrowser> {
+pub(crate) fn launch_armed_until(
+    opts: &LaunchOpts,
+    storage: BrowserStorage,
+    deadline: Deadline,
+) -> Result<LaunchedBrowser> {
     let binary = discover()?;
     let profile_dir = storage.profile.path().to_path_buf();
     let data_root = profile_dir.parent().context("profile has no state root")?;
@@ -102,16 +106,16 @@ pub(crate) fn launch_armed(opts: &LaunchOpts, storage: BrowserStorage) -> Result
         .with_context(|| format!("launching {}", binary.display()))?;
     let launch_guard = ChildLaunchGuard::armed(child);
 
-    let port = match wait_for_devtools_port(&storage.profile) {
+    let port = match wait_for_devtools_port(&storage.profile, deadline) {
         Ok(port) => port,
         Err(_) => return Err(launch_probe_error(data_root)),
     };
-    let version = match wait_for_version("127.0.0.1", port) {
+    let version = match wait_for_version("127.0.0.1", port, deadline) {
         Ok(version) => version,
         Err(_) => return Err(launch_probe_error(data_root)),
     };
     crate::cdp::client::validate_debugger_url(&version.ws_url, "127.0.0.1", port)?;
-    let target_id = first_page_target("127.0.0.1", port);
+    let target_id = first_page_target("127.0.0.1", port, deadline)?;
 
     let child_id = launch_guard.id();
     let process_identity = Some(
@@ -147,7 +151,22 @@ pub(crate) fn launch_armed(opts: &LaunchOpts, storage: BrowserStorage) -> Result
 /// it has no authenticated HTTP discovery transport. `allow_remote` exists as
 /// a deadline-ready policy hook and produces guidance instead of silently
 /// downgrading security.
+#[cfg(test)]
 pub fn connect_with_policy(host: &str, port: u16, allow_remote: bool) -> Result<SessionState> {
+    connect_with_policy_until(
+        host,
+        port,
+        allow_remote,
+        Deadline::after(http::HTTP_TIMEOUT),
+    )
+}
+
+pub fn connect_with_policy_until(
+    host: &str,
+    port: u16,
+    allow_remote: bool,
+    deadline: Deadline,
+) -> Result<SessionState> {
     // Do not bless arbitrary DNS names merely because one lookup returned a
     // loopback address: the HTTP and WebSocket lookups could be rebound.
     let loopback = host.eq_ignore_ascii_case("localhost")
@@ -163,7 +182,7 @@ pub fn connect_with_policy(host: &str, port: u16, allow_remote: bool) -> Result<
             "refusing Chrome DevTools endpoint {host}:{port}: {opt_in}; create a verified SSH tunnel (for example `ssh -N -L 9222:127.0.0.1:{port} HOST`) and connect to 127.0.0.1:9222"
         );
     }
-    let version = http::version(host, port).map_err(|_| {
+    let version = http::version_until(host, port, deadline.instant()).map_err(|_| {
         let relaunch = relaunch_example(discover().ok().as_deref(), port, cfg!(target_os = "macos"));
         hint_error(
             format!("could not reach Chrome DevTools at {host}:{port} (the debug port only exists when the browser was launched with it)"),
@@ -181,7 +200,7 @@ pub fn connect_with_policy(host: &str, port: u16, allow_remote: bool) -> Result<
         process_identity: None,
         user_data_dir: None,
         browser_path: None,
-        target_id: first_page_target(host, port),
+        target_id: first_page_target(host, port, deadline)?,
         label: None,
         viewport: None,
         recording: false,
@@ -207,6 +226,10 @@ pub enum StopOutcome {
 /// Attached sessions (no pid) are never killed: the caller should
 /// clear the session state, leaving the browser running.
 pub fn stop(state: &SessionState) -> Result<StopOutcome> {
+    stop_until(state, Deadline::after(Duration::from_secs(7)))
+}
+
+pub fn stop_until(state: &SessionState, deadline: Deadline) -> Result<StopOutcome> {
     if let Some(id) = &state.process_identity {
         process_identity::validate_persisted(
             state.pid,
@@ -220,15 +243,18 @@ pub fn stop(state: &SessionState) -> Result<StopOutcome> {
         ProcessClass::ManagedDead => Ok(StopOutcome::Stopped),
         ProcessClass::ManagedMatching => {
             let identity = state.process_identity.as_ref().expect("classified managed");
-            let close_result = close_browser(&state.ws_url);
-            if process_identity::wait_for_exit(identity, Duration::from_secs(5))? {
+            let close_result = close_browser(&state.ws_url, deadline);
+            let graceful_wait = deadline.remaining().unwrap_or_default() / 2;
+            if process_identity::wait_for_exit(identity, graceful_wait)? {
                 return Ok(StopOutcome::Stopped);
             }
 
             // Linux can safely escalate only through a pidfd, which binds the
             // signal to the already-open process identity. Other platforms and
             // kernels without pidfd must never validate and then numeric-kill.
-            if let Err(signal_error) = process_identity::terminate(identity) {
+            if let Err(signal_error) =
+                process_identity::terminate_until(identity, deadline.instant())
+            {
                 let close_detail = close_result
                     .err()
                     .map(|err| format!("Browser.close failed: {err:#}; "))
@@ -243,12 +269,6 @@ pub fn stop(state: &SessionState) -> Result<StopOutcome> {
                         .unwrap_or_else(|| "(unknown)".to_string())
                 );
             }
-            if !process_identity::wait_for_exit(identity, Duration::from_secs(2))? {
-                bail!(
-                    "managed browser PID {} did not exit after safe pidfd escalation; close it manually and retry `rdny stop`; session state was preserved",
-                    identity.pid
-                );
-            }
             Ok(StopOutcome::Stopped)
         }
         ProcessClass::LegacyUnverifiable => bail!(
@@ -260,11 +280,10 @@ pub fn stop(state: &SessionState) -> Result<StopOutcome> {
     }
 }
 
-fn close_browser(ws_url: &str) -> Result<()> {
-    let mut client = CdpClient::connect(ws_url)?;
-    client.set_timeout(Duration::from_secs(5));
+fn close_browser(ws_url: &str, deadline: Deadline) -> Result<()> {
+    let mut client = CdpClient::connect_until(ws_url, deadline.instant())?;
     client
-        .call(None, "Browser.close", json!({}))
+        .call_until(None, "Browser.close", json!({}), deadline.instant())
         .context("sending Browser.close")?;
     Ok(())
 }
@@ -279,7 +298,12 @@ pub enum BrowserStatus {
 }
 
 /// Probe the session's browser.
+#[cfg(test)]
 pub fn status(state: &SessionState) -> Result<BrowserStatus> {
+    status_until(state, Deadline::after(http::HTTP_TIMEOUT))
+}
+
+pub fn status_until(state: &SessionState, deadline: Deadline) -> Result<BrowserStatus> {
     if let Some(id) = &state.process_identity {
         process_identity::validate_persisted(
             state.pid,
@@ -288,7 +312,7 @@ pub fn status(state: &SessionState) -> Result<BrowserStatus> {
             id,
         )?;
     }
-    let reachable = http::version(&state.host, state.port).ok();
+    let reachable = http::version_until(&state.host, state.port, deadline.instant()).ok();
     match process_identity::classify(
         state.pid,
         state.process_identity.as_ref(),
@@ -469,17 +493,16 @@ fn parse_devtools_active_port(contents: &str) -> Result<u16> {
     Ok(port)
 }
 
-fn wait_for_devtools_port(profile: &crate::state::SecureDir) -> Result<u16> {
-    let deadline = Instant::now() + DEVTOOLS_TIMEOUT;
+fn wait_for_devtools_port(profile: &crate::state::SecureDir, deadline: Deadline) -> Result<u16> {
     let mut last_err = None;
-    while Instant::now() < deadline {
+    while !deadline.expired() {
         if let Ok(contents) = profile.read_string("DevToolsActivePort") {
             match parse_devtools_active_port(&contents) {
                 Ok(port) => return Ok(port),
                 Err(err) => last_err = Some(err),
             }
         }
-        thread::sleep(POLL_INTERVAL);
+        deadline.sleep(POLL_INTERVAL);
     }
     if let Some(err) = last_err {
         return Err(err);
@@ -487,15 +510,14 @@ fn wait_for_devtools_port(profile: &crate::state::SecureDir) -> Result<u16> {
     bail!("DevToolsActivePort never appeared")
 }
 
-fn wait_for_version(host: &str, port: u16) -> Result<http::VersionInfo> {
-    let deadline = Instant::now() + DEVTOOLS_TIMEOUT;
+fn wait_for_version(host: &str, port: u16, deadline: Deadline) -> Result<http::VersionInfo> {
     let mut last_err = None;
-    while Instant::now() < deadline {
-        match http::version(host, port) {
+    while !deadline.expired() {
+        match http::version_until(host, port, deadline.instant()) {
             Ok(version) => return Ok(version),
             Err(err) => last_err = Some(err),
         }
-        thread::sleep(POLL_INTERVAL);
+        deadline.sleep(POLL_INTERVAL);
     }
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("DevTools port never became reachable")))
 }
@@ -511,13 +533,11 @@ fn launch_probe_error(data_root: &Path) -> anyhow::Error {
     )
 }
 
-fn first_page_target(host: &str, port: u16) -> Option<String> {
-    http::list_targets(host, port).ok().and_then(|targets| {
-        targets
-            .into_iter()
-            .find(|target| target.target_type == "page")
-            .map(|target| target.id)
-    })
+fn first_page_target(host: &str, port: u16, deadline: Deadline) -> Result<Option<String>> {
+    Ok(http::list_targets_until(host, port, deadline.instant())?
+        .into_iter()
+        .find(|target| target.target_type == "page")
+        .map(|target| target.id))
 }
 
 fn kill_child(child: &mut std::process::Child) {
@@ -584,7 +604,7 @@ mod tests {
     #[test]
     fn graceful_close_uses_browser_level_cdp() {
         let (url, handle) = fake_close_server(r#"{"id":1,"result":{}}"#);
-        close_browser(&url).unwrap();
+        close_browser(&url, Deadline::after(Duration::from_secs(1))).unwrap();
         handle.join().unwrap();
     }
 
@@ -592,7 +612,9 @@ mod tests {
     fn graceful_close_surfaces_cdp_rejection() {
         let (url, handle) =
             fake_close_server(r#"{"id":1,"error":{"code":-32000,"message":"close denied"}}"#);
-        let err = close_browser(&url).unwrap_err().to_string();
+        let err = close_browser(&url, Deadline::after(Duration::from_secs(1)))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("Browser.close"), "{err}");
         handle.join().unwrap();
     }

@@ -4,6 +4,7 @@
 use anyhow::Result;
 
 use crate::cdp::http::{self, TargetInfo};
+use crate::session::Deadline;
 
 /// List open pages with indices; the current page is marked with `*`.
 #[allow(dead_code)]
@@ -12,8 +13,12 @@ pub fn pages() -> Result<()> {
 }
 
 pub fn pages_format(structured: bool) -> Result<()> {
+    pages_format_until(structured, Deadline::after(http::HTTP_TIMEOUT))
+}
+
+pub fn pages_format_until(structured: bool, deadline: Deadline) -> Result<()> {
     let state = crate::state::require()?;
-    let pages = page_targets(&state.host, state.port)?;
+    let pages = page_targets(&state.host, state.port, deadline)?;
     if structured {
         let rows: Vec<_> = pages.iter().enumerate().map(|(index, target)| serde_json::json!({
             "index": index, "current": state.target_id.as_deref() == Some(target.id.as_str()),
@@ -39,9 +44,14 @@ pub fn pages_format(structured: bool) -> Result<()> {
 }
 
 /// Switch the session's current page by index (as printed by `pages`).
+#[allow(dead_code)]
 pub fn page(index: usize) -> Result<()> {
+    page_until(index, Deadline::after(http::HTTP_TIMEOUT))
+}
+
+pub fn page_until(index: usize, deadline: Deadline) -> Result<()> {
     let state = crate::state::require()?;
-    let pages = page_targets(&state.host, state.port)?;
+    let pages = page_targets(&state.host, state.port, deadline)?;
     let target = pages
         .get(index)
         .ok_or_else(|| anyhow::anyhow!("no page at index {index} (see `rdny pages`)"))?;
@@ -56,21 +66,22 @@ pub fn page(index: usize) -> Result<()> {
 /// Open a new page/tab, optionally at a URL, and make it current.
 pub fn newpage_with_policy(
     url: Option<&str>,
-    timeout_secs: f64,
+    timeout: std::time::Duration,
+    deadline: Deadline,
     policy: &crate::commands::nav::UrlPolicy,
 ) -> Result<()> {
     let state = crate::state::require()?;
     let normalized = url
         .map(|url| crate::commands::nav::normalize_url(url, policy))
         .transpose()?;
-    let target = http::new_tab(&state.host, state.port, None)?;
+    let target = http::new_tab_until(&state.host, state.port, None, deadline.instant())?;
     crate::state::update(|state| {
         state.target_id = Some(target.id.clone());
         Ok(())
     })?;
     if let Some(url) = normalized.as_deref() {
-        let mut sess = crate::session::connect(timeout_secs)?;
-        crate::commands::nav::open(&mut sess, url)?;
+        let mut sess = crate::session::connect(deadline, timeout)?;
+        crate::commands::nav::open_with_policy(&mut sess, url, policy)?;
     }
     let opened = if target.url.is_empty() {
         normalized.as_deref().unwrap_or(target.id.as_str())
@@ -81,8 +92,8 @@ pub fn newpage_with_policy(
     Ok(())
 }
 
-fn page_targets(host: &str, port: u16) -> Result<Vec<TargetInfo>> {
-    let mut pages: Vec<_> = http::list_targets(host, port)?
+fn page_targets(host: &str, port: u16, deadline: Deadline) -> Result<Vec<TargetInfo>> {
+    let mut pages: Vec<_> = http::list_targets_until(host, port, deadline.instant())?
         .into_iter()
         .filter(|target| target.target_type == "page")
         .collect();

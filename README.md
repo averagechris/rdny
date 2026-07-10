@@ -259,11 +259,19 @@ cross-host/cross-port debugger URLs are rejected.
 ## Transport and URL safety limits
 
 DevTools HTTP responses are bounded to 32 KiB of headers and 8 MiB of decoded
-body data, with bounded chunk metadata/trailers and a 10-second overall request
-deadline. CDP WebSockets allow at most 2 MiB per frame, 8 MiB per message, and
-1,024 events buffered while waiting for a command response. The internal HTTP
-and CDP APIs accept absolute deadlines so commands can share an overall budget
-without changing the global `--timeout` interface.
+body data, with bounded chunk metadata/trailers. CDP WebSockets allow at most 2
+MiB per frame, 8 MiB per message, and 1,024 events buffered while waiting for a
+command response.
+
+`--timeout` accepts 0.001 through 86400 seconds. A command creates one monotonic
+deadline: discovery, TCP connection, HTTP, WebSocket handshake and I/O, CDP
+setup/calls/events, waits, recording acknowledgement, and shutdown all consume
+that same budget rather than starting fresh timers. Under normal local scheduler
+load, a blocked transport returns within 250 ms of the requested deadline (the
+tests use this tolerance); non-network filesystem and process cleanup can add
+small platform-dependent overhead. `logs --duration` remains the explicit
+capture budget when supplied, `logs --follow` remains unbounded after bounded
+setup, and wait quiet-window values are unchanged.
 
 Navigation uses standards-based URL parsing. Bare `localhost` and
 `*.localhost` targets intentionally become `http://` for local development;
