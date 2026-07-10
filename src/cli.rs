@@ -105,6 +105,9 @@ pub enum Command {
     /// Click and download a linked resource.
     Download {
         selector: String,
+        /// Maximum accepted payload bytes (default 268435456; env RDNY_MAX_DOWNLOAD_BYTES).
+        #[arg(long)]
+        max_bytes: Option<u64>,
         /// Replace an existing output file.
         #[arg(long)]
         force: bool,
@@ -527,9 +530,10 @@ pub fn run() -> Result<()> {
         Command::File { selector, path } => commands::interact::file(sess!(), &selector, &path)?,
         Command::Download {
             selector,
+            max_bytes,
             force,
             file,
-        } => commands::interact::download(sess!(), &selector, file.as_deref(), force)?,
+        } => commands::interact::download(sess!(), &selector, file.as_deref(), force, max_bytes)?,
         Command::Select { selector, value } => {
             commands::interact::select(sess!(), &selector, &value)?
         }
@@ -895,7 +899,14 @@ mod tests {
             Command::Page { index: 2 }
         ));
         assert!(
-            matches!(parse(&["rdny", "download", "a.link", "-"]), Command::Download { selector, file: Some(file), force: false } if selector == "a.link" && file.as_os_str() == "-")
+            matches!(parse(&["rdny", "download", "a.link", "-"]), Command::Download { selector, file: Some(file), force: false, max_bytes: None } if selector == "a.link" && file.as_os_str() == "-")
+        );
+    }
+
+    #[test]
+    fn parses_download_max_bytes() {
+        assert!(
+            matches!(parse(&["rdny", "download", "a.link", "--max-bytes", "1024"]), Command::Download { selector, max_bytes: Some(1024), .. } if selector == "a.link")
         );
     }
 

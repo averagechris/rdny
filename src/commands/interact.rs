@@ -1,10 +1,10 @@
 //! Interaction: js, click, input, clear, file, download, select,
 //! submit, hover, focus.
 
-use std::io::{self, Write as _};
+use std::io;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::json;
 
 use crate::commands::{artifacts, decode_base64, print_value};
@@ -72,6 +72,7 @@ pub fn download(
     _selector: &str,
     _file: Option<&Path>,
     force: bool,
+    max_bytes: Option<u64>,
 ) -> Result<()> {
     let id = _sess.element(_selector)?;
     let url_value = _sess.call_on(
@@ -84,23 +85,53 @@ pub fn download(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow::anyhow!("element has no href or src"))?
         .to_string();
-    let data = _sess.call_on(
-        &id,
-        "async function() { const url = this.href || this.currentSrc || this.src; const resp = await fetch(url, {credentials: 'include'}); if (!resp.ok) { throw new Error('fetch failed: HTTP ' + resp.status); } const buf = await resp.arrayBuffer(); const bytes = new Uint8Array(buf); let s = ''; for (let i = 0; i < bytes.length; i += 0x8000) { s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)); } return btoa(s); }",
-        &[],
+    let max_bytes = artifacts::configured_max_download_bytes(max_bytes)?;
+    let len = _sess.call_on(&id,
+        "async function(max) { const url = this.href || this.currentSrc || this.src; const r = await fetch(url, {method:'HEAD', credentials:'include'}).catch(() => null); const n = r && r.headers ? Number(r.headers.get('content-length')) : NaN; return Number.isFinite(n) ? n : null; }",
+        &[json!(max_bytes)],
     )?;
-    let bytes = decode_base64(data.as_str().context("download returned no data")?)?;
+    if let Some(len) = len.as_u64()
+        && len > max_bytes
+    {
+        bail!(
+            "download preflight content-length {len} exceeds max {max_bytes} bytes (--max-bytes or RDNY_MAX_DOWNLOAD_BYTES)"
+        );
+    }
+    let data = _sess.call_on(&id,
+        "async function(max) { const url = this.href || this.currentSrc || this.src; const resp = await fetch(url, {credentials: 'include'}); if (!resp.ok) { throw new Error('fetch failed: HTTP ' + resp.status); } const len = Number(resp.headers.get('content-length')); if (Number.isFinite(len) && len > max) { throw new Error('download content-length ' + len + ' exceeds max ' + max); } const reader = resp.body && resp.body.getReader ? resp.body.getReader() : null; if (!reader) { const buf = await resp.arrayBuffer(); if (buf.byteLength > max) throw new Error('download exceeds max ' + max); const bytes = new Uint8Array(buf); let s = ''; for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)); return btoa(s); } let chunks = []; let total = 0; for (;;) { const {done, value} = await reader.read(); if (done) break; total += value.byteLength; if (total > max) throw new Error('download exceeds max ' + max); let s = ''; for (let i = 0; i < value.length; i += 0x8000) s += String.fromCharCode.apply(null, value.subarray(i, i + 0x8000)); chunks.push(btoa(s)); } return chunks.join('\n'); }",
+        &[json!(max_bytes)],
+    )?;
+    let chunks = data.as_str().context("download returned no data")?;
     match _file {
-        Some(path) if path == Path::new("-") => io::stdout().lock().write_all(&bytes)?,
+        Some(path) if path == Path::new("-") => {
+            write_download_chunks(chunks, io::stdout().lock(), max_bytes)?
+        }
         Some(path) => {
-            artifacts::write_artifact(path, &bytes, force)?;
+            let mut reservation = artifacts::ReservedArtifact::reserve(path, force)?;
+            write_download_chunks(chunks, reservation.as_file_mut(), max_bytes)?;
+            reservation.finalize(force)?;
             println!("saved {}", path.display());
         }
         None => {
             let name = filename_from_url(&url);
-            artifacts::write_artifact(Path::new(&name), &bytes, force)?;
+            let mut reservation = artifacts::ReservedArtifact::reserve(Path::new(&name), force)?;
+            write_download_chunks(chunks, reservation.as_file_mut(), max_bytes)?;
+            reservation.finalize(force)?;
             println!("saved {name}");
         }
+    }
+    Ok(())
+}
+
+fn write_download_chunks(chunks: &str, mut out: impl std::io::Write, max: u64) -> Result<()> {
+    let mut total = 0_u64;
+    for chunk in chunks.split('\n').filter(|s| !s.is_empty()) {
+        let bytes = decode_base64(chunk)?;
+        total = total.saturating_add(bytes.len() as u64);
+        if total > max {
+            bail!("download is larger than {max} bytes");
+        }
+        out.write_all(&bytes).context("writing download chunk")?;
     }
     Ok(())
 }
@@ -174,7 +205,7 @@ fn filename_from_url(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::filename_from_url;
+    use super::{filename_from_url, write_download_chunks};
 
     #[test]
     fn filename_from_url_strips_query() {
@@ -203,5 +234,15 @@ mod tests {
             filename_from_url("https://example.com/a/b.txt#part"),
             "b.txt"
         );
+    }
+
+    #[test]
+    fn download_chunks_write_incrementally_and_bound_total() {
+        let mut out = Vec::new();
+        write_download_chunks("aGVs\nbG8=", &mut out, 5).unwrap();
+        assert_eq!(out, b"hello");
+        let mut out = Vec::new();
+        let err = write_download_chunks("aGVs\nbG8=", &mut out, 4).unwrap_err();
+        assert!(format!("{err}").contains("larger than 4 bytes"));
     }
 }

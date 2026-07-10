@@ -7,6 +7,20 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 pub const STDIN_UPLOAD_LIMIT: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
+
+pub fn configured_max_download_bytes(cli: Option<u64>) -> Result<u64> {
+    if let Some(value) = cli {
+        return Ok(value);
+    }
+    match std::env::var("RDNY_MAX_DOWNLOAD_BYTES") {
+        Ok(raw) => raw
+            .parse::<u64>()
+            .context("RDNY_MAX_DOWNLOAD_BYTES must be an integer byte count"),
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_MAX_DOWNLOAD_BYTES),
+        Err(err) => Err(err).context("reading RDNY_MAX_DOWNLOAD_BYTES"),
+    }
+}
 
 pub fn write_artifact(path: &Path, bytes: &[u8], force: bool) -> Result<()> {
     let mut reservation = ReservedArtifact::reserve(path, force)?;
@@ -168,31 +182,47 @@ fn stdin_upload_in(reader: impl Read, parent: impl AsRef<Path>) -> Result<StdinU
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).ok();
     }
-    let mut limited = reader.take(STDIN_UPLOAD_LIMIT + 1);
-    let mut bytes = Vec::new();
-    limited
-        .read_to_end(&mut bytes)
-        .context("reading upload data from stdin")?;
-    if bytes.len() as u64 > STDIN_UPLOAD_LIMIT {
-        bail!(
-            "stdin upload is larger than {} MiB; pass a file path instead or reduce the input",
-            STDIN_UPLOAD_LIMIT / 1024 / 1024
-        );
-    }
     let path = dir.path().join("stdin-upload");
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&path)
         .with_context(|| format!("creating {}", path.display()))?;
-    file.write_all(&bytes)
-        .with_context(|| format!("writing {}", path.display()))?;
+    copy_bounded(reader, &mut file, STDIN_UPLOAD_LIMIT, "stdin upload")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).ok();
     }
     Ok(StdinUpload { _dir: dir, path })
+}
+
+pub fn copy_bounded(
+    mut reader: impl Read,
+    mut writer: impl Write,
+    max: u64,
+    label: &str,
+) -> Result<u64> {
+    let mut buf = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .with_context(|| format!("reading {label}"))?;
+        if n == 0 {
+            break;
+        }
+        total = total.saturating_add(n as u64);
+        if total > max {
+            bail!(
+                "{label} is larger than {max} bytes; pass a file path, increase the limit, or reduce the input"
+            );
+        }
+        writer
+            .write_all(&buf[..n])
+            .with_context(|| format!("writing {label}"))?;
+    }
+    Ok(total)
 }
 
 fn overwrite_hint(path: &Path) -> String {

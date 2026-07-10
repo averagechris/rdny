@@ -128,6 +128,11 @@ default, including symlinks. Pass `--force` to replace an output intentionally.
 When `download` infers a filename from page-controlled URLs, rdny keeps the file
 in the current directory and sanitizes separators, dotfiles, control characters,
 `.`/`..`, and overlong names before creating it on Linux/macOS.
+Downloads perform a best-effort `HEAD` preflight and reject payloads larger than
+256 MiB by default before fetching when `Content-Length` is available. Use
+`rdny download --max-bytes N ...` or `RDNY_MAX_DOWNLOAD_BYTES=N` to tune this.
+Fetched chunks are decoded and written incrementally to the reserved artifact (or
+stdout) instead of materializing additional full output copies in Rust.
 
 `rdny file SELECTOR -` reads upload data from stdin into a private temporary file
 with owner-only permissions, keeps it until Chrome accepts the upload, and then
@@ -145,6 +150,12 @@ Successful assembly clears that id from state before best-effort frame deletion,
 so a deletion warning leaves an explicit manual cleanup path without state
 pointing at deleted frames. Older state using the legacy singular
 `recoverable_recording` field or `frames/` directory is still readable.
+Recording capture is bounded: each incoming screencast frame is size-checked
+before decode, and active recordings stop into recoverable state when frame
+count, duration, total frame bytes, or minimum free disk quotas are exceeded.
+Tune with `RDNY_MAX_SCREENCAST_FRAME_BYTES` (default 8 MiB),
+`RDNY_MAX_RECORDING_FRAMES` (18,000), `RDNY_MAX_RECORDING_SECONDS` (1,800),
+`RDNY_MAX_RECORDING_BYTES` (512 MiB), and `RDNY_MIN_FREE_DISK_BYTES` (256 MiB).
 
 All Nix systems can opt into an ffmpeg-containing closure without a bundled
 browser using `.#rdny-ffmpeg`:

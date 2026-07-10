@@ -17,6 +17,11 @@ use crate::hint::hint_error;
 use crate::{session::PageSession, state};
 
 const LAST_FRAME_DURATION: f64 = 0.1;
+const DEFAULT_MAX_FRAME_BYTES: u64 = 8 * 1024 * 1024;
+const DEFAULT_MAX_RECORDING_BYTES: u64 = 512 * 1024 * 1024;
+const DEFAULT_MAX_RECORDING_FRAMES: u64 = 18_000;
+const DEFAULT_MAX_RECORDING_SECONDS: f64 = 30.0 * 60.0;
+const DEFAULT_MIN_FREE_DISK_BYTES: u64 = 256 * 1024 * 1024;
 static RECORDING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn start() -> Result<()> {
@@ -362,11 +367,122 @@ pub(crate) fn handle_screencast_frame(
         // directory being assembled or cleaned up.
         return Ok(ack);
     };
+    if estimated_decoded_len(data)
+        > env_u64("RDNY_MAX_SCREENCAST_FRAME_BYTES", DEFAULT_MAX_FRAME_BYTES)
+    {
+        stop_recording_for_quota(frames_dir, "screencast frame exceeds max decoded size")?;
+        return Ok(ack);
+    }
     let bytes = decode_base64(data)?;
+    if bytes.len() as u64 > env_u64("RDNY_MAX_SCREENCAST_FRAME_BYTES", DEFAULT_MAX_FRAME_BYTES) {
+        stop_recording_for_quota(frames_dir, "screencast frame exceeds max decoded size")?;
+        return Ok(ack);
+    }
+    if enforce_recording_quota(frames_dir, timestamp, bytes.len() as u64)? {
+        return Ok(ack);
+    }
     frames_dir
         .write_file(&format!("{timestamp:.6}.jpg"), &bytes)
         .context("writing screencast frame")?;
     Ok(ack)
+}
+
+fn enforce_recording_quota(
+    frames_dir: &state::SecureDir,
+    timestamp: f64,
+    incoming: u64,
+) -> Result<bool> {
+    let frames = read_frames(frames_dir).unwrap_or_default();
+    let frame_count = frames.len() as u64;
+    let bytes = dir_bytes(frames_dir.path()).saturating_add(incoming);
+    let duration = frames
+        .first()
+        .map(|(first, _)| (timestamp - *first).max(0.0))
+        .unwrap_or(0.0);
+    let reason =
+        if frame_count + 1 > env_u64("RDNY_MAX_RECORDING_FRAMES", DEFAULT_MAX_RECORDING_FRAMES) {
+            Some("recording frame quota exceeded")
+        } else if bytes > env_u64("RDNY_MAX_RECORDING_BYTES", DEFAULT_MAX_RECORDING_BYTES) {
+            Some("recording byte quota exceeded")
+        } else if duration > env_f64("RDNY_MAX_RECORDING_SECONDS", DEFAULT_MAX_RECORDING_SECONDS) {
+            Some("recording duration quota exceeded")
+        } else if free_bytes(frames_dir.path())
+            < env_u64("RDNY_MIN_FREE_DISK_BYTES", DEFAULT_MIN_FREE_DISK_BYTES)
+        {
+            Some("recording stopped to preserve free disk")
+        } else {
+            None
+        };
+    if let Some(reason) = reason {
+        stop_recording_for_quota(frames_dir, reason)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn stop_recording_for_quota(frames_dir: &state::SecureDir, reason: &str) -> Result<()> {
+    let frames_path = frames_dir.path().to_path_buf();
+    state::update_if_present(|st| {
+        if st.recording_frames_dir.as_deref() == Some(frames_path.as_path()) {
+            let id = st
+                .recording_id
+                .clone()
+                .unwrap_or_else(|| "quota-stopped".into());
+            st.recording = false;
+            st.recording_id = None;
+            st.recording_frames_dir = None;
+            upsert_recovery(
+                st,
+                state::RecoverableRecording {
+                    id,
+                    frames_dir: frames_path.clone(),
+                    status: state::RecordingStatus::Recoverable,
+                },
+            );
+        }
+        Ok(())
+    })?;
+    eprintln!("warning: {reason}; recording marked recoverable");
+    Ok(())
+}
+
+fn estimated_decoded_len(b64: &str) -> u64 {
+    (b64.len() as u64 / 4).saturating_mul(3)
+}
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+fn env_f64(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+fn dir_bytes(path: &Path) -> u64 {
+    fs::read_dir(path)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok()?.metadata().ok().map(|m| m.len()))
+        .sum()
+}
+fn free_bytes(path: &Path) -> u64 {
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok();
+    let Some(c) = c else {
+        return u64::MAX;
+    };
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    unsafe {
+        if libc::statvfs(c.as_ptr(), stat.as_mut_ptr()) == 0 {
+            let s = stat.assume_init();
+            (s.f_bavail as u64).saturating_mul(s.f_frsize)
+        } else {
+            u64::MAX
+        }
+    }
 }
 
 pub fn concat_list(frames: &[(f64, PathBuf)]) -> String {
