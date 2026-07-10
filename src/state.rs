@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::process_identity::ProcessIdentity;
 use storage::StateStore;
 pub(crate) use storage::{Generation, Inspection, SecureDir};
 
@@ -59,6 +60,9 @@ pub struct SessionState {
     pub port: u16,
     /// PID of the browser we launched; None for `rdny connect` sessions.
     pub pid: Option<u32>,
+    /// Robust identity captured at launch. Missing in legacy PID-only state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_identity: Option<ProcessIdentity>,
     /// user-data-dir we created for launched sessions.
     pub user_data_dir: Option<PathBuf>,
     /// Browser binary used for launched sessions.
@@ -184,7 +188,7 @@ pub(crate) fn capture_initial_cwd() -> Result<()> {
 pub fn load() -> Result<Option<SessionState>> {
     match inspect()? {
         StateInspection::Missing => Ok(None),
-        StateInspection::Valid(state) => Ok(Some(state)),
+        StateInspection::Valid(state) => Ok(Some(*state)),
         StateInspection::Malformed(message) => {
             anyhow::bail!("state file contains malformed JSON: {message}")
         }
@@ -249,6 +253,7 @@ fn merge_state(current: Option<Value>, state: &SessionState) -> Result<Value> {
             "host",
             "port",
             "pid",
+            "process_identity",
             "user_data_dir",
             "browser_path",
             "target_id",
@@ -273,7 +278,7 @@ pub fn clear() -> Result<()> {
 #[derive(Debug)]
 enum StateInspection {
     Missing,
-    Valid(SessionState),
+    Valid(Box<SessionState>),
     Malformed(String),
     Incompatible(String),
 }
@@ -293,7 +298,7 @@ fn inspect() -> Result<StateInspection> {
     };
     Ok(match store.inspect(STATE_FILE)? {
         Inspection::Missing => StateInspection::Missing,
-        Inspection::Valid(v, _) => StateInspection::Valid(v),
+        Inspection::Valid(v, _) => StateInspection::Valid(Box::new(v)),
         Inspection::Malformed(v) => StateInspection::Malformed(v.message().to_owned()),
         Inspection::Incompatible(e, _) => StateInspection::Incompatible(e),
     })
@@ -337,6 +342,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 9222,
             pid: Some(123),
+            process_identity: None,
             user_data_dir: Some(PathBuf::from("/tmp/rdny-profile")),
             browser_path: Some(PathBuf::from("/Applications/Google Chrome.app")),
             target_id: Some("target-1".to_string()),

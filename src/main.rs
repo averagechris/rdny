@@ -4,6 +4,7 @@ mod cli;
 mod commands;
 mod config;
 mod hint;
+mod process_identity;
 mod session;
 mod state;
 

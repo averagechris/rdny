@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 
 use crate::browser;
 use crate::cdp::http;
+use crate::process_identity::{self, ProcessClass};
 use crate::state::{self, Generation, Inspection, SessionState};
 
 /// How an instance relates to a running browser.
@@ -19,17 +20,21 @@ pub enum Liveness {
     Attached,
     /// Neither a live pid nor a reachable debug port.
     Dead,
+    Unverifiable,
+    Unrelated,
 }
 
 /// Classify an instance given injectable probes, so tests need
 /// neither real pids nor sockets.
-pub fn classify(
+#[cfg(test)]
+fn classify(
     state: &SessionState,
     pid_alive: impl Fn(u32) -> bool,
     port_reachable: impl Fn(&str, u16) -> bool,
 ) -> Liveness {
     match state.pid {
-        Some(pid) if pid_alive(pid) => Liveness::Alive,
+        Some(pid) if state.process_identity.is_some() && pid_alive(pid) => Liveness::Alive,
+        Some(_) if state.process_identity.is_none() => Liveness::Unverifiable,
         Some(_) => Liveness::Dead,
         None if port_reachable(&state.host, state.port) => Liveness::Attached,
         None => Liveness::Dead,
@@ -37,11 +42,25 @@ pub fn classify(
 }
 
 fn probe_liveness(state: &SessionState) -> Liveness {
-    classify(
-        state,
-        |pid| browser::pid_exists(pid as libc::pid_t),
-        |host, port| http::version(host, port).is_ok(),
-    )
+    if let Some(id) = &state.process_identity
+        && process_identity::validate_persisted(
+            state.pid,
+            state.browser_path.as_deref(),
+            state.user_data_dir.as_deref(),
+            id,
+        )
+        .is_err()
+    {
+        return Liveness::Unrelated;
+    }
+    let reachable = http::version(&state.host, state.port).is_ok();
+    match process_identity::classify(state.pid, state.process_identity.as_ref(), reachable) {
+        ProcessClass::ManagedMatching => Liveness::Alive,
+        ProcessClass::ManagedDead | ProcessClass::AttachedDead => Liveness::Dead,
+        ProcessClass::PidReusedOrUnrelated => Liveness::Unrelated,
+        ProcessClass::LegacyUnverifiable => Liveness::Unverifiable,
+        ProcessClass::AttachedReachable => Liveness::Attached,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -150,6 +169,8 @@ pub fn format_line(line: &InstanceLine) -> String {
             Liveness::Alive => "alive",
             Liveness::Attached => "attached",
             Liveness::Dead => "dead",
+            Liveness::Unverifiable => "legacy-unverifiable",
+            Liveness::Unrelated => "pid-reused/unrelated",
         },
         display_label(line.label.as_deref())
     )
@@ -217,6 +238,7 @@ mod tests {
             host: "127.0.0.1".into(),
             port: 1,
             pid,
+            process_identity: None,
             user_data_dir: None,
             browser_path: None,
             target_id: None,
@@ -267,11 +289,11 @@ mod tests {
     fn classifies_liveness() {
         assert_eq!(
             classify(&state(Some(1), None), |_| true, |_, _| false),
-            Liveness::Alive
+            Liveness::Unverifiable
         );
         assert_eq!(
             classify(&state(Some(1), None), |_| false, |_, _| true),
-            Liveness::Dead
+            Liveness::Unverifiable
         );
         assert_eq!(
             classify(&state(None, None), |_| true, |_, _| true),
@@ -315,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_removes_dead_but_leaves_live_and_attached_without_all() {
+    fn cleanup_preserves_legacy_unverifiable_without_all() {
         let temp = tempfile::tempdir().unwrap();
         let dead = temp.path().join("dead");
         let live = temp.path().join("live");
@@ -343,8 +365,8 @@ mod tests {
             classify(st, |pid| pid == 2, |_, _| true)
         })
         .unwrap();
-        assert_eq!(cleaned.len(), 1);
-        assert!(!dead.join("state.json").exists());
+        assert_eq!(cleaned.len(), 0);
+        assert!(dead.join("state.json").exists());
         assert!(live.join("state.json").exists());
         assert!(attached.join("state.json").exists());
     }

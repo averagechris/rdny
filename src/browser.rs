@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 use crate::cdp::http;
 use crate::config;
 use crate::hint::hint_error;
+use crate::process_identity::{self, ProcessClass};
 use crate::state::{BrowserStorage, SessionState};
 
 const DEVTOOLS_TIMEOUT: Duration = Duration::from_secs(15);
@@ -71,35 +72,37 @@ pub fn launch(opts: &LaunchOpts, storage: BrowserStorage) -> Result<SessionState
 
     let log = storage.log;
     let log_err = log.try_clone().context("cloning chrome log handle")?;
-    let mut child = Command::new(&binary)
+    let child = Command::new(&binary)
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err))
         .spawn()
         .with_context(|| format!("launching {}", binary.display()))?;
+    let mut launch_guard = ChildLaunchGuard::armed(child);
 
     let port = match wait_for_devtools_port(&storage.profile) {
         Ok(port) => port,
-        Err(_) => {
-            kill_child(&mut child);
-            return Err(launch_probe_error(data_root));
-        }
+        Err(_) => return Err(launch_probe_error(data_root)),
     };
     let version = match wait_for_version("127.0.0.1", port) {
         Ok(version) => version,
-        Err(_) => {
-            kill_child(&mut child);
-            return Err(launch_probe_error(data_root));
-        }
+        Err(_) => return Err(launch_probe_error(data_root)),
     };
     let target_id = first_page_target("127.0.0.1", port);
 
+    let child_id = launch_guard.id();
+    let process_identity = Some(
+        process_identity::capture(child_id, &binary, Some(&profile_dir))
+            .context("capturing launched browser process identity")?,
+    );
+    launch_guard.commit();
     Ok(SessionState {
         ws_url: version.ws_url,
         host: "127.0.0.1".into(),
         port,
-        pid: Some(child.id()),
+        pid: Some(child_id),
+        process_identity,
         user_data_dir: Some(profile_dir),
         browser_path: Some(binary),
         target_id,
@@ -124,6 +127,7 @@ pub fn connect(host: &str, port: u16) -> Result<SessionState> {
         host: host.into(),
         port,
         pid: None,
+        process_identity: None,
         user_data_dir: None,
         browser_path: None,
         target_id: first_page_target(host, port),
@@ -147,53 +151,36 @@ pub enum StopOutcome {
 /// Attached sessions (no pid) are never killed: the caller should
 /// clear the session state, leaving the browser running.
 pub fn stop(state: &SessionState) -> Result<StopOutcome> {
-    let Some(pid) = state.pid else {
-        return Ok(StopOutcome::Detached);
-    };
-    let pid = pid as libc::pid_t;
-    reap_if_child(pid);
-    if !pid_exists(pid) {
-        return Ok(StopOutcome::Stopped);
+    if let Some(id) = &state.process_identity {
+        process_identity::validate_persisted(
+            state.pid,
+            state.browser_path.as_deref(),
+            state.user_data_dir.as_deref(),
+            id,
+        )?;
     }
-    unsafe {
-        libc::kill(pid, libc::SIGTERM);
-    }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        reap_if_child(pid);
-        if !pid_exists(pid) {
-            return Ok(StopOutcome::Stopped);
+    match process_identity::classify(state.pid, state.process_identity.as_ref(), false) {
+        ProcessClass::AttachedReachable | ProcessClass::AttachedDead => Ok(StopOutcome::Detached),
+        ProcessClass::ManagedDead => Ok(StopOutcome::Stopped),
+        ProcessClass::ManagedMatching => {
+            process_identity::terminate(
+                state.process_identity.as_ref().expect("classified managed"),
+            )?;
+            Ok(StopOutcome::Stopped)
         }
-        thread::sleep(POLL_INTERVAL);
-    }
-    unsafe {
-        libc::kill(pid, libc::SIGKILL);
-    }
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        reap_if_child(pid);
-        if !pid_exists(pid) {
-            break;
+        ProcessClass::LegacyUnverifiable => bail!(
+            "refusing to signal legacy PID-only state; run cleanup or remove state after verifying the process manually"
+        ),
+        ProcessClass::PidReusedOrUnrelated => {
+            bail!("refusing to signal PID that does not match rdny's managed process identity")
         }
-        thread::sleep(POLL_INTERVAL);
-    }
-    Ok(StopOutcome::Stopped)
-}
-
-/// Reap the process if it is a zombie child of this process (e.g. when
-/// stop() runs in the same process that launched the browser, as in
-/// tests or launch-failure cleanup). Harmless ECHILD otherwise.
-fn reap_if_child(pid: libc::pid_t) {
-    let mut status: libc::c_int = 0;
-    unsafe {
-        libc::waitpid(pid, &mut status, libc::WNOHANG);
     }
 }
 
 /// Health of the recorded session.
 #[derive(Debug, Clone)]
 pub enum BrowserStatus {
-    /// Browser answers /json/version.
+    /// Browser identity matches and answers /json/version.
     Running { browser: String },
     /// State file exists but the browser is gone.
     Stale,
@@ -201,9 +188,24 @@ pub enum BrowserStatus {
 
 /// Probe the session's browser.
 pub fn status(state: &SessionState) -> Result<BrowserStatus> {
-    match http::version(&state.host, state.port) {
-        Ok(v) => Ok(BrowserStatus::Running { browser: v.browser }),
-        Err(_) => Ok(BrowserStatus::Stale),
+    if let Some(id) = &state.process_identity {
+        process_identity::validate_persisted(
+            state.pid,
+            state.browser_path.as_deref(),
+            state.user_data_dir.as_deref(),
+            id,
+        )?;
+    }
+    let reachable = http::version(&state.host, state.port).ok();
+    match process_identity::classify(
+        state.pid,
+        state.process_identity.as_ref(),
+        reachable.is_some(),
+    ) {
+        ProcessClass::ManagedMatching | ProcessClass::AttachedReachable => reachable
+            .map(|v| Ok(BrowserStatus::Running { browser: v.browser }))
+            .unwrap_or(Ok(BrowserStatus::Stale)),
+        _ => Ok(BrowserStatus::Stale),
     }
 }
 
@@ -347,7 +349,10 @@ fn build_args(
         args.push("--ignore-certificate-errors".to_string());
     }
     args.extend(user_args.iter().filter_map(|arg| {
-        if macos && (arg == "--single-process" || arg.starts_with("--single-process=")) {
+        if arg == "--user-data-dir" || arg.starts_with("--user-data-dir=") {
+            eprintln!("ignoring user-supplied --user-data-dir: rdny owns the managed profile");
+            None
+        } else if macos && (arg == "--single-process" || arg.starts_with("--single-process=")) {
             eprintln!("ignoring --single-process on macOS: it crashes recent Chromium");
             None
         } else {
@@ -423,15 +428,42 @@ fn first_page_target(host: &str, port: u16) -> Option<String> {
     })
 }
 
-pub fn pid_exists(pid: libc::pid_t) -> bool {
-    unsafe { libc::kill(pid, 0) == 0 }
-}
-
 fn kill_child(child: &mut std::process::Child) {
     unsafe {
         libc::kill(child.id() as libc::pid_t, libc::SIGKILL);
     }
     let _ = child.wait();
+}
+
+struct ChildLaunchGuard {
+    child: Option<std::process::Child>,
+}
+
+impl ChildLaunchGuard {
+    fn armed(child: std::process::Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn id(&self) -> u32 {
+        self.child.as_ref().expect("guard is armed").id()
+    }
+
+    fn commit(&mut self) {
+        self.child = None;
+    }
+}
+
+impl Drop for ChildLaunchGuard {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.child {
+            kill_child(child);
+        }
+    }
+}
+
+#[cfg(test)]
+fn pid_exists(pid: libc::pid_t) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
 }
 
 #[cfg(test)]
@@ -617,6 +649,44 @@ mod tests {
     }
 
     #[test]
+    fn build_args_rejects_user_data_dir_override() {
+        let user = vec![
+            "--foo".into(),
+            "--user-data-dir=/tmp/evil".into(),
+            "--user-data-dir".into(),
+            "--bar".into(),
+        ];
+        let args = build_args(
+            &LaunchOpts::default(),
+            Path::new("/tmp/profile"),
+            &user,
+            false,
+        );
+        assert_eq!(
+            args.iter()
+                .filter(|a| a.starts_with("--user-data-dir"))
+                .count(),
+            1
+        );
+        assert!(args.contains(&"--user-data-dir=/tmp/profile".to_string()));
+        assert!(args.ends_with(&["--foo".into(), "--bar".into()]));
+    }
+
+    #[test]
+    fn post_spawn_identity_failure_cleanup_kills_and_reaps_child() {
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        // This is the exact cleanup path launch uses after a post-spawn
+        // identity-capture error.
+        drop(ChildLaunchGuard::armed(child));
+        assert!(!pid_exists(pid));
+    }
+
+    #[test]
     fn parses_devtools_active_port() {
         assert_eq!(
             parse_devtools_active_port("12345\n/devtools/browser/abc\n").unwrap(),
@@ -644,7 +714,10 @@ mod tests {
         }
         stop(&state).unwrap();
         if let Some(pid) = state.pid {
-            assert!(!pid_exists(pid as libc::pid_t));
+            assert_ne!(
+                process_identity::classify(Some(pid), state.process_identity.as_ref(), false),
+                ProcessClass::ManagedMatching
+            );
         }
     }
 }
