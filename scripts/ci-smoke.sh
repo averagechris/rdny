@@ -33,6 +33,8 @@ else
     "$rdny" --version
     printf '$ %s --help >/dev/null\n' "$rdny"
     "$rdny" --help >/dev/null
+    printf '$ env -i PATH=/no-such %s --help >/dev/null\n' "$rdny"
+    env -i PATH=/no-such HOME="${HOME:-/tmp}" "$rdny" --help >/dev/null
     printf '$ scripts/smoke.sh %s\n' "$rdny"
     scripts/smoke.sh "$rdny"
   } >"$RDNY_SMOKE_WORKDIR/smoke.log" 2>&1 || status=$?

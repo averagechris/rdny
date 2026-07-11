@@ -1,0 +1,58 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>rdny browser programs</title>
+<style>
+  #drag-source, #drop-target { position: fixed; top: 180px; width: 120px; height: 60px; }
+  #drag-source { left: 80px; background: #9cf; }
+  #drop-target { left: 360px; background: #cfc; }
+  #pointer-target { position: fixed; left: 200px; top: 100px; width: 120px; height: 60px; }
+</style>
+<a id="download" href="data:text/plain;base64,YXJjaGl0ZWN0dXJlCg==">download</a>
+<h1 id="heading">browser programs</h1>
+<outer-host id="outer"></outer-host>
+<button id="plain-action">plain action</button>
+<input id="key-target">
+<button id="pointer-target">pointer</button>
+<div id="drag-source" draggable="true">source</div>
+<div id="drop-target">target</div>
+<script>
+  window.result = {clicked: false, dragged: false, dropData: '', keys: [], pointer: false, releaseButtons: null};
+  const outer = document.querySelector('#outer').attachShadow({mode: 'open'});
+  outer.innerHTML = '<inner-host id="inner"></inner-host>';
+  const inner = outer.querySelector('#inner').attachShadow({mode: 'open'});
+  inner.innerHTML = '<button id="action"><span>action</span></button>';
+  inner.querySelector('#action').addEventListener('click', event => {
+    window.result.clicked = event.isTrusted && event.target.localName === 'span';
+  });
+  for (const type of ['keydown', 'keyup']) {
+    document.querySelector('#key-target').addEventListener(type, event => {
+      window.result.keys.push({type, key: event.key, code: event.code, shift: event.shiftKey, control: event.ctrlKey, trusted: event.isTrusted});
+    });
+  }
+  document.querySelector('#pointer-target').addEventListener('pointerup', event => {
+    window.result.pointer = event.isTrusted;
+  });
+  document.querySelector('#drag-source').addEventListener('dragstart', event => {
+    window.result.dragged = event.isTrusted;
+    event.dataTransfer.setData('text/plain', 'architecture-drag');
+  });
+  document.querySelector('#drop-target').addEventListener('dragover', event => event.preventDefault());
+  document.querySelector('#drop-target').addEventListener('drop', event => {
+    event.preventDefault();
+    window.result.dropData = event.dataTransfer.getData('text/plain');
+  });
+  window.captureReleasedPointer = () => {
+    document.querySelector('#drop-target').addEventListener('pointermove', event => {
+      window.result.releaseButtons = event.buttons;
+    }, {once: true});
+  };
+  window.makeLargeDownload = () => {
+    const size = 9 * 1024 * 1024 + 123;
+    const bytes = new Uint8Array(size);
+    for (let index = 0; index < bytes.length; index++) bytes[index] = index % 251;
+    if (window.largeDownloadUrl) URL.revokeObjectURL(window.largeDownloadUrl);
+    window.largeDownloadUrl = URL.createObjectURL(new Blob([bytes], {type: 'application/octet-stream'}));
+    document.querySelector('#download').href = window.largeDownloadUrl;
+    return size;
+  };
+</script>
