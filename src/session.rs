@@ -13,6 +13,8 @@ use crate::hint::hint_error;
 use crate::selector::{ElementProbe, ElementSelector};
 use crate::state;
 
+pub(crate) mod recording;
+
 pub const RDNY_INSTRUMENTATION_VERSION: u32 = 2;
 pub const RDNY_INSTRUMENTATION_SCRIPT: &str = r#"(() => {
     const key = Symbol.for('rdny.wait.instrumentation.v1');
@@ -194,7 +196,7 @@ mod tests {
         assert!(session.is_recording());
         assert_eq!(session.instance_id(), Some("instance"));
         assert_eq!(session.target_id(), "target");
-        let context = session.artifact_context().unwrap();
+        let context = session.page_identity().unwrap();
         assert_eq!(context.instance.as_deref(), Some("instance"));
         assert_eq!(context.target.as_deref(), Some("target"));
         assert_eq!(context.url.as_deref(), Some("ok"));
@@ -443,6 +445,14 @@ pub struct PageSession {
     /// Overall budget for waiting-style commands (from --timeout).
     pub timeout: Duration,
     deadline: Deadline,
+}
+
+/// Identity owned by a live page session, independent of command output DTOs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PageIdentity {
+    pub instance: Option<String>,
+    pub target: Option<String>,
+    pub url: Option<String>,
 }
 
 /// Load the session state, connect, and attach to the current page.
@@ -758,9 +768,7 @@ impl PageSession {
         let Some(frames_dir) = self.frames_dir.as_ref() else {
             return Ok(false);
         };
-        if let Some(ack_id) =
-            crate::commands::video::handle_screencast_frame(&event.params, frames_dir)?
-        {
+        if let Some(ack_id) = recording::ingest_screencast_frame(&event.params, frames_dir)? {
             self.call_until(
                 "Page.screencastFrameAck",
                 json!({"sessionId": ack_id.parse::<i64>().unwrap_or_default()}),
@@ -786,14 +794,14 @@ impl PageSession {
     }
 
     /// Capture page identity before a live page produces an artifact.
-    pub fn artifact_context(&mut self) -> Result<crate::commands::artifacts::ArtifactContext> {
+    pub fn page_identity(&mut self) -> Result<PageIdentity> {
         let url = self
             .eval("location.href")?
             .as_str()
             .filter(|value| !value.is_empty())
             .context("location.href did not return the current page URL")?
             .to_string();
-        Ok(crate::commands::artifacts::ArtifactContext {
+        Ok(PageIdentity {
             instance: self.instance_id().map(str::to_string),
             target: Some(self.target_id().to_string()),
             url: Some(url),
@@ -802,13 +810,13 @@ impl PageSession {
 
     /// Capture optional context for recovery paths that must succeed without a
     /// responsive browser.
-    pub fn artifact_context_best_effort(&mut self) -> crate::commands::artifacts::ArtifactContext {
+    pub fn page_identity_best_effort(&mut self) -> PageIdentity {
         let url = self
             .eval("location.href")
             .ok()
             .and_then(|value| value.as_str().map(str::to_string))
             .filter(|value| !value.is_empty());
-        crate::commands::artifacts::ArtifactContext {
+        PageIdentity {
             instance: self.instance_id().map(str::to_string),
             target: Some(self.target_id().to_string()),
             url,

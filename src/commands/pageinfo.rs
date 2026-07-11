@@ -66,7 +66,7 @@ pub fn pdf(sess: &mut PageSession, file: Option<&Path>, force: bool) -> Result<P
     let path = file
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("page.pdf"));
-    let context = sess.artifact_context()?;
+    let context = sess.page_identity()?.into();
     let result = sess.call("Page.printToPDF", json!({}))?;
     let data = result["data"]
         .as_str()

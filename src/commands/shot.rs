@@ -19,7 +19,7 @@ pub fn screenshot(
     force: bool,
     persisted_viewport: Option<&ViewportOverride>,
 ) -> Result<ProducedArtifact> {
-    let context = sess.artifact_context()?;
+    let context = sess.page_identity()?.into();
     let override_set = width.is_some() || height.is_some();
     if override_set {
         let w = match width {
@@ -55,7 +55,7 @@ pub fn screenshot_el(
     file: Option<&Path>,
     force: bool,
 ) -> Result<ProducedArtifact> {
-    let context = sess.artifact_context()?;
+    let context = sess.page_identity()?.into();
     let object_id = sess.element(selector)?;
     let _ = sess.call("DOM.scrollIntoViewIfNeeded", json!({"objectId": object_id}));
     let result = sess.call("DOM.getBoxModel", json!({"objectId": object_id}))?;

@@ -30,6 +30,16 @@ pub struct ArtifactContext {
     pub url: Option<String>,
 }
 
+impl From<crate::session::PageIdentity> for ArtifactContext {
+    fn from(identity: crate::session::PageIdentity) -> Self {
+        Self {
+            instance: identity.instance,
+            target: identity.target,
+            url: identity.url,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HumanArtifactOutput {
     Saved,

@@ -80,7 +80,7 @@ pub fn download(
     force: bool,
     max_bytes: Option<u64>,
 ) -> Result<Option<ProducedArtifact>> {
-    let context = _sess.artifact_context()?;
+    let context = _sess.page_identity()?.into();
     let id = _sess.element(_selector)?;
     let url_value = _sess.call_on(
         &id,
