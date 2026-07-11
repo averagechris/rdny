@@ -27,6 +27,9 @@
 - Documented US-layout key semantics and extended real-browser smoke coverage for
   key press/release, implied shifted punctuation, modifier release, and bounded
   drag cleanup (~averagechris/projects#223).
+- Documented bounded download streaming and expanded real-browser smoke coverage
+  for payloads above CDP message limits, exact bytes, max-failure cleanup, and
+  raw stdout purity (~averagechris/projects#222).
 - Made `rdny cleanup` preserve inconclusive attached-session probes by default
   and documented `--all` as the explicit state-removal override
   (~averagechris/projects#220).

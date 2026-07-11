@@ -480,6 +480,37 @@ for structured_format in json jsonl; do
   fi
   expect_contains "$structured_format omitted-FILE rejection" "raw bytes" "$raw_structured_error"
 done
+"${RDNY[@]}" js 'window.largeDownloadBytes = 9 * 1024 * 1024 + 123; const bytes = new Uint8Array(window.largeDownloadBytes); for (let i = 0; i < bytes.length; i++) bytes[i] = i % 251; const blob = new Blob([bytes], {type: "application/octet-stream"}); const link = document.querySelector("#link"); if (window.largeDownloadUrl) URL.revokeObjectURL(window.largeDownloadUrl); window.largeDownloadUrl = URL.createObjectURL(blob); link.href = window.largeDownloadUrl;' >/dev/null
+"${RDNY[@]}" download "#link" --max-bytes 10485900 "$workdir/download-large.bin" >/dev/null
+python3 - "$workdir/download-large.bin" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+data = path.read_bytes()
+expected = 9 * 1024 * 1024 + 123
+if len(data) != expected:
+    raise SystemExit(f"large download length: expected {expected}, got {len(data)}")
+for index in (0, 1, 1024, len(data) - 1):
+    if data[index] != index % 251:
+        raise SystemExit(f"large download byte {index}: expected {index % 251}, got {data[index]}")
+PY
+echo "smoke: ok: large download exact artifact bytes"
+if large_max_error=$("${RDNY[@]}" download "#link" --max-bytes 1048576 "$workdir/download-too-large.bin" 2>&1); then
+  fail "large download over max should fail"
+fi
+expect_contains "large download max failure names limit" "exceeds max" "$large_max_error"
+[[ ! -e "$workdir/download-too-large.bin" ]] || fail "large download max failure published a file"
+"${RDNY[@]}" download "#link" --max-bytes 10485900 - >"$workdir/download-large-raw.bin"
+python3 - "$workdir/download-large-raw.bin" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+data = path.read_bytes()
+expected = 9 * 1024 * 1024 + 123
+if len(data) != expected:
+    raise SystemExit(f"raw large download length: expected {expected}, got {len(data)}")
+if data[:4] != bytes([0, 1, 2, 3]) or data[-1] != (expected - 1) % 251:
+    raise SystemExit("raw large download bytes were not pure payload")
+PY
+echo "smoke: ok: large raw stdout is pure payload"
 
 # --- video ------------------------------------------------------------
 "${RDNY[@]}" start-video

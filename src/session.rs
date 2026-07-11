@@ -902,4 +902,78 @@ impl PageSession {
         check_exception(&result, "js exception")?;
         Ok(result["result"]["value"].clone())
     }
+
+    /// Call a JS function with the resolved element bound to `this`, returning
+    /// the resulting remote object id instead of serializing it by value.
+    pub fn call_on_object(
+        &mut self,
+        object_id: &str,
+        function: &str,
+        args: &[Value],
+    ) -> Result<String> {
+        let arguments: Vec<Value> = args.iter().map(|v| json!({ "value": v })).collect();
+        let result = self.call(
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId": object_id,
+                "functionDeclaration": function,
+                "arguments": arguments,
+                "returnByValue": false,
+                "awaitPromise": true,
+            }),
+        )?;
+        check_exception(&result, "js exception")?;
+        result["result"]["objectId"]
+            .as_str()
+            .map(str::to_string)
+            .context("remote object result missing objectId")
+    }
+
+    /// Call a JS function with an arbitrary remote object bound to `this`.
+    pub fn call_remote_object(
+        &mut self,
+        object_id: &str,
+        function: &str,
+        args: &[Value],
+    ) -> Result<Value> {
+        self.call_on(object_id, function, args)
+    }
+
+    /// Call a JS function with an arbitrary remote object within an absolute deadline.
+    pub fn call_remote_object_until(
+        &mut self,
+        object_id: &str,
+        function: &str,
+        args: &[Value],
+        deadline: Deadline,
+    ) -> Result<Value> {
+        let arguments: Vec<Value> = args.iter().map(|v| json!({ "value": v })).collect();
+        let result = self.call_until(
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId": object_id,
+                "functionDeclaration": function,
+                "arguments": arguments,
+                "returnByValue": true,
+                "awaitPromise": true,
+            }),
+            deadline,
+        )?;
+        check_exception(&result, "js exception")?;
+        Ok(result["result"]["value"].clone())
+    }
+
+    /// Best-effort release of a Runtime remote object within an absolute deadline.
+    pub fn release_remote_object_until(
+        &mut self,
+        object_id: &str,
+        deadline: Deadline,
+    ) -> Result<()> {
+        self.call_until(
+            "Runtime.releaseObject",
+            json!({ "objectId": object_id }),
+            deadline,
+        )?;
+        Ok(())
+    }
 }

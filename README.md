@@ -302,8 +302,15 @@ default, including symlinks. Pass `--force` to replace an output intentionally.
 Downloads perform a best-effort `HEAD` preflight and reject payloads larger than
 256 MiB by default before fetching when `Content-Length` is available. Use
 `rdny download --max-bytes N ...` or `RDNY_MAX_DOWNLOAD_BYTES=N` to tune this.
-Fetched chunks are decoded and written incrementally to the reserved artifact (or
-stdout) instead of materializing additional full output copies in Rust.
+The browser fetch is pulled through a managed remote stream in bounded chunks,
+then decoded and written incrementally to the reserved artifact (or stdout)
+instead of returning one full payload through a CDP WebSocket message or
+materializing additional full output copies in Rust. The remote stream object is
+canceled and released on success or failure. Artifact files are reserved under a
+temporary name and published only after the full payload is accepted, so max-byte
+or midstream failures do not leave a partial published file. Human raw stdout for
+omitted `FILE` or `FILE=-` contains only the downloaded bytes; progress,
+warnings, and diagnostics stay on stderr.
 
 Machine-readable command output is selected globally with
 `--format human|json|jsonl`. Supported schemas are versioned with
