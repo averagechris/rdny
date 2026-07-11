@@ -308,8 +308,16 @@ fn observe(pid: u32) -> Result<Option<Observed>> {
         .nth(19)
         .context("missing proc starttime")?
         .parse()?;
-    let exe = std::fs::read_link(format!("/proc/{pid}/exe"))?;
-    let raw = std::fs::read(format!("/proc/{pid}/cmdline"))?;
+    let exe = match std::fs::read_link(format!("/proc/{pid}/exe")) {
+        Ok(exe) => exe,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let raw = match std::fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
     let argv = parse_nul_argv(&raw);
     Ok(Some(Observed {
         start_time,
