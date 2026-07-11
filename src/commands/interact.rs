@@ -22,10 +22,11 @@ pub fn js(sess: &mut PageSession, expression: &str) -> Result<()> {
 /// Click the first selector match (real mouse events).
 pub fn click(_sess: &mut PageSession, _selector: &ElementSelector) -> Result<()> {
     let id = _sess.element(_selector)?;
-    let (x, y) = _sess.element_center(&id)?;
-    dispatch_mouse(_sess, "mouseMoved", x, y, None)?;
-    dispatch_mouse(_sess, "mousePressed", x, y, Some("left"))?;
-    dispatch_mouse(_sess, "mouseReleased", x, y, Some("left"))?;
+    let point = _sess.element_action_point(&id)?;
+    dispatch_mouse(_sess, "mouseMoved", point.x, point.y, None)?;
+    _sess.revalidate_element_action_point(&id, point)?;
+    dispatch_mouse(_sess, "mousePressed", point.x, point.y, Some("left"))?;
+    dispatch_mouse(_sess, "mouseReleased", point.x, point.y, Some("left"))?;
     Ok(())
 }
 
@@ -182,8 +183,8 @@ pub fn submit(_sess: &mut PageSession, _selector: &ElementSelector) -> Result<()
 /// Hover over the first selector match (real mouse events).
 pub fn hover(_sess: &mut PageSession, _selector: &ElementSelector) -> Result<()> {
     let id = _sess.element(_selector)?;
-    let (x, y) = _sess.element_center(&id)?;
-    dispatch_mouse(_sess, "mouseMoved", x, y, None)?;
+    let point = _sess.element_action_point(&id)?;
+    dispatch_mouse(_sess, "mouseMoved", point.x, point.y, None)?;
     Ok(())
 }
 

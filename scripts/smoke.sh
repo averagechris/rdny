@@ -127,11 +127,27 @@ page="$workdir/page.html"
 cat >"$page" <<'HTML'
 <!DOCTYPE html>
 <html>
-  <head><title>rdny smoke</title></head>
+  <head>
+    <title>rdny smoke</title>
+    <style>
+      .interaction-fixture { display: none; position: fixed; z-index: 100; }
+      #child-hit { left: 20px; top: 100px; width: 140px; height: 44px; }
+      #child-hit > span { position: absolute; inset: 0; display: grid; place-items: center; }
+      #partially-visible { left: -80px; top: 180px; width: 100px; height: 44px; }
+      #occluded-fixture { left: 20px; top: 100px; width: 140px; height: 44px; }
+      #occluded-button, #occluder { position: absolute; inset: 0; }
+      #occluder { z-index: 1; background: rgba(0, 0, 0, 0.1); }
+      #pointer-fixture { left: 20px; top: 100px; width: 140px; height: 44px; }
+      #pointer-underlay, #pointer-none { position: absolute; inset: 0; }
+      #pointer-none { z-index: 1; pointer-events: none; }
+      #detached-target { left: 20px; top: 100px; width: 140px; height: 44px; }
+      outer-shell, slot-shell { display: inline-block; }
+    </style>
+  </head>
   <body>
     <h1 id="heading">Smoke Page</h1>
     <a id="link" href="data:text/plain;base64,U21va2UgZG93bmxvYWQK">a link</a>
-    <button id="btn" onclick="document.title = 'clicked'">press</button>
+    <button id="btn">press</button>
     <form id="f" onsubmit="event.preventDefault(); document.title = 'submitted'">
       <input id="name" type="text">
       <select id="pet">
@@ -139,15 +155,68 @@ cat >"$page" <<'HTML'
         <option value="dog">dog</option>
       </select>
     </form>
+    <button id="child-hit" class="interaction-fixture"><span>child covers button</span></button>
+    <button id="partially-visible" class="interaction-fixture">visible edge</button>
+    <div id="occluded-fixture" class="interaction-fixture">
+      <button id="occluded-button" class="blocked primary">blocked target</button>
+      <div id="occluder" class="cover modal"></div>
+    </div>
+    <div id="pointer-fixture" class="interaction-fixture">
+      <button id="pointer-underlay">underlay</button>
+      <button id="pointer-none" class="disabled-target">no pointer events</button>
+    </div>
+    <button id="detached-target" class="interaction-fixture">detach on move</button>
+    <slot-shell id="slot-host"><button id="slotted-button"><span>slotted child</span></button></slot-shell>
     <outer-shell id="shadow-outer"></outer-shell>
     <script>
+      window.interactions = {
+        ordinaryTrusted: false,
+        hoverTrusted: false,
+        childTrusted: false,
+        partialTrusted: false,
+        occludedClicks: 0,
+        occluderClicks: 0,
+        pointerNoneClicks: 0,
+        pointerUnderlayClicks: 0,
+        detachedMoves: 0,
+        detachedClicks: 0,
+        slotTrusted: false,
+      };
+      const ordinary = document.querySelector('#btn');
+      ordinary.addEventListener('click', (event) => {
+        window.interactions.ordinaryTrusted = event.isTrusted;
+        document.title = 'clicked';
+      });
+      ordinary.addEventListener('mouseover', (event) => {
+        window.interactions.hoverTrusted = event.isTrusted;
+      });
+      document.querySelector('#child-hit').addEventListener('click', (event) => {
+        window.interactions.childTrusted = event.isTrusted && event.target.localName === 'span';
+      });
+      document.querySelector('#partially-visible').addEventListener('click', (event) => {
+        window.interactions.partialTrusted = event.isTrusted;
+      });
+      document.querySelector('#occluded-button').addEventListener('click', () => window.interactions.occludedClicks++);
+      document.querySelector('#occluder').addEventListener('click', () => window.interactions.occluderClicks++);
+      document.querySelector('#pointer-none').addEventListener('click', () => window.interactions.pointerNoneClicks++);
+      document.querySelector('#pointer-underlay').addEventListener('click', () => window.interactions.pointerUnderlayClicks++);
+      const detached = document.querySelector('#detached-target');
+      detached.addEventListener('mousemove', () => {
+        window.interactions.detachedMoves++;
+        detached.remove();
+      });
+      detached.addEventListener('click', () => window.interactions.detachedClicks++);
+      document.querySelector('#slot-host').attachShadow({mode: 'open'}).innerHTML = '<slot style="display: inline-block"></slot>';
+      document.querySelector('#slotted-button').addEventListener('click', (event) => {
+        window.interactions.slotTrusted = event.isTrusted && event.target.localName === 'span';
+      });
       const outerRoot = document.querySelector('#shadow-outer').attachShadow({mode: 'open'});
       outerRoot.innerHTML = '<inner-shell id="shadow-inner"></inner-shell>';
       const innerRoot = outerRoot.querySelector('#shadow-inner').attachShadow({mode: 'open'});
       window.installShadowButton = () => {
         const button = document.createElement('button');
         button.id = 'shadow-button';
-        button.textContent = 'Nested shadow ready';
+        button.innerHTML = '<span>Nested shadow ready</span>';
         button.onclick = () => { document.title = 'shadow clicked'; };
         innerRoot.appendChild(button);
       };
@@ -233,6 +302,35 @@ expect_contains "html page" "</html>" "$("${RDNY[@]}" html)"
 # --- interaction -----------------------------------------------------
 "${RDNY[@]}" click "#btn"
 expect "click fired" "clicked" "$("${RDNY[@]}" js 'document.title')"
+expect "click stays trusted" "true" "$("${RDNY[@]}" js 'window.interactions.ordinaryTrusted')"
+"${RDNY[@]}" js "document.querySelector('#child-hit').style.display = 'block'" >/dev/null
+"${RDNY[@]}" click "#child-hit"
+expect "composed child hit accepted" "true" "$("${RDNY[@]}" js 'window.interactions.childTrusted')"
+"${RDNY[@]}" click --pierce "#slot-host >>> slot"
+expect "slotted composed child hit accepted" "true" "$("${RDNY[@]}" js 'window.interactions.slotTrusted')"
+"${RDNY[@]}" js "document.querySelector('#child-hit').style.display = 'none'; document.querySelector('#partially-visible').style.display = 'block'" >/dev/null
+"${RDNY[@]}" click "#partially-visible"
+expect "viewport-clipped visible point clicked" "true" "$("${RDNY[@]}" js 'window.interactions.partialTrusted')"
+"${RDNY[@]}" js "document.querySelector('#partially-visible').style.display = 'none'; document.querySelector('#occluded-fixture').style.display = 'block'" >/dev/null
+if occluded_error=$("${RDNY[@]}" click "#occluded-button" 2>&1); then
+  fail "fully occluded target should fail before dispatch"
+fi
+expect_contains "occlusion names selected target" "button#occluded-button.blocked.primary" "$occluded_error"
+expect_contains "occlusion names intercepting target" "div#occluder.cover.modal" "$occluded_error"
+expect "occlusion dispatches no click" "0,0" "$("${RDNY[@]}" js '[window.interactions.occludedClicks, window.interactions.occluderClicks].join()')"
+"${RDNY[@]}" js "document.querySelector('#occluded-fixture').style.display = 'none'; document.querySelector('#pointer-fixture').style.display = 'block'" >/dev/null
+if pointer_error=$("${RDNY[@]}" click "#pointer-none" 2>&1); then
+  fail "pointer-events none target should fail before dispatch"
+fi
+expect_contains "pointer-events failure names selected" "button#pointer-none.disabled-target" "$pointer_error"
+expect_contains "pointer-events failure names underlay" "button#pointer-underlay" "$pointer_error"
+expect "pointer-events failure dispatches no click" "0,0" "$("${RDNY[@]}" js '[window.interactions.pointerNoneClicks, window.interactions.pointerUnderlayClicks].join()')"
+"${RDNY[@]}" js "document.querySelector('#pointer-fixture').style.display = 'none'; document.querySelector('#detached-target').style.display = 'block'" >/dev/null
+if detached_error=$("${RDNY[@]}" click "#detached-target" 2>&1); then
+  fail "target detached by mouse movement should fail before press"
+fi
+expect_contains "detached target fails actionably" "button#detached-target.interaction-fixture became detached" "$detached_error"
+expect "detachment happened before click" "1,0" "$("${RDNY[@]}" js '[window.interactions.detachedMoves, window.interactions.detachedClicks].join()')"
 "${RDNY[@]}" input "#name" "hello smoke"
 expect "input typed" "hello smoke" "$("${RDNY[@]}" js "document.querySelector('#name').value")"
 "${RDNY[@]}" clear "#name"
@@ -242,6 +340,7 @@ expect "select" "dog" "$("${RDNY[@]}" js "document.querySelector('#pet').value")
 "${RDNY[@]}" focus "#name"
 expect "focus" "name" "$("${RDNY[@]}" js 'document.activeElement.id')"
 "${RDNY[@]}" hover "#btn"
+expect "hover stays trusted" "true" "$("${RDNY[@]}" js 'window.interactions.hoverTrusted')"
 "${RDNY[@]}" submit "#f"
 expect "submit" "submitted" "$("${RDNY[@]}" js 'document.title')"
 expect "js math" "3" "$("${RDNY[@]}" js '1+2')"

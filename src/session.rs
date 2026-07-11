@@ -309,6 +309,77 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[test]
+    fn action_point_and_revalidation_reuse_the_resolved_remote_node() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = accept(stream).unwrap();
+
+            let resolve = read_json_message(&mut socket);
+            assert_eq!(resolve["method"], "Runtime.evaluate");
+            socket
+                .send(Message::Text(
+                    format!(
+                        r#"{{"id":{},"result":{{"result":{{"type":"object","subtype":"node","objectId":"selected-node"}}}}}}"#,
+                        resolve["id"]
+                    )
+                    .into(),
+                ))
+                .unwrap();
+
+            let geometry = read_json_message(&mut socket);
+            assert_eq!(geometry["method"], "Runtime.callFunctionOn");
+            assert_eq!(geometry["params"]["objectId"], "selected-node");
+            assert_eq!(geometry["params"]["returnByValue"], true);
+            assert_eq!(geometry["params"]["arguments"][0]["value"], "resolve");
+            assert_eq!(geometry["params"]["arguments"][1]["value"], Value::Null);
+            assert!(
+                geometry["params"]["functionDeclaration"]
+                    .as_str()
+                    .unwrap()
+                    .contains("const isComposedDescendant")
+            );
+            socket
+                .send(Message::Text(
+                    format!(
+                        r#"{{"id":{},"result":{{"result":{{"type":"object","value":{{"status":"ready","x":10.5,"y":20.25,"selected":{{"tag":"button","id":"save","classes":[]}}}}}}}}}}"#,
+                        geometry["id"]
+                    )
+                    .into(),
+                ))
+                .unwrap();
+
+            let revalidate = read_json_message(&mut socket);
+            assert_eq!(revalidate["method"], "Runtime.callFunctionOn");
+            assert_eq!(revalidate["params"]["objectId"], "selected-node");
+            assert_eq!(revalidate["params"]["arguments"][0]["value"], "validate");
+            assert_eq!(revalidate["params"]["arguments"][1]["value"], 10.5);
+            assert_eq!(revalidate["params"]["arguments"][2]["value"], 20.25);
+            socket
+                .send(Message::Text(
+                    format!(
+                        r#"{{"id":{},"result":{{"result":{{"type":"object","value":{{"status":"ready","x":10.5,"y":20.25,"selected":{{"tag":"button","id":"save","classes":[]}}}}}}}}}}"#,
+                        revalidate["id"]
+                    )
+                    .into(),
+                ))
+                .unwrap();
+        });
+
+        let mut session = test_page_session(port);
+        let selector = ElementSelector::parse("#save", false).unwrap();
+        let id = session.element(&selector).unwrap();
+        let point = session.element_action_point(&id).unwrap();
+        assert_eq!(
+            point,
+            crate::interaction_target::ActionPoint { x: 10.5, y: 20.25 }
+        );
+        session.revalidate_element_action_point(&id, point).unwrap();
+        server.join().unwrap();
+    }
+
     fn read_json_message(socket: &mut tungstenite::WebSocket<std::net::TcpStream>) -> Value {
         match socket.read().unwrap() {
             Message::Text(text) => serde_json::from_str(&text).unwrap(),
@@ -814,24 +885,5 @@ impl PageSession {
         )?;
         check_exception(&result, "js exception")?;
         Ok(result["result"]["value"].clone())
-    }
-
-    /// Viewport center of the element's content box, after scrolling it
-    /// into view. Used for real mouse-event dispatch.
-    pub fn element_center(&mut self, object_id: &str) -> Result<(f64, f64)> {
-        // Best effort: not all targets support it, and getBoxModel will
-        // fail loudly enough if the element is unrenderable.
-        let _ = self.call(
-            "DOM.scrollIntoViewIfNeeded",
-            json!({ "objectId": object_id }),
-        );
-        let result = self.call("DOM.getBoxModel", json!({ "objectId": object_id }))?;
-        let quad = result["model"]["content"]
-            .as_array()
-            .context("element has no box model (is it rendered?)")?;
-        let coord = |i: usize| quad.get(i).and_then(Value::as_f64).unwrap_or(0.0);
-        let x = (coord(0) + coord(2) + coord(4) + coord(6)) / 4.0;
-        let y = (coord(1) + coord(3) + coord(5) + coord(7)) / 4.0;
-        Ok((x, y))
     }
 }
