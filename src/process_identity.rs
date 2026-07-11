@@ -748,7 +748,10 @@ mod tests {
         terminate(&id).unwrap();
         let identity_gone = !matches_identity(pid, &id).unwrap();
         let _ = child.wait();
-        assert_eq!(observed_executable.file_name(), Some(OsStr::new("sleep")));
+        assert_eq!(
+            observed_executable.file_name(),
+            Some(std::ffi::OsStr::new("sleep"))
+        );
         assert_ne!(launcher, observed_executable);
         assert!(identity_matches);
         assert!(identity_gone);
