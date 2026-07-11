@@ -41,6 +41,15 @@ Generated artifacts in this directory include shot.png, shot-el.png, page.pdf,
 video-frame.png, and smoke.mp4 when smoke reaches those steps.
 EOF
 
+# Never publish the browser profile or session state: they are large and may
+# contain sensitive browser data. Keep the launch log as a small diagnostic.
+if [[ $status -eq 0 && -d "$RDNY_SMOKE_WORKDIR/state" ]]; then
+  if [[ -f "$RDNY_SMOKE_WORKDIR/state/chrome.log" ]]; then
+    cp "$RDNY_SMOKE_WORKDIR/state/chrome.log" "$RDNY_SMOKE_WORKDIR/chrome.log"
+  fi
+  rm -rf "$RDNY_SMOKE_WORKDIR/state"
+fi
+
 if [[ $status -ne 0 ]]; then
   printf 'ci-smoke: recorded failure status %s; preserving artifacts in %s\n' "$status" "$RDNY_SMOKE_WORKDIR" >&2
   printf 'ci-smoke: begin captured smoke log\n' >&2
