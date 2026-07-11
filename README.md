@@ -117,9 +117,12 @@ rdny key 'Meta+ArrowLeft'
 
 Modifier names are `Control`/`Ctrl`, `Shift`, `Alt`/`Option`, and
 `Meta`/`Cmd`/`Command` (case-insensitive). Common navigation, editing, function,
-letter, digit, and punctuation keys are supported. Use names such as `Space`,
-`Plus`, or `Slash` where punctuation would make a chord ambiguous. Empty chord
-segments, duplicate modifiers, unknown names, modifier-only chords, and multiple
+letter, digit, and punctuation keys are supported using Chrome's US-keyboard
+physical codes. Use names such as `Space`, `Plus`, `QuestionMark`, or `Slash`
+where punctuation would make a chord ambiguous; shifted punctuation names such as
+`Plus` send the physical base key (`Equal`) with `Shift` for the press and
+release the implied modifier before the command returns. Empty chord segments,
+duplicate modifiers, unknown names, modifier-only chords, and multiple
 non-modifier keys are rejected before browser input is sent. Unlike `rdny input`,
 which inserts arbitrary text into an element, `rdny key` models physical key
 down/up events and shortcuts.

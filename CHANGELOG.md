@@ -24,6 +24,9 @@
   `--format json|jsonl` to commands without structured schemas must remove it or
   switch to one of the documented structured commands
   (~averagechris/projects#221, ~averagechris/projects#225).
+- Documented US-layout key semantics and extended real-browser smoke coverage for
+  key press/release, implied shifted punctuation, modifier release, and bounded
+  drag cleanup (~averagechris/projects#223).
 - Made `rdny cleanup` preserve inconclusive attached-session probes by default
   and documented `--all` as the explicit state-removal override
   (~averagechris/projects#220).

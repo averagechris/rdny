@@ -45,6 +45,7 @@ struct KeyDefinition {
     text: String,
     shifted_text: Option<String>,
     location: u8,
+    required_modifiers: u8,
 }
 
 impl KeyDefinition {
@@ -57,6 +58,7 @@ impl KeyDefinition {
             text: String::new(),
             shifted_text: None,
             location: 0,
+            required_modifiers: 0,
         }
     }
 
@@ -69,6 +71,7 @@ impl KeyDefinition {
             text: key.to_string(),
             shifted_text: shifted.map(|value| value.to_string()),
             location: 0,
+            required_modifiers: 0,
         }
     }
 
@@ -173,6 +176,7 @@ impl FromStr for KeyChord {
 
             let parsed = parse_primary_key(segment)
                 .with_context(|| format!("invalid key chord segment `{segment}`"))?;
+            modifiers |= parsed.required_modifiers;
             if primary.replace(parsed).is_some() {
                 bail!("key chord contains more than one non-modifier key");
             }
@@ -308,31 +312,33 @@ fn parse_named_punctuation(value: &str) -> Result<KeyDefinition> {
         return Ok(key);
     }
 
-    let (character, code, vk) = match value {
-        "plus" => ('+', "Equal", 187),
-        "tilde" => ('~', "Backquote", 192),
-        "underscore" => ('_', "Minus", 189),
-        "braceleft" | "leftbrace" => ('{', "BracketLeft", 219),
-        "braceright" | "rightbrace" => ('}', "BracketRight", 221),
-        "pipe" => ('|', "Backslash", 220),
-        "colon" => (':', "Semicolon", 186),
-        "doublequote" => ('"', "Quote", 222),
-        "lessthan" => ('<', "Comma", 188),
-        "greaterthan" => ('>', "Period", 190),
-        "question" | "questionmark" => ('?', "Slash", 191),
-        "exclamation" | "exclamationmark" => ('!', "Digit1", 49),
-        "at" | "atsign" => ('@', "Digit2", 50),
-        "hash" | "numbersign" => ('#', "Digit3", 51),
-        "dollar" => ('$', "Digit4", 52),
-        "percent" => ('%', "Digit5", 53),
-        "caret" => ('^', "Digit6", 54),
-        "ampersand" => ('&', "Digit7", 55),
-        "asterisk" => ('*', "Digit8", 56),
-        "parenthesisleft" | "leftparen" => ('(', "Digit9", 57),
-        "parenthesisright" | "rightparen" => (')', "Digit0", 48),
+    let (base, shifted, code, vk) = match value {
+        "plus" => ('=', '+', "Equal", 187),
+        "tilde" => ('`', '~', "Backquote", 192),
+        "underscore" => ('-', '_', "Minus", 189),
+        "braceleft" | "leftbrace" => ('[', '{', "BracketLeft", 219),
+        "braceright" | "rightbrace" => (']', '}', "BracketRight", 221),
+        "pipe" => ('\\', '|', "Backslash", 220),
+        "colon" => (';', ':', "Semicolon", 186),
+        "doublequote" => ('\'', '"', "Quote", 222),
+        "lessthan" => (',', '<', "Comma", 188),
+        "greaterthan" => ('.', '>', "Period", 190),
+        "question" | "questionmark" => ('/', '?', "Slash", 191),
+        "exclamation" | "exclamationmark" => ('1', '!', "Digit1", 49),
+        "at" | "atsign" => ('2', '@', "Digit2", 50),
+        "hash" | "numbersign" => ('3', '#', "Digit3", 51),
+        "dollar" => ('4', '$', "Digit4", 52),
+        "percent" => ('5', '%', "Digit5", 53),
+        "caret" => ('6', '^', "Digit6", 54),
+        "ampersand" => ('7', '&', "Digit7", 55),
+        "asterisk" => ('8', '*', "Digit8", 56),
+        "parenthesisleft" | "leftparen" => ('9', '(', "Digit9", 57),
+        "parenthesisright" | "rightparen" => ('0', ')', "Digit0", 48),
         _ => bail!("unknown key name `{value}`"),
     };
-    Ok(KeyDefinition::direct_printable(character, code, vk))
+    let mut key = KeyDefinition::printable(base, Some(shifted), code, vk);
+    key.required_modifiers = MOD_SHIFT;
+    Ok(key)
 }
 
 fn modifier_key_payload(event_type: &str, modifier: Modifier, modifiers: u8) -> Value {
@@ -418,11 +424,12 @@ pub(crate) fn key(sess: &mut PageSession, chord: &KeyChord) -> Result<()> {
         }
     }
 
+    let cleanup_deadline = Deadline::after(CLEANUP_TIMEOUT);
     if primary_attempted
         && let Err(error) = dispatch_key_payload(
             sess,
             primary_key_payload("keyUp", chord, false),
-            Deadline::after(CLEANUP_TIMEOUT),
+            cleanup_deadline,
         )
     {
         if primary_error.is_some() {
@@ -437,7 +444,7 @@ pub(crate) fn key(sess: &mut PageSession, chord: &KeyChord) -> Result<()> {
         if let Err(error) = dispatch_key_payload(
             sess,
             modifier_key_payload("keyUp", modifier, active),
-            Deadline::after(CLEANUP_TIMEOUT),
+            cleanup_deadline,
         ) {
             if primary_error.is_some() {
                 cleanup_errors
@@ -875,11 +882,12 @@ pub(crate) fn pointer_down(
         target.point,
         sess.deadline(),
     ) {
+        let cleanup_deadline = Deadline::after(CLEANUP_TIMEOUT);
         let cleanup = dispatch_mouse(
             sess,
             MouseEventKind::Released { button },
             target.point,
-            Deadline::after(CLEANUP_TIMEOUT),
+            cleanup_deadline,
         )
         .context("releasing mouse button after ambiguous press failure")
         .err()
@@ -942,11 +950,12 @@ pub(crate) fn pointer_click(
     {
         primary_error = Some(error.context("revalidating click target before release"));
     }
+    let cleanup_deadline = Deadline::after(CLEANUP_TIMEOUT);
     let release = dispatch_mouse(
         sess,
         MouseEventKind::Released { button },
         target.point,
-        Deadline::after(CLEANUP_TIMEOUT),
+        cleanup_deadline,
     )
     .context("releasing mouse button");
 
@@ -989,7 +998,8 @@ pub(crate) fn drag(
         .context("resetting prior browser drag state")?;
 
     if let Err(primary) = set_drag_interception(sess, true, sess.deadline()) {
-        let cleanup = set_drag_interception(sess, false, Deadline::after(CLEANUP_TIMEOUT))
+        let cleanup_deadline = Deadline::after(CLEANUP_TIMEOUT);
+        let cleanup = set_drag_interception(sess, false, cleanup_deadline)
             .context("disabling drag interception after ambiguous enable failure")
             .err()
             .into_iter()
@@ -1001,12 +1011,13 @@ pub(crate) fn drag(
     }
     if let Err(primary) = install_page_drag_capture(sess) {
         let mut cleanup = Vec::new();
-        if let Err(error) = take_page_drag_data(sess, Deadline::after(CLEANUP_TIMEOUT))
+        let cleanup_deadline = Deadline::after(CLEANUP_TIMEOUT);
+        if let Err(error) = take_page_drag_data(sess, cleanup_deadline)
             .context("removing possibly installed dragstart capture after setup failure")
         {
             cleanup.push(error);
         }
-        if let Err(error) = set_drag_interception(sess, false, Deadline::after(CLEANUP_TIMEOUT))
+        if let Err(error) = set_drag_interception(sess, false, cleanup_deadline)
             .context("disabling drag interception after capture setup failure")
         {
             cleanup.push(error);
@@ -1033,12 +1044,13 @@ pub(crate) fn drag(
     })();
     if let Err(primary) = source_setup {
         let mut cleanup = Vec::new();
-        if let Err(error) = take_page_drag_data(sess, Deadline::after(CLEANUP_TIMEOUT))
+        let cleanup_deadline = Deadline::after(CLEANUP_TIMEOUT);
+        if let Err(error) = take_page_drag_data(sess, cleanup_deadline)
             .context("removing dragstart capture after source setup failure")
         {
             cleanup.push(error);
         }
-        if let Err(error) = set_drag_interception(sess, false, Deadline::after(CLEANUP_TIMEOUT))
+        if let Err(error) = set_drag_interception(sess, false, cleanup_deadline)
             .context("disabling drag interception after source setup failure")
         {
             cleanup.push(error);
@@ -1204,11 +1216,12 @@ pub(crate) fn drag(
     // The press request may have reached Chromium even when its response did
     // not.  Always send release on a fresh, short budget and at the last point
     // whose move was successfully dispatched.
+    let cleanup_deadline = Deadline::after(CLEANUP_TIMEOUT);
     let release = dispatch_mouse(
         sess,
         MouseEventKind::Released { button },
         last_safe_point,
-        Deadline::after(CLEANUP_TIMEOUT),
+        cleanup_deadline,
     )
     .context("releasing mouse button after drag");
     let mut cleanup_errors = Vec::new();
@@ -1219,7 +1232,7 @@ pub(crate) fn drag(
             primary_error = Some(error);
         }
     }
-    if let Err(error) = take_page_drag_data(sess, Deadline::after(CLEANUP_TIMEOUT)) {
+    if let Err(error) = take_page_drag_data(sess, cleanup_deadline) {
         let error = error.context("removing dragstart capture after drag");
         if primary_error.is_some() {
             cleanup_errors.push(error);
@@ -1229,11 +1242,7 @@ pub(crate) fn drag(
     }
     if !drop_dispatched
         && let Err(error) = sess
-            .call_until(
-                "Input.cancelDragging",
-                json!({}),
-                Deadline::after(CLEANUP_TIMEOUT),
-            )
+            .call_until("Input.cancelDragging", json!({}), cleanup_deadline)
             .context("canceling intercepted drag after unsuccessful drop")
     {
         if primary_error.is_some() {
@@ -1242,7 +1251,7 @@ pub(crate) fn drag(
             primary_error = Some(error);
         }
     }
-    if let Err(error) = set_drag_interception(sess, false, Deadline::after(CLEANUP_TIMEOUT))
+    if let Err(error) = set_drag_interception(sess, false, cleanup_deadline)
         .context("disabling drag interception after drag")
     {
         if primary_error.is_some() {
@@ -1371,8 +1380,37 @@ mod tests {
                 .unwrap_or_else(|error| panic!("expected {name} to parse, got {error:#}"));
         }
         let plus: KeyChord = "Plus".parse().unwrap();
-        assert_eq!(plus.primary.key, "+");
+        assert_eq!(plus.primary.effective_key(plus.modifiers), "+");
         assert_eq!(plus.primary.code, "Equal");
+        assert_eq!(plus.modifiers, MOD_SHIFT);
+    }
+
+    #[test]
+    fn shifted_named_punctuation_uses_physical_base_key_plus_shift() {
+        for (name, base, shifted, code, vk) in [
+            ("Plus", "=", "+", "Equal", 187),
+            ("Tilde", "`", "~", "Backquote", 192),
+            ("QuestionMark", "/", "?", "Slash", 191),
+            ("AtSign", "2", "@", "Digit2", 50),
+            ("LeftBrace", "[", "{", "BracketLeft", 219),
+        ] {
+            let chord: KeyChord = name.parse().unwrap();
+            assert_eq!(chord.modifiers, MOD_SHIFT, "{name}");
+            assert_eq!(chord.primary.key, base, "{name}");
+            assert_eq!(
+                chord.primary.shifted_key.as_deref(),
+                Some(shifted),
+                "{name}"
+            );
+            assert_eq!(chord.primary.code, code, "{name}");
+            assert_eq!(chord.primary.windows_virtual_key_code, vk, "{name}");
+            let payload = primary_key_payload("keyDown", &chord, true);
+            assert_eq!(payload["key"], shifted, "{name}");
+            assert_eq!(payload["text"], shifted, "{name}");
+            assert_eq!(payload["unmodifiedText"], base, "{name}");
+        }
+
+        assert!("SectionSign".parse::<KeyChord>().is_err());
     }
 
     #[test]
@@ -1625,6 +1663,109 @@ mod tests {
         assert!(format!("{error:#}").contains("injected key failure"));
         assert!(format!("{error:#}").contains("input cleanup also failed"));
         assert!(format!("{error:#}").contains("injected key release failure"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn key_cleanup_is_bounded_when_release_reply_never_arrives() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = accept(stream).unwrap();
+            for index in 0..4 {
+                let command = read_json_message(&mut socket);
+                let response = if index == 2 {
+                    json!({
+                        "id": command["id"],
+                        "error": {"code": -32000, "message": "primary failed before missing cleanup reply"}
+                    })
+                } else {
+                    json!({"id": command["id"], "result": {}})
+                };
+                if index < 3 {
+                    socket
+                        .send(Message::Text(response.to_string().into()))
+                        .unwrap();
+                } else {
+                    thread::sleep(CLEANUP_TIMEOUT + Duration::from_millis(500));
+                }
+            }
+        });
+
+        let mut session =
+            PageSession::connect_for_input_test(&format!("ws://127.0.0.1:{port}")).unwrap();
+        let chord: KeyChord = "Control+Shift+K".parse().unwrap();
+        let started = Instant::now();
+        let error = key(&mut session, &chord).unwrap_err();
+        assert!(started.elapsed() < CLEANUP_TIMEOUT + Duration::from_millis(750));
+        assert!(format!("{error:#}").contains("pressing primary key"));
+        assert!(format!("{error:#}").contains("input cleanup also failed"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn slow_ambiguous_key_press_does_not_preexpire_cleanup_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = accept(stream).unwrap();
+            let expected = [
+                ("rawKeyDown", "Control", 2),
+                ("rawKeyDown", "Shift", 10),
+                ("rawKeyDown", "K", 10),
+                ("keyUp", "K", 10),
+                ("keyUp", "Shift", 2),
+                ("keyUp", "Control", 0),
+            ];
+            for (index, (event_type, key, modifiers)) in expected.into_iter().enumerate() {
+                let command = read_json_message(&mut socket);
+                assert_eq!(command["method"], "Input.dispatchKeyEvent");
+                assert_eq!(command["params"]["type"], event_type);
+                assert_eq!(command["params"]["key"], key);
+                assert_eq!(command["params"]["modifiers"], modifiers);
+
+                if index == 2 {
+                    thread::sleep(CLEANUP_TIMEOUT - Duration::from_millis(250));
+                    socket
+                        .send(Message::Text(
+                            json!({
+                                "id": command["id"],
+                                "error": {"code": -32000, "message": "slow primary failure"}
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .unwrap();
+                } else if index == 3 {
+                    thread::sleep(Duration::from_millis(400));
+                    socket
+                        .send(Message::Text(
+                            json!({"id": command["id"], "result": {}})
+                                .to_string()
+                                .into(),
+                        ))
+                        .unwrap();
+                } else {
+                    socket
+                        .send(Message::Text(
+                            json!({"id": command["id"], "result": {}})
+                                .to_string()
+                                .into(),
+                        ))
+                        .unwrap();
+                }
+            }
+        });
+
+        let mut session =
+            PageSession::connect_for_input_test(&format!("ws://127.0.0.1:{port}")).unwrap();
+        let chord: KeyChord = "Control+Shift+K".parse().unwrap();
+        let error = key(&mut session, &chord).unwrap_err();
+        assert!(format!("{error:#}").contains("pressing primary key"));
+        assert!(format!("{error:#}").contains("slow primary failure"));
+        assert!(!format!("{error:#}").contains("input cleanup also failed"));
         server.join().unwrap();
     }
 

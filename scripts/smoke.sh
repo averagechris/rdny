@@ -188,7 +188,7 @@ cat >"$page" <<'HTML'
         detachedMoves: 0,
         detachedClicks: 0,
         slotTrusted: false,
-        key: null,
+        keys: [],
         pointerEvents: [],
         drag: {start: false, over: false, drop: false, target: '', data: ''},
       };
@@ -216,17 +216,20 @@ cat >"$page" <<'HTML'
         detached.remove();
       });
       detached.addEventListener('click', () => window.interactions.detachedClicks++);
-      document.querySelector('#key-target').addEventListener('keydown', (event) => {
-        if (event.key === 'K') {
-          window.interactions.key = {
+      for (const type of ['keydown', 'keyup']) {
+        document.querySelector('#key-target').addEventListener(type, (event) => {
+          window.interactions.keys.push({
+            type,
             trusted: event.isTrusted,
             key: event.key,
             code: event.code,
             control: event.ctrlKey,
             shift: event.shiftKey,
-          };
-        }
-      });
+            alt: event.altKey,
+            meta: event.metaKey,
+          });
+        });
+      }
       const trustedPointer = document.querySelector('#trusted-pointer');
       for (const type of ['pointermove', 'pointerdown', 'pointerup']) {
         trustedPointer.addEventListener(type, (event) => {
@@ -404,7 +407,10 @@ expect "focus" "name" "$("${RDNY[@]}" js 'document.activeElement.id')"
 expect "hover stays trusted" "true" "$("${RDNY[@]}" js 'window.interactions.hoverTrusted')"
 "${RDNY[@]}" focus "#key-target"
 "${RDNY[@]}" key 'Control+Shift+K'
-expect "keyboard chord is trusted with key/code/modifiers" "true,K,KeyK,true,true" "$("${RDNY[@]}" js 'const e = window.interactions.key; [e.trusted,e.key,e.code,e.control,e.shift].join()')"
+"${RDNY[@]}" key Enter
+"${RDNY[@]}" key Plus
+"${RDNY[@]}" key a
+expect "keyboard events are trusted with key/code/modifiers and release" "keydown:true:Control:ControlLeft:true:false,keydown:true:Shift:ShiftLeft:true:true,keydown:true:K:KeyK:true:true,keyup:true:K:KeyK:true:true,keyup:true:Shift:ShiftLeft:true:false,keyup:true:Control:ControlLeft:false:false,keydown:true:Enter:Enter:false:false,keyup:true:Enter:Enter:false:false,keydown:true:Shift:ShiftLeft:false:true,keydown:true:+:Equal:false:true,keyup:true:+:Equal:false:true,keyup:true:Shift:ShiftLeft:false:false,keydown:true:a:KeyA:false:false,keyup:true:a:KeyA:false:false" "$("${RDNY[@]}" js 'window.interactions.keys.map(e => [e.type,e.trusted,e.key,e.code,e.control,e.shift].join(":")).join()')"
 "${RDNY[@]}" pointer move --pierce --selector '#slot-host >>> slot'
 "${RDNY[@]}" js "document.querySelector('#trusted-pointer').style.display = 'block'" >/dev/null
 "${RDNY[@]}" pointer move --selector '#trusted-pointer'
@@ -418,6 +424,10 @@ expect "pointer primitives are trusted and hit the real target" "pointermove:tru
 "${RDNY[@]}" pointer drag --from-selector '#drag-source' --to-selector '#drop-target' --steps 20 --duration-ms 300
 expect "native drag/drop is trusted and reaches actual target" "true,true,true,drop-target,rdny-smoke" "$("${RDNY[@]}" js 'const d = window.interactions.drag; [d.start,d.over,d.drop,d.target,d.data].join()')"
 expect "drag leaves mouse button released" "0" "$("${RDNY[@]}" js 'window.__releaseButtons = null; const t = document.querySelector("#drop-target"); t.addEventListener("pointermove", e => window.__releaseButtons = e.buttons, {once:true}); 0' >/dev/null; "${RDNY[@]}" pointer move --selector '#drop-target'; "${RDNY[@]}" js 'window.__releaseButtons')"
+if drag_bounds_error=$("${RDNY[@]}" pointer drag --from-at 1,1 --to-at 999999,999999 2>&1); then
+  fail "out-of-bounds drag should fail before dispatch"
+fi
+expect_contains "drag release/out-of-bounds reports viewport bound" "viewport" "$drag_bounds_error"
 "${RDNY[@]}" js "document.querySelector('#drag-source').style.display = 'none'; document.querySelector('#drop-target').style.display = 'none'" >/dev/null
 "${RDNY[@]}" submit "#f"
 expect "submit" "submitted" "$("${RDNY[@]}" js 'document.title')"
