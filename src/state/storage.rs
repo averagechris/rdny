@@ -1050,13 +1050,13 @@ fn validate_trusted_ancestor(file: &File, path: &Path, private: bool, euid: u32)
         )
     }
     let uid = metadata.uid();
-    if uid != 0 && uid != euid {
+    let mode = metadata.mode();
+    if uid != 0 && uid != euid && mode & 0o222 != 0 {
         bail!(
-            "external path ancestor {} is owned by untrusted uid {uid}",
+            "external path ancestor {} is writable by untrusted uid {uid}",
             path.display()
         )
     }
-    let mode = metadata.mode();
     let writable = mode & 0o022 != 0;
     #[cfg(target_os = "macos")]
     let sticky_bit = u32::from(libc::S_ISVTX);
