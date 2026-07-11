@@ -93,35 +93,7 @@ enum PageDragCapture {
 }
 
 fn install_page_drag_capture(sess: &mut PageSession) -> Result<()> {
-    let expression = format!(
-        r#"(() => {{
-            const key = Symbol.for({key});
-            const prior = window[key];
-            if (prior && prior.listener) window.removeEventListener('dragstart', prior.listener);
-            const state = {{seen: false, settled: false, canceled: false, effectAllowed: 'none', items: [], listener: null}};
-            state.listener = (event) => {{
-                const transfer = event.dataTransfer;
-                state.seen = true;
-                state.effectAllowed = transfer ? String(transfer.effectAllowed || 'none') : 'none';
-                state.items = transfer ? Array.from(transfer.types || [])
-                    .filter((mimeType) => mimeType !== 'Files')
-                    .map((mimeType) => ({{
-                        mimeType: String(mimeType),
-                        data: String(transfer.getData(mimeType) || ''),
-                        title: '',
-                        baseURL: String(location.href),
-                    }})) : [];
-                queueMicrotask(() => {{
-                    state.canceled = event.defaultPrevented;
-                    state.settled = true;
-                }});
-            }};
-            window.addEventListener('dragstart', state.listener);
-            window[key] = state;
-            return true;
-        }})()"#,
-        key = serde_json::to_string(DRAG_CAPTURE_KEY).expect("static capture key serializes"),
-    );
+    let expression = crate::browser_programs::drag_capture_install(DRAG_CAPTURE_KEY);
     if sess.eval(&expression)?.as_bool() != Some(true) {
         bail!("browser did not install dragstart data capture");
     }
@@ -129,23 +101,7 @@ fn install_page_drag_capture(sess: &mut PageSession) -> Result<()> {
 }
 
 fn take_page_drag_data(sess: &mut PageSession, deadline: Deadline) -> Result<PageDragCapture> {
-    let expression = format!(
-        r#"(() => {{
-            const key = Symbol.for({key});
-            const state = window[key];
-            if (!state) return null;
-            if (state.listener) window.removeEventListener('dragstart', state.listener);
-            delete window[key];
-            return {{
-                seen: Boolean(state.seen),
-                settled: Boolean(state.settled),
-                canceled: Boolean(state.canceled),
-                effectAllowed: String(state.effectAllowed || 'none'),
-                items: Array.isArray(state.items) ? state.items : [],
-            }};
-        }})()"#,
-        key = serde_json::to_string(DRAG_CAPTURE_KEY).expect("static capture key serializes"),
-    );
+    let expression = crate::browser_programs::drag_capture_take(DRAG_CAPTURE_KEY);
     let capture = sess.eval_until(&expression, deadline)?;
     if capture.is_null() || capture["seen"].as_bool() != Some(true) {
         return Ok(PageDragCapture::NotSeen);

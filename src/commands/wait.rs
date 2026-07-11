@@ -87,15 +87,7 @@ pub fn waitstable_quiet(sess: &mut PageSession, quiet_window: Duration) -> Resul
 }
 
 fn install_mutation_clock(sess: &mut PageSession, deadline: Deadline) -> Result<()> {
-    sess.eval_until(r#"(() => {
-        const key = Symbol.for('rdny.waitstable.mutationClock.v1');
-        if (window[key] && window[key].observer) return true;
-        const state = { last: performance.now(), observer: null };
-        state.observer = new MutationObserver(() => { state.last = performance.now(); });
-        state.observer.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
-        Object.defineProperty(window, key, { value: state, configurable: true });
-        return true;
-    })()"#, deadline)?;
+    sess.eval_until(crate::browser_programs::WAIT_MUTATION_CLOCK, deadline)?;
     Ok(())
 }
 

@@ -1,5 +1,6 @@
 mod broker;
 mod browser;
+mod browser_programs;
 mod cdp;
 mod cli;
 mod commands;

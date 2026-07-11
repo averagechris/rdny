@@ -106,7 +106,7 @@ pub fn download(
     }
     let stream = _sess.call_on_object(
         &id,
-        DOWNLOAD_STREAM_FACTORY,
+        crate::browser_programs::DOWNLOAD_STREAM_FACTORY,
         &[json!(max_bytes), json!(DOWNLOAD_DECODED_CHUNK_BYTES)],
     )?;
     match _file {
@@ -123,39 +123,6 @@ pub fn download(
         )?)),
     }
 }
-
-const DOWNLOAD_STREAM_FACTORY: &str = r#"async function(max, chunkSize) {
-    const url = this.href || this.currentSrc || this.src;
-    const resp = await fetch(url, {credentials: 'include'});
-    if (!resp.ok) throw new Error('fetch failed: HTTP ' + resp.status);
-    const contentType = resp.headers.get('content-type');
-    const len = Number(resp.headers.get('content-length'));
-    if (Number.isFinite(len) && len > max) throw new Error('download content-length ' + len + ' exceeds max ' + max);
-    const reader = resp.body && resp.body.getReader ? resp.body.getReader() : null;
-    if (!reader) throw new Error('download streaming is unavailable in this page');
-    let done = false, total = 0, pending = null, pendingOffset = 0;
-    const encode = (value) => { let s = ''; for (let i = 0; i < value.length; i += 0x8000) s += String.fromCharCode.apply(null, value.subarray(i, i + 0x8000)); return btoa(s); };
-    return {
-      contentType,
-      async next() {
-        if (done) return {done: true, contentType, total};
-        let value;
-        while (!pending || pendingOffset >= pending.byteLength) {
-          const read = await reader.read();
-          if (read.done) { done = true; return {done: true, contentType, total}; }
-          pending = read.value;
-          pendingOffset = 0;
-        }
-        const end = Math.min(pending.byteLength, pendingOffset + chunkSize);
-        value = pending.subarray(pendingOffset, end);
-        pendingOffset = end;
-        total += value.byteLength;
-        if (total > max) { try { await reader.cancel(); } finally { done = true; } throw new Error('download exceeds max ' + max); }
-        return {done: false, chunk: encode(value), contentType, total};
-      },
-      async cancel() { done = true; await reader.cancel(); pending = null; return true; }
-    };
-}"#;
 
 fn save_download_file(
     sess: &mut PageSession,
@@ -304,9 +271,7 @@ pub fn focus(_sess: &mut PageSession, _selector: &ElementSelector) -> Result<()>
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DOWNLOAD_DECODED_CHUNK_BYTES, DOWNLOAD_STREAM_FACTORY, download, write_download_chunks,
-    };
+    use super::{DOWNLOAD_DECODED_CHUNK_BYTES, download, write_download_chunks};
     use crate::selector::ElementSelector;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use serde_json::{Value, json};
@@ -328,8 +293,8 @@ mod tests {
     fn download_browser_stream_has_fixed_chunking_and_no_full_body_fallback() {
         let encoded = STANDARD.encode(vec![0_u8; DOWNLOAD_DECODED_CHUNK_BYTES]);
         assert!(encoded.len() < crate::cdp::client::MAX_WEBSOCKET_FRAME_BYTES);
-        assert!(!DOWNLOAD_STREAM_FACTORY.contains("arrayBuffer"));
-        assert!(DOWNLOAD_STREAM_FACTORY.contains("pendingOffset"));
+        assert!(!crate::browser_programs::DOWNLOAD_STREAM_FACTORY.contains("arrayBuffer"));
+        assert!(crate::browser_programs::DOWNLOAD_STREAM_FACTORY.contains("pendingOffset"));
     }
 
     #[test]
