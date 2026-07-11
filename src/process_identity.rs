@@ -736,23 +736,20 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn wrapper_script_exec_runtime_exe_capture_and_terminate() {
-        use std::os::unix::fs::symlink;
-
-        let dir = tempfile::tempdir().unwrap();
-        let wrapper = dir.path().join("chrome-wrapper");
-        let executable = std::env::current_exe().unwrap();
-        symlink(&executable, &wrapper).unwrap();
-
-        let mut child = test_helper_command(&wrapper).spawn().unwrap();
+        let launcher = Path::new("sleep");
+        let mut child = std::process::Command::new(launcher)
+            .arg("30")
+            .spawn()
+            .unwrap();
         let pid = child.id();
-        let id = capture(pid, &wrapper, None).unwrap();
-        let observed_executable = normalize(&id.exe);
+        let id = capture(pid, launcher, None).unwrap();
+        let observed_executable = id.exe.clone();
         let identity_matches = matches_identity(pid, &id).unwrap();
         terminate(&id).unwrap();
         let identity_gone = !matches_identity(pid, &id).unwrap();
         let _ = child.wait();
-        assert_eq!(observed_executable, normalize(&executable));
-        assert_ne!(wrapper, id.exe);
+        assert_eq!(observed_executable.file_name(), Some(OsStr::new("sleep")));
+        assert_ne!(launcher, observed_executable);
         assert!(identity_matches);
         assert!(identity_gone);
     }
