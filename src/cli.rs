@@ -461,7 +461,7 @@ fn parse_quiet_ms(raw: &str) -> std::result::Result<u64, String> {
 
 #[derive(Debug, Parser)]
 pub struct CleanupArgs {
-    /// Stop live instances before removing their state files.
+    /// Also remove state whose liveness probe is inconclusive; attached browsers are never killed.
     #[arg(long)]
     pub all: bool,
 }

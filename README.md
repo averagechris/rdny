@@ -416,6 +416,14 @@ Both sessions coexist because state is separated. Attached sessions record no
 browser pid, so `rdny stop` and `rdny cleanup` never kill your personal browser;
 they only detach rdny from it or clear rdny state.
 
+`rdny cleanup` is conservative when liveness cannot be proven. Without `--all`,
+managed sessions with a still-live browser or broker are preserved, and attached
+sessions are also preserved when their debugger probe is inconclusive (for
+example a timeout, temporary connection failure, or unavailable endpoint). Use
+`rdny cleanup --all` only after independently verifying that any attached
+personal browser state may be detached; it overrides inconclusive probes and
+removes rdny state while still avoiding process kills for attached browsers.
+
 For security, debugger connections are loopback-only. `localhost`, names below
 `.localhost`, and literal loopback addresses retain the convenient plaintext
 HTTP/WS workflow above. rdny does not support direct remote CDP because Chrome's

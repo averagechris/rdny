@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[cfg(test)]
 use std::{fs, path::Path};
@@ -27,6 +28,31 @@ pub enum Liveness {
     Dead,
     Unverifiable,
     Unrelated,
+}
+
+const CLEANUP_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupProbe {
+    Conclusive(Liveness),
+    Inconclusive(CleanupProbeFailure),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupProbeFailure {
+    Expired,
+    Timeout,
+    Unavailable,
+}
+
+impl CleanupProbeFailure {
+    fn diagnostic(self) -> &'static str {
+        match self {
+            Self::Expired => "probe budget expired",
+            Self::Timeout => "probe timed out",
+            Self::Unavailable => "probe unavailable",
+        }
+    }
 }
 
 /// Classify an instance given injectable probes, so tests need
@@ -72,6 +98,123 @@ fn probe_liveness_until(state: &SessionState, deadline: Deadline) -> Liveness {
         ProcessClass::PidReusedOrUnrelated => Liveness::Unrelated,
         ProcessClass::LegacyUnverifiable => Liveness::Unverifiable,
         ProcessClass::AttachedReachable => Liveness::Attached,
+    }
+}
+
+fn cleanup_probe_liveness_until(state: &SessionState, overall: Deadline) -> CleanupProbe {
+    let Some(remaining) = overall.remaining() else {
+        return CleanupProbe::Inconclusive(CleanupProbeFailure::Expired);
+    };
+    let probe_deadline = Deadline::at(
+        std::time::Instant::now()
+            .checked_add(remaining.min(CLEANUP_PROBE_TIMEOUT))
+            .unwrap_or_else(|| overall.instant())
+            .min(overall.instant()),
+    );
+    let liveness = probe_liveness_until(state, probe_deadline);
+    if probe_deadline.expired() {
+        CleanupProbe::Inconclusive(if overall.expired() {
+            CleanupProbeFailure::Expired
+        } else {
+            CleanupProbeFailure::Timeout
+        })
+    } else if matches!(liveness, Liveness::Dead) && state.pid.is_none() {
+        CleanupProbe::Inconclusive(CleanupProbeFailure::Unavailable)
+    } else {
+        CleanupProbe::Conclusive(liveness)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupDecision {
+    Cleaned,
+    PreservedDeadRecheck,
+    PreservedInconclusive(CleanupProbeFailure),
+    PreservedLive(Liveness),
+}
+
+impl CleanupDecision {
+    fn human_reason(self) -> &'static str {
+        match self {
+            Self::Cleaned => "cleaned",
+            Self::PreservedDeadRecheck => "state changed before locked cleanup",
+            Self::PreservedInconclusive(reason) => reason.diagnostic(),
+            Self::PreservedLive(Liveness::Alive) => "browser is alive",
+            Self::PreservedLive(Liveness::Attached) => "attached browser is reachable",
+            Self::PreservedLive(Liveness::Dead) => "dead",
+            Self::PreservedLive(Liveness::Unverifiable) => "legacy pid is unverifiable",
+            Self::PreservedLive(Liveness::Unrelated) => "pid belongs to an unrelated process",
+        }
+    }
+
+    fn structured_kind(self) -> &'static str {
+        match self {
+            Self::Cleaned => "cleaned",
+            Self::PreservedDeadRecheck => "preserved_changed",
+            Self::PreservedInconclusive(CleanupProbeFailure::Expired) => {
+                "preserved_inconclusive_expired"
+            }
+            Self::PreservedInconclusive(CleanupProbeFailure::Timeout) => {
+                "preserved_inconclusive_timeout"
+            }
+            Self::PreservedInconclusive(CleanupProbeFailure::Unavailable) => {
+                "preserved_inconclusive_unavailable"
+            }
+            Self::PreservedLive(Liveness::Alive) => "preserved_live_alive",
+            Self::PreservedLive(Liveness::Attached) => "preserved_live_attached",
+            Self::PreservedLive(Liveness::Dead) => "preserved_dead",
+            Self::PreservedLive(Liveness::Unverifiable) => "preserved_live_unverifiable",
+            Self::PreservedLive(Liveness::Unrelated) => "preserved_live_unrelated",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CleanupEntry {
+    instance: Instance,
+    decision: CleanupDecision,
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+struct CleanupReport {
+    entries: Vec<CleanupEntry>,
+}
+
+impl CleanupReport {
+    fn push(&mut self, instance: Instance, decision: CleanupDecision) {
+        self.entries.push(CleanupEntry { instance, decision });
+    }
+
+    fn cleaned(&self) -> impl Iterator<Item = &CleanupEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.decision == CleanupDecision::Cleaned)
+    }
+
+    #[cfg(test)]
+    fn cleaned_len(&self) -> usize {
+        self.cleaned().count()
+    }
+
+    #[cfg(test)]
+    fn cleaned_is_empty(&self) -> bool {
+        self.cleaned_len() == 0
+    }
+
+    #[allow(dead_code)]
+    fn structured_rows(&self) -> Vec<serde_json::Value> {
+        self.entries
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "dir": entry.instance.dir,
+                    "pid": entry.instance.state.pid,
+                    "label": entry.instance.state.label,
+                    "action": entry.decision.structured_kind(),
+                    "reason": entry.decision.human_reason(),
+                })
+            })
+            .collect()
     }
 }
 
@@ -178,18 +321,29 @@ pub fn cleanup_until(all: bool, deadline: Deadline) -> Result<()> {
             .with_context(|| format!("locking lifecycle in {}", dir.display()))?;
         state::prune_stale_registry_locked(&lifecycle, instance_id)?;
     }
-    let cleaned = cleanup_instances_with_deadline(
+    let report = cleanup_instances_with_deadline(
         discovery.instances,
         all,
-        |state| probe_liveness_until(state, deadline),
+        |state| cleanup_probe_liveness_until(state, deadline),
         Some(deadline),
     )?;
-    for instance in cleaned {
+    for entry in &report.entries {
+        if entry.decision != CleanupDecision::Cleaned {
+            eprintln!(
+                "warning: preserved: {} (pid={} label={} reason={})",
+                entry.instance.dir.display(),
+                display_pid(entry.instance.state.pid),
+                display_label(entry.instance.state.label.as_deref()),
+                entry.decision.human_reason()
+            );
+        }
+    }
+    for entry in report.cleaned() {
         println!(
             "cleaned: {} (pid={} label={})",
-            instance.dir.display(),
-            display_pid(instance.state.pid),
-            display_label(instance.state.label.as_deref())
+            entry.instance.dir.display(),
+            display_pid(entry.instance.state.pid),
+            display_label(entry.instance.state.label.as_deref())
         );
     }
     Ok(())
@@ -552,29 +706,38 @@ pub fn cleanup_instances(
     all: bool,
     liveness: impl Fn(&SessionState) -> Liveness,
 ) -> Result<Vec<Instance>> {
-    cleanup_instances_with_deadline(instances, all, liveness, None)
+    Ok(cleanup_instances_with_deadline(
+        instances,
+        all,
+        |state| CleanupProbe::Conclusive(liveness(state)),
+        None,
+    )?
+    .cleaned()
+    .map(|entry| entry.instance.clone())
+    .collect())
 }
 
 fn cleanup_instances_with_deadline(
     instances: Vec<Instance>,
     all: bool,
-    liveness: impl Fn(&SessionState) -> Liveness,
+    liveness: impl FnMut(&SessionState) -> CleanupProbe,
     deadline: Option<Deadline>,
-) -> Result<Vec<Instance>> {
+) -> Result<CleanupReport> {
     cleanup_instances_with_hook(instances, all, liveness, |_| {}, deadline)
 }
 
 fn cleanup_instances_with_hook(
     instances: Vec<Instance>,
     all: bool,
-    liveness: impl Fn(&SessionState) -> Liveness,
+    mut liveness: impl FnMut(&SessionState) -> CleanupProbe,
     before_locked_action: impl Fn(&Instance),
     deadline: Option<Deadline>,
-) -> Result<Vec<Instance>> {
-    let mut cleaned = Vec::new();
+) -> Result<CleanupReport> {
+    let mut report = CleanupReport::default();
     for instance in instances {
         let current_liveness = liveness(&instance.state);
-        if current_liveness != Liveness::Dead && !all {
+        if !all && current_liveness != CleanupProbe::Conclusive(Liveness::Dead) {
+            report.push(instance, cleanup_preserved_decision(current_liveness));
             continue;
         }
         before_locked_action(&instance);
@@ -593,12 +756,18 @@ fn cleanup_instances_with_hook(
                 .as_deref()
                 .is_some_and(|id| latest.instance_id.as_deref() != Some(id))
         {
+            report.push(instance, CleanupDecision::PreservedDeadRecheck);
             continue;
         }
         let latest_liveness = liveness(&latest);
-        if !all && latest_liveness != Liveness::Dead {
+        if !all && latest_liveness != CleanupProbe::Conclusive(Liveness::Dead) {
+            report.push(instance, cleanup_preserved_decision(latest_liveness));
             continue;
         }
+        let latest_liveness = match latest_liveness {
+            CleanupProbe::Conclusive(liveness) => liveness,
+            CleanupProbe::Inconclusive(_) => Liveness::Dead,
+        };
         if latest_liveness == Liveness::Dead && latest.endpoint.is_some() {
             crate::broker::remove_stale_socket(&latest).with_context(|| {
                 format!(
@@ -622,10 +791,17 @@ fn cleanup_instances_with_hook(
             &latest_generation,
         )?;
         if removed {
-            cleaned.push(instance);
+            report.push(instance, CleanupDecision::Cleaned);
         }
     }
-    Ok(cleaned)
+    Ok(report)
+}
+
+fn cleanup_preserved_decision(probe: CleanupProbe) -> CleanupDecision {
+    match probe {
+        CleanupProbe::Conclusive(liveness) => CleanupDecision::PreservedLive(liveness),
+        CleanupProbe::Inconclusive(reason) => CleanupDecision::PreservedInconclusive(reason),
+    }
 }
 
 #[cfg(test)]
@@ -1130,7 +1306,7 @@ mod tests {
                 cleanup_instances_with_hook(
                     discovered,
                     false,
-                    |_| Liveness::Dead,
+                    |_| CleanupProbe::Conclusive(Liveness::Dead),
                     |_| {
                         paused.wait();
                         resume.wait();
@@ -1155,7 +1331,7 @@ mod tests {
         }
         assert!(child.wait().unwrap().success());
         resume.wait();
-        assert!(cleanup_thread.join().unwrap().is_empty());
+        assert!(cleanup_thread.join().unwrap().cleaned_is_empty());
         let replacement: SessionState =
             serde_json::from_slice(&fs::read(temp.path().join("state.json")).unwrap()).unwrap();
         assert_eq!(replacement.label.as_deref(), Some("replacement"));
@@ -1179,10 +1355,10 @@ mod tests {
         discovered[0].registered = true;
         let new_dir = temp.path().join("new");
         fs::create_dir_all(&new_dir).unwrap();
-        let cleaned = cleanup_instances_with_hook(
+        let report = cleanup_instances_with_hook(
             discovered,
             false,
-            |_| Liveness::Dead,
+            |_| CleanupProbe::Conclusive(Liveness::Dead),
             |_| {
                 fs::write(
                     temp.path().join("state.json"),
@@ -1193,7 +1369,210 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(cleaned.is_empty());
+        assert!(report.cleaned_is_empty());
+        assert_eq!(
+            report.entries[0].decision,
+            CleanupDecision::PreservedDeadRecheck
+        );
         assert!(temp.path().join("state.json").exists());
+    }
+
+    #[test]
+    fn cleanup_preserves_expired_probe_without_all() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("state.json"),
+            serde_json::to_vec(&state(None, Some("expired"))).unwrap(),
+        )
+        .unwrap();
+        let instances = discover_from(vec![temp.path().to_path_buf()]).unwrap();
+        let report = cleanup_instances_with_deadline(
+            instances,
+            false,
+            |_| CleanupProbe::Inconclusive(CleanupProbeFailure::Expired),
+            None,
+        )
+        .unwrap();
+        assert!(report.cleaned_is_empty());
+        assert_eq!(
+            report.entries[0].decision,
+            CleanupDecision::PreservedInconclusive(CleanupProbeFailure::Expired)
+        );
+        assert!(temp.path().join("state.json").exists());
+    }
+
+    #[test]
+    fn real_expired_attached_probe_is_inconclusive_not_dead() {
+        let probe = cleanup_probe_liveness_until(
+            &state(None, Some("attached")),
+            Deadline::at(std::time::Instant::now() - Duration::from_millis(1)),
+        );
+        assert_eq!(
+            probe,
+            CleanupProbe::Inconclusive(CleanupProbeFailure::Expired)
+        );
+    }
+
+    #[test]
+    fn cleanup_report_structured_rows_distinguish_dead_from_inconclusive() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("state.json"),
+            serde_json::to_vec(&state(None, Some("distinguish"))).unwrap(),
+        )
+        .unwrap();
+        let instances = discover_from(vec![temp.path().to_path_buf()]).unwrap();
+        let report = cleanup_instances_with_deadline(
+            instances,
+            false,
+            |_| CleanupProbe::Inconclusive(CleanupProbeFailure::Unavailable),
+            None,
+        )
+        .unwrap();
+        let rows = report.structured_rows();
+        assert_eq!(rows[0]["action"], "preserved_inconclusive_unavailable");
+        assert_ne!(rows[0]["action"], "preserved_dead");
+        assert!(rows[0]["reason"].as_str().unwrap().contains("unavailable"));
+    }
+
+    #[test]
+    fn cleanup_earlier_budget_consumption_is_inconclusive_not_dead() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("state.json"),
+            serde_json::to_vec(&state(None, Some("budget"))).unwrap(),
+        )
+        .unwrap();
+        let instances = discover_from(vec![temp.path().to_path_buf()]).unwrap();
+        let mut probes = 0;
+        let report = cleanup_instances_with_deadline(
+            instances,
+            false,
+            |_| {
+                probes += 1;
+                CleanupProbe::Inconclusive(CleanupProbeFailure::Expired)
+            },
+            Some(Deadline::after(Duration::from_millis(1))),
+        )
+        .unwrap();
+        assert_eq!(probes, 1);
+        assert!(report.cleaned_is_empty());
+        assert_eq!(
+            report.entries[0].decision,
+            CleanupDecision::PreservedInconclusive(CleanupProbeFailure::Expired)
+        );
+        assert!(temp.path().join("state.json").exists());
+    }
+
+    #[test]
+    fn real_earlier_budget_consumption_preserves_later_attached_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(
+            first.join("state.json"),
+            serde_json::to_vec(&state(Some(1), Some("first"))).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            second.join("state.json"),
+            serde_json::to_vec(&state(None, Some("second"))).unwrap(),
+        )
+        .unwrap();
+        let instances = discover_from(vec![first, second.clone()]).unwrap();
+        let deadline = Deadline::after(Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(2));
+        let report = cleanup_instances_with_deadline(
+            instances,
+            false,
+            |state| cleanup_probe_liveness_until(state, deadline),
+            Some(deadline),
+        )
+        .unwrap();
+        assert!(report.cleaned_is_empty());
+        assert!(second.join("state.json").exists());
+        assert!(report.entries.iter().any(|entry| matches!(
+            entry.decision,
+            CleanupDecision::PreservedInconclusive(CleanupProbeFailure::Expired)
+        )));
+    }
+
+    #[test]
+    fn cleanup_locked_timeout_recheck_cannot_turn_expiration_into_dead() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("state.json"),
+            serde_json::to_vec(&state(None, Some("locked"))).unwrap(),
+        )
+        .unwrap();
+        let instances = discover_from(vec![temp.path().to_path_buf()]).unwrap();
+        let mut probes = 0;
+        let report = cleanup_instances_with_deadline(
+            instances,
+            false,
+            |_| {
+                probes += 1;
+                if probes == 1 {
+                    CleanupProbe::Conclusive(Liveness::Dead)
+                } else {
+                    CleanupProbe::Inconclusive(CleanupProbeFailure::Timeout)
+                }
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(probes, 2);
+        assert!(report.cleaned_is_empty());
+        assert_eq!(
+            report.entries[0].decision,
+            CleanupDecision::PreservedInconclusive(CleanupProbeFailure::Timeout)
+        );
+        assert!(temp.path().join("state.json").exists());
+    }
+
+    #[test]
+    fn cleanup_preserves_live_without_all() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("state.json"),
+            serde_json::to_vec(&state(Some(2), Some("live"))).unwrap(),
+        )
+        .unwrap();
+        let instances = discover_from(vec![temp.path().to_path_buf()]).unwrap();
+        let report = cleanup_instances_with_deadline(
+            instances,
+            false,
+            |_| CleanupProbe::Conclusive(Liveness::Alive),
+            None,
+        )
+        .unwrap();
+        assert!(report.cleaned_is_empty());
+        assert_eq!(
+            report.entries[0].decision,
+            CleanupDecision::PreservedLive(Liveness::Alive)
+        );
+        assert!(temp.path().join("state.json").exists());
+    }
+
+    #[test]
+    fn cleanup_all_overrides_inconclusive_attached_probe() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("state.json"),
+            serde_json::to_vec(&state(None, Some("override"))).unwrap(),
+        )
+        .unwrap();
+        let instances = discover_from(vec![temp.path().to_path_buf()]).unwrap();
+        let report = cleanup_instances_with_deadline(
+            instances,
+            true,
+            |_| CleanupProbe::Inconclusive(CleanupProbeFailure::Unavailable),
+            None,
+        )
+        .unwrap();
+        assert_eq!(report.cleaned_len(), 1);
+        assert!(!temp.path().join("state.json").exists());
     }
 }
