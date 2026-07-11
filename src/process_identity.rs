@@ -99,16 +99,30 @@ fn validate_profile_arg(argv: &[OsString], profile: Option<&Path>) -> Result<()>
     let Some(profile) = profile else {
         return Ok(());
     };
-    let needle = OsString::from(format!("--user-data-dir={}", profile.display()));
+    let expected = normalize(profile);
     let mut matches = 0;
-    for arg in argv {
+    let mut index = 0;
+    while index < argv.len() {
+        let arg = &argv[index];
         let s = arg.to_string_lossy();
-        if s == "--user-data-dir" || s.starts_with("--user-data-dir=") {
-            if arg != &needle {
+        if s == "--user-data-dir" {
+            let value = argv
+                .get(index + 1)
+                .context("--user-data-dir is missing its value")?;
+            if normalize(Path::new(value)) != expected {
+                bail!("process argv contains conflicting --user-data-dir");
+            }
+            matches += 1;
+            index += 2;
+            continue;
+        }
+        if let Some(value) = s.strip_prefix("--user-data-dir=") {
+            if normalize(Path::new(value)) != expected {
                 bail!("process argv contains conflicting --user-data-dir");
             }
             matches += 1;
         }
+        index += 1;
     }
     if matches != 1 {
         bail!("process argv must contain exactly one matching --user-data-dir");
@@ -686,7 +700,14 @@ mod tests {
             OsString::from("--user-data-dir"),
             OsString::from("/tmp/rdny-profile"),
         ];
-        assert!(validate_profile_arg(&split, Some(profile)).is_err());
+        validate_profile_arg(&split, Some(profile)).unwrap();
+        let duplicate_forms = vec![
+            argv[0].clone(),
+            argv[1].clone(),
+            OsString::from("--user-data-dir"),
+            OsString::from("/tmp/rdny-profile"),
+        ];
+        assert!(validate_profile_arg(&duplicate_forms, Some(profile)).is_err());
     }
 
     #[test]
