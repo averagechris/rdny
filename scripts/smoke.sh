@@ -318,6 +318,14 @@ expect "nested shadow click" "shadow clicked" "$("${RDNY[@]}" title)"
 
 # Chromium internal URLs stay denied by default, fail without changing the
 # current page when malformed, and navigate only with the explicit privilege.
+"${RDNY[@]}" open "about:blank" >/dev/null
+expect "allowed safe about blank" "about:blank" "$("${RDNY[@]}" url)"
+"${RDNY[@]}" open "file://$page" --allow-file-url >/dev/null
+if about_error=$("${RDNY[@]}" open "about:version" 2>&1); then
+  fail "privileged about alias without opt-in should fail"
+fi
+expect_contains "about alias denial retry flag" "--allow-chrome-url" "$about_error"
+expect "denied about alias leaves page unchanged" "file://$page" "$("${RDNY[@]}" url)"
 if internal_error=$("${RDNY[@]}" open "chrome://version" 2>&1); then
   fail "chrome URL without opt-in should fail"
 fi
@@ -340,6 +348,10 @@ expect_contains "malformed chrome-extension URL" "malformed chrome-extension: UR
 expect "malformed chrome-extension URL leaves page unchanged" "file://$page" "$("${RDNY[@]}" url)"
 "${RDNY[@]}" open "chrome://version" --allow-chrome-url >/dev/null
 expect_contains "allowed chrome open" "chrome://version" "$("${RDNY[@]}" url)"
+"${RDNY[@]}" open "about:version" --allow-chrome-url >/dev/null
+allowed_about_open_url=$("${RDNY[@]}" url)
+[[ -n "$allowed_about_open_url" ]] || fail "allowed about alias open left an empty URL"
+echo "smoke: ok: allowed about alias open"
 "${RDNY[@]}" open "file://$page" --allow-file-url >/dev/null
 
 # --- page info -------------------------------------------------------
@@ -481,8 +493,17 @@ expect_artifact_json "stop-video jsonl artifact" jsonl "$video_jsonl" "$workdir/
 # --- tabs ------------------------------------------------------------
 "${RDNY[@]}" newpage "file://$page" --allow-file-url >/dev/null
 expect_contains "pages lists two" "1: " "$("${RDNY[@]}" pages)"
+if newpage_about_error=$("${RDNY[@]}" newpage "about:version" 2>&1); then
+  fail "privileged about newpage without opt-in should fail"
+fi
+expect_contains "newpage about alias denial retry flag" "--allow-chrome-url" "$newpage_about_error"
+expect_contains "newpage denied about leaves page unchanged" "file://$page" "$("${RDNY[@]}" url)"
 "${RDNY[@]}" newpage "chrome://version" --allow-chrome-url >/dev/null
 expect_contains "allowed chrome newpage" "chrome://version" "$("${RDNY[@]}" url)"
+"${RDNY[@]}" newpage "about:version" --allow-chrome-url >/dev/null
+allowed_about_newpage_url=$("${RDNY[@]}" url)
+[[ -n "$allowed_about_newpage_url" ]] || fail "allowed about alias newpage left an empty URL"
+echo "smoke: ok: allowed about alias newpage"
 "${RDNY[@]}" page 0 >/dev/null
 expect_contains "pages marker moved" "* 0:" "$("${RDNY[@]}" pages)"
 

@@ -460,8 +460,12 @@ Loopback remains allowed by default.
 
 Chromium's internal pages are a separate privilege boundary and are denied by
 default. Use `--allow-chrome-url` on `open` or a URL-bearing `newpage` to permit
-a trusted `chrome://` page. Use the separate `--allow-chrome-extension-url`
-flag for `chrome-extension://` pages: those pages can execute with the installed
+a trusted `chrome://` page or Chromium `about:` alias such as `about:version`.
+Only the exact safe `about:` allowlist entry `about:blank` is accepted without
+this opt-in; query strings, fragments, unknown aliases, and privileged aliases
+are denied by default and use the same `--allow-chrome-url` policy for `open`
+and `newpage`. Use the separate `--allow-chrome-extension-url` flag for
+`chrome-extension://` pages: those pages can execute with the installed
 extension's permissions, not ordinary web-page permissions. The URL authority
 must be the extension's exact 32-character lowercase ID (letters `a` through
 `p`), for example

@@ -397,7 +397,7 @@ pub struct UrlPolicyArgs {
     /// Permit data: URLs.
     #[arg(long)]
     allow_data_url: bool,
-    /// Permit privileged chrome: browser-internal URLs.
+    /// Permit privileged chrome: URLs and Chromium about: aliases.
     #[arg(long)]
     allow_chrome_url: bool,
     /// Permit chrome-extension: URLs for installed 32-character extension IDs.

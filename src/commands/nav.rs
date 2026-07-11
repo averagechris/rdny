@@ -63,7 +63,7 @@ pub fn normalize_url(url: &str, policy: &UrlPolicy) -> Result<String> {
     if !parsed.username().is_empty() || parsed.password().is_some() {
         bail!("URLs containing embedded credentials are not supported");
     }
-    validate_chromium_internal_url(&parsed, &candidate)?;
+    validate_chromium_internal_url(&parsed, &candidate, policy)?;
     match parsed.scheme() {
         "http" | "https" | "about" => {}
         "file" if policy.allow_file => {}
@@ -118,8 +118,13 @@ pub fn normalize_url(url: &str, policy: &UrlPolicy) -> Result<String> {
     Ok(parsed.into())
 }
 
-fn validate_chromium_internal_url(parsed: &url::Url, candidate: &str) -> Result<()> {
+fn validate_chromium_internal_url(
+    parsed: &url::Url,
+    candidate: &str,
+    policy: &UrlPolicy,
+) -> Result<()> {
     match parsed.scheme() {
+        "about" => validate_about_url(parsed, policy)?,
         "chrome" => {
             if parsed.port().is_some() {
                 bail!("malformed chrome: URL: ports are not supported");
@@ -163,6 +168,27 @@ fn validate_chromium_internal_url(parsed: &url::Url, candidate: &str) -> Result<
         _ => {}
     }
     Ok(())
+}
+
+fn validate_about_url(parsed: &url::Url, policy: &UrlPolicy) -> Result<()> {
+    if parsed.cannot_be_a_base() {
+        let page = parsed.path();
+        if page.is_empty() {
+            bail!("malformed about: URL: expected about:PAGE");
+        }
+        if parsed.as_str() == "about:blank" {
+            return Ok(());
+        }
+        if policy.allow_chrome {
+            return Ok(());
+        }
+        return Err(crate::hint::hint_error(
+            format!("about:{page} URLs require --allow-chrome-url"),
+            "retry with `--allow-chrome-url` only for a trusted Chromium about alias",
+            None,
+        ));
+    }
+    bail!("malformed about: URL: expected about:PAGE");
 }
 
 fn ipv6_is_unique_local(ip: Ipv6Addr) -> bool {
@@ -363,6 +389,18 @@ mod tests {
 
     #[test]
     fn chromium_internal_urls_are_denied_with_exact_retry_flags() {
+        let about_error = normalize_url("about:version", &UrlPolicy::default()).unwrap_err();
+        assert_eq!(
+            about_error.to_string(),
+            "about:version URLs require --allow-chrome-url\nhint: retry with `--allow-chrome-url` only for a trusted Chromium about alias"
+        );
+
+        let srcdoc_error = normalize_url("about:srcdoc", &UrlPolicy::default()).unwrap_err();
+        assert_eq!(
+            srcdoc_error.to_string(),
+            "about:srcdoc URLs require --allow-chrome-url\nhint: retry with `--allow-chrome-url` only for a trusted Chromium about alias"
+        );
+
         let chrome_error = normalize_url("chrome://version", &UrlPolicy::default()).unwrap_err();
         assert_eq!(
             chrome_error.to_string(),
@@ -386,6 +424,14 @@ mod tests {
             allow_chrome: true,
             ..Default::default()
         };
+        assert_eq!(
+            normalize_url("about:version", &chrome_policy).unwrap(),
+            "about:version"
+        );
+        assert_eq!(
+            normalize_url("about:unknown?debug=1#section", &chrome_policy).unwrap(),
+            "about:unknown?debug=1#section"
+        );
         assert_eq!(
             normalize_url("chrome://settings/content", &chrome_policy).unwrap(),
             "chrome://settings/content"
@@ -421,6 +467,10 @@ mod tests {
             ..Default::default()
         };
         for url in [
+            "about:",
+            "about://blank",
+            "about://version",
+            "about://user@version",
             "chrome:///version",
             "chrome://-version",
             "chrome://version-",
@@ -438,6 +488,43 @@ mod tests {
     }
 
     #[test]
+    fn about_policy_allows_only_exact_blank_by_default() {
+        let default_policy = UrlPolicy::default();
+        assert_eq!(
+            normalize_url("about:blank", &default_policy).unwrap(),
+            "about:blank"
+        );
+        for url in [
+            "about:blank?x=1",
+            "about:blank#fragment",
+            "about:srcdoc",
+            "about:version",
+            "about:unknown",
+            "about:unknown?debug=1#section",
+        ] {
+            assert!(
+                normalize_url(url, &default_policy).is_err(),
+                "accepted {url}"
+            );
+        }
+
+        let opt_in_policy = UrlPolicy {
+            allow_chrome: true,
+            ..Default::default()
+        };
+        for url in [
+            "about:blank?x=1",
+            "about:blank#fragment",
+            "about:srcdoc",
+            "about:version",
+            "about:unknown",
+            "about:unknown?debug=1#section",
+        ] {
+            assert_eq!(normalize_url(url, &opt_in_policy).unwrap(), url);
+        }
+    }
+
+    #[test]
     fn internal_opt_ins_do_not_allow_credentials_controls_or_other_schemes() {
         let policy = UrlPolicy {
             allow_chrome: true,
@@ -447,6 +534,7 @@ mod tests {
         for url in [
             "chrome://user@version/",
             "chrome-extension://user@abcdefghijklmnopabcdefghijklmnop/page.html",
+            "about:version\n",
             "chrome://version/\nsettings",
             "chrome-extension://abcdefghijklmnopabcdefghijklmnop/%zz",
             "devtools://devtools/bundled/inspector.html",
