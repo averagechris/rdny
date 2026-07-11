@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added global `--instance` / `RDNY_INSTANCE` selection by exact registered id
+  or unique label, with strict `--state-dir` conflict handling and copyable
+  selectors in `rdny list` (~averagechris/projects#180).
 
 ## v0.1.0 - 2026-07-08
 

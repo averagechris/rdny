@@ -23,8 +23,13 @@ running/reachable and non-zero when missing or stale.
 ## list
 
 ```json
-{"schemaVersion":1,"kind":"list","instances":[{"dir":"/state","pid":123,"liveness":"alive|attached|dead|unverifiable|unrelated","label":"optional","instance":"...","target":"...","host":"127.0.0.1","port":9222}]}
+{"schemaVersion":1,"kind":"list","instances":[{"dir":"/state","pid":123,"liveness":"alive|attached|dead|unverifiable|unrelated","label":"optional","instance":"...","selector":"...","target":"...","host":"127.0.0.1","port":9222}]}
 ```
+
+`selector` is the registry-verified stable value to pass to
+`rdny --instance VALUE` or `RDNY_INSTANCE=VALUE`; it is `null` for discovered
+legacy state that is not registered. Human output prints the same value as
+`selector=...`.
 
 ## pages
 

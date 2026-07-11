@@ -69,6 +69,7 @@ impl Generation {
 pub(crate) struct StateStore {
     root: PathBuf,
     dir: File,
+    repair_permissions: bool,
 }
 
 impl StateStore {
@@ -357,10 +358,16 @@ fn clear_errno() {
 
 impl StateStore {
     pub(crate) fn open(path: &Path) -> Result<Self> {
-        open_secure_dir(path, true)
+        open_secure_dir(path, true, true)
     }
     pub(crate) fn open_existing(path: &Path) -> Result<Self> {
-        open_secure_dir(path, false)
+        open_secure_dir(path, false, true)
+    }
+    /// Open an existing private store without chmod, creation, quarantine, or
+    /// any other repair. Used for selector resolution, where failures must be
+    /// observational only.
+    pub(crate) fn open_existing_read_only(path: &Path) -> Result<Self> {
+        open_secure_dir(path, false, false)
     }
     pub(crate) fn root(&self) -> &Path {
         &self.root
@@ -429,7 +436,12 @@ impl StateStore {
             Err(err) if err.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
             Err(err) => return Err(err).with_context(|| format!("opening state file {name}")),
         };
-        validate_regular(&file, 0o600).with_context(|| format!("validating state file {name}"))?;
+        if self.repair_permissions {
+            validate_regular(&file, 0o600)
+        } else {
+            validate_regular_read_only(&file, 0o600)
+        }
+        .with_context(|| format!("validating state file {name}"))?;
         let mut raw = Vec::new();
         file.read_to_end(&mut raw)
             .with_context(|| format!("reading state file {name}"))?;
@@ -912,7 +924,7 @@ pub(super) fn normalize_absolute(path: &Path) -> Result<PathBuf> {
     Ok(out)
 }
 
-fn open_secure_dir(path: &Path, create: bool) -> Result<StateStore> {
+fn open_secure_dir(path: &Path, create: bool, repair_permissions: bool) -> Result<StateStore> {
     let root = normalize_absolute(path)?;
     let mut current = file_from_open(
         "/",
@@ -999,8 +1011,16 @@ fn open_secure_dir(path: &Path, create: bool) -> Result<StateStore> {
         current = next;
     }
     validate_owned_directory(&current)?;
-    current.set_permissions(std::fs::Permissions::from_mode(0o700))?;
-    Ok(StateStore { root, dir: current })
+    if repair_permissions {
+        current.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    } else {
+        validate_private_directory(&current, 0o700)?;
+    }
+    Ok(StateStore {
+        root,
+        dir: current,
+        repair_permissions,
+    })
 }
 
 fn validate_external_dir_path(state_root: &Path, target: &Path) -> Result<()> {
@@ -1135,6 +1155,14 @@ fn validate_owned_directory(file: &File) -> Result<()> {
     }
     Ok(())
 }
+fn validate_private_directory(file: &File, mode: u32) -> Result<()> {
+    validate_owned_directory(file)?;
+    let actual = file.metadata()?.mode() & 0o777;
+    if actual != mode {
+        bail!("directory mode must be {mode:04o}, found {actual:04o}")
+    }
+    Ok(())
+}
 fn validate_regular(file: &File, mode: u32) -> Result<()> {
     let st = file.metadata()?;
     if !st.is_file() {
@@ -1147,6 +1175,23 @@ fn validate_regular(file: &File, mode: u32) -> Result<()> {
         bail!("refusing file owned by uid {}", st.uid())
     }
     file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+fn validate_regular_read_only(file: &File, mode: u32) -> Result<()> {
+    let st = file.metadata()?;
+    if !st.is_file() {
+        bail!("not a regular file")
+    }
+    if st.nlink() != 1 {
+        bail!("refusing hard-linked file")
+    }
+    if st.uid() != unsafe { libc::geteuid() } {
+        bail!("refusing file owned by uid {}", st.uid())
+    }
+    let actual = st.mode() & 0o777;
+    if actual != mode {
+        bail!("file mode must be {mode:04o}, found {actual:04o}")
+    }
     Ok(())
 }
 
@@ -1335,6 +1380,28 @@ mod tests {
         for name in ["a/b", ".", "..", "a\0b", ""] {
             assert!(s.write_json(name, &1).is_err(), "{name:?}");
         }
+    }
+
+    #[test]
+    fn read_only_store_rejects_insecure_modes_without_repairing_them() {
+        let t = tempdir();
+        let root = t.path().join("state");
+        let store = StateStore::open(&root).unwrap();
+        store
+            .write_json("state.json", &serde_json::json!({"a": 1}))
+            .unwrap();
+        drop(store);
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(StateStore::open_existing_read_only(&root).is_err());
+        assert_eq!(fs::metadata(&root).unwrap().mode() & 0o777, 0o750);
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let state_path = root.join("state.json");
+        fs::set_permissions(&state_path, fs::Permissions::from_mode(0o640)).unwrap();
+        let store = StateStore::open_existing_read_only(&root).unwrap();
+        assert!(store.inspect::<serde_json::Value>("state.json").is_err());
+        assert_eq!(fs::metadata(state_path).unwrap().mode() & 0o777, 0o640);
     }
 
     #[test]

@@ -13,7 +13,10 @@ use std::{
     env,
     fs::File,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -28,6 +31,7 @@ pub(crate) use storage::{AdvisoryLock, Generation, Inspection, SecureDir};
 
 const STATE_FILE: &str = "state.json";
 const REGISTRY_FILE: &str = "instances.json";
+static SELECTED_INSTANCE_ID: OnceLock<String> = OnceLock::new();
 
 #[cfg(test)]
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -211,7 +215,9 @@ pub(crate) fn lifecycle_lock_at(path: &Path) -> Result<LifecycleLock> {
 }
 
 pub(crate) fn inspect_for_lifecycle(lock: &LifecycleLock) -> Result<Inspection<SessionState>> {
-    StateStore::open(&lock.dir)?.inspect(STATE_FILE)
+    let inspection = StateStore::open(&lock.dir)?.inspect(STATE_FILE)?;
+    verify_selected_inspection(&inspection)?;
+    Ok(inspection)
 }
 
 /// Atomic ownership publication/removal transaction. Lock order is always the
@@ -476,6 +482,7 @@ pub(crate) fn active_recording_writer_lease(frames_path: &Path) -> Result<Option
         STATE_FILE,
         Duration::from_secs(5),
         |inspection| {
+            verify_selected_inspection(&inspection)?;
             let Inspection::Valid(state, _) = inspection else {
                 return Ok(None);
             };
@@ -520,11 +527,60 @@ pub(crate) fn resolved_state_dir() -> Result<PathBuf> {
 
 fn open_store() -> Result<StateStore> {
     let dir = resolved_state_dir()?;
-    StateStore::open(&dir).with_context(|| format!("opening secure state dir {}", dir.display()))
+    let store = StateStore::open(&dir)
+        .with_context(|| format!("opening secure state dir {}", dir.display()))?;
+    verify_selected_store(&store)?;
+    Ok(store)
 }
 
 pub(crate) fn open_store_at(path: &Path) -> Result<StateStore> {
     StateStore::open_existing(path)
+}
+
+pub(crate) fn open_store_at_read_only(path: &Path) -> Result<StateStore> {
+    StateStore::open_existing_read_only(path)
+}
+
+/// Bind this process to the registry identity selected before command dispatch.
+/// Subsequent state reads and transactional mutations reject a replacement in
+/// the same directory rather than crossing lifecycle identities.
+pub(crate) fn select_instance(instance_id: &str) -> Result<()> {
+    SELECTED_INSTANCE_ID
+        .set(instance_id.to_string())
+        .map_err(|_| anyhow::anyhow!("an rdny instance is already selected in this process"))
+}
+
+fn verify_selected_store(store: &StateStore) -> Result<()> {
+    if SELECTED_INSTANCE_ID.get().is_none() {
+        return Ok(());
+    }
+    let inspection = store.inspect::<SessionState>(STATE_FILE)?;
+    verify_selected_inspection(&inspection)
+}
+
+fn verify_selected_inspection(inspection: &Inspection<SessionState>) -> Result<()> {
+    let Some(expected) = SELECTED_INSTANCE_ID.get() else {
+        return Ok(());
+    };
+    match inspection {
+        Inspection::Valid(state, _) if state.instance_id.as_deref() == Some(expected.as_str()) => {
+            Ok(())
+        }
+        Inspection::Valid(state, _) => anyhow::bail!(
+            "selected instance `{expected}` was replaced by `{}` before the command completed; refusing to read or mutate replacement state",
+            state.instance_id.as_deref().unwrap_or("<missing>")
+        ),
+        Inspection::Missing => anyhow::bail!(
+            "selected instance `{expected}` disappeared before the command completed; refusing to create replacement state"
+        ),
+        Inspection::Malformed(malformed) => anyhow::bail!(
+            "selected instance `{expected}` became malformed before the command completed: {}; refusing to mutate it",
+            malformed.message()
+        ),
+        Inspection::Incompatible(error, _) => anyhow::bail!(
+            "selected instance `{expected}` became incompatible before the command completed: {error}; refusing to mutate it"
+        ),
+    }
 }
 
 /// Resolve the default rdny state directory, deliberately ignoring RDNY_STATE_DIR.
@@ -682,8 +738,22 @@ fn registry_from_valid_value(value: Value) -> Result<InstanceRegistry> {
 }
 
 pub(crate) fn registered_state_dirs() -> Result<(Vec<RegistryEntry>, Vec<String>)> {
+    registered_state_dirs_with_repair(true)
+}
+
+pub(crate) fn registered_state_dirs_read_only() -> Result<(Vec<RegistryEntry>, Vec<String>)> {
+    registered_state_dirs_with_repair(false)
+}
+
+fn registered_state_dirs_with_repair(
+    repair_permissions: bool,
+) -> Result<(Vec<RegistryEntry>, Vec<String>)> {
     let dir = default_state_dir()?;
-    let store = match StateStore::open_existing(&dir) {
+    let store = match if repair_permissions {
+        StateStore::open_existing(&dir)
+    } else {
+        StateStore::open_existing_read_only(&dir)
+    } {
         Ok(store) => store,
         Err(error)
             if error
@@ -779,6 +849,7 @@ pub fn update<R>(mutate: impl FnOnce(&mut SessionState) -> Result<R>) -> Result<
         let current = current.context("no browser session; run `rdny start`")?;
         let mut state: SessionState = serde_json::from_value(current.clone())
             .context("state file has incompatible schema")?;
+        verify_selected_state(&state)?;
         result = Some(mutate(&mut state)?);
         merge_state(Some(current), &state)
     })?;
@@ -796,6 +867,7 @@ pub fn update_if_present<R>(
         };
         let mut state: SessionState = serde_json::from_value(current.clone())
             .context("state file has incompatible schema")?;
+        verify_selected_state(&state)?;
         result = Some(mutate(&mut state)?);
         merge_state(Some(current), &state).map(Some)
     })?;
@@ -835,6 +907,20 @@ fn merge_state(current: Option<Value>, state: &SessionState) -> Result<Value> {
         }
     }
     Ok(next)
+}
+
+fn verify_selected_state(state: &SessionState) -> Result<()> {
+    let Some(expected) = SELECTED_INSTANCE_ID.get() else {
+        return Ok(());
+    };
+    if state.instance_id.as_deref() == Some(expected.as_str()) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "selected instance `{expected}` was replaced by `{}` before mutation; refusing to mutate replacement state",
+            state.instance_id.as_deref().unwrap_or("<missing>")
+        )
+    }
 }
 
 /// Remove the state file if present.
@@ -887,7 +973,9 @@ fn inspect() -> Result<StateInspection> {
         }
         Err(err) => return Err(err),
     };
-    Ok(match store.inspect(STATE_FILE)? {
+    let inspection = store.inspect(STATE_FILE)?;
+    verify_selected_inspection(&inspection)?;
+    Ok(match inspection {
         Inspection::Missing => StateInspection::Missing,
         Inspection::Valid(v, _) => StateInspection::Valid(Box::new(v)),
         Inspection::Malformed(v) => StateInspection::Malformed(v.message().to_owned()),
@@ -945,6 +1033,48 @@ mod tests {
             recoverable_recordings: Vec::new(),
             instrumentation: None,
         }
+    }
+
+    #[test]
+    fn selected_replacement_process_helper() {
+        if env::var_os("RDNY_SELECTED_REPLACEMENT_HELPER").is_none() {
+            return;
+        }
+        replace(&sample_state()).unwrap();
+        let selected_id = load().unwrap().unwrap().instance_id.unwrap();
+        select_instance(&selected_id).unwrap();
+
+        let mut replacement = sample_state();
+        replacement.instance_id = Some("replacement-id".into());
+        let path = resolved_state_dir().unwrap().join(STATE_FILE);
+        std::fs::write(&path, serde_json::to_vec(&replacement).unwrap()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let error = update(|state| {
+            state.label = Some("must-not-write".into());
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("was replaced"));
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn selected_instance_binding_rejects_replacement_without_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .arg("state::tests::selected_replacement_process_helper")
+            .arg("--exact")
+            .env("RDNY_SELECTED_REPLACEMENT_HELPER", "1")
+            .env("RDNY_STATE_DIR", temp.path().join("state"))
+            .env("XDG_STATE_HOME", temp.path().join("xdg"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "helper failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

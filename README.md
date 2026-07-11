@@ -83,6 +83,43 @@ rdny status
 rdny stop
 ```
 
+### Selecting registered instances
+
+Every started or connected lifecycle is published in the owner-private global
+instance registry. `rdny list` prints a stable `selector=<instance-id>` for each
+registered instance. Target status, stop, page, artifact, tab, and recording
+commands with that id or with a unique exact label:
+
+```sh
+rdny --state-dir /tmp/rdny-work start --label work
+rdny --state-dir /tmp/rdny-docs start --label docs
+rdny list
+rdny --instance work open https://example.com
+rdny --instance work screenshot work.png
+rdny --instance 0000019abc... status
+RDNY_INSTANCE=docs rdny title
+```
+
+An exact instance id wins if it is also another instance's label. Duplicate
+labels fail and print every matching id and state directory so the command can
+be retried unambiguously. Selection verifies the secured registry entry against
+the selected `state.json`; missing, malformed, stale, inaccessible, or unrelated
+state fails before browser dispatch or mutation.
+
+Selector precedence is intentionally strict:
+
+1. CLI `--instance` overrides `RDNY_INSTANCE`.
+2. Any effective instance selector conflicts with either CLI `--state-dir` or
+   `RDNY_STATE_DIR`; rdny never silently chooses one addressing mechanism.
+3. With no instance selector, CLI `--state-dir` continues to override
+   `RDNY_STATE_DIR`, which continues to override the platform default.
+
+`--state-dir` remains the low-level destination override for `start` and
+`connect`. Instance selectors apply only to commands targeting an existing
+instance. `start`, `connect`, `list`, `cleanup`, `completion`, and `sleep` reject
+an effective selector instead of ignoring it; unset `RDNY_INSTANCE` when using
+those commands.
+
 ## Browser provisioning
 
 ### Managed-session isolation
@@ -281,6 +318,7 @@ browser, while a separate state directory tracks your personal browser:
 rdny start --label agent
 rdny --state-dir ~/.local/state/rdny-personal connect helium
 rdny list
+rdny --instance agent title
 ```
 
 Both sessions coexist because state is separated. Attached sessions record no

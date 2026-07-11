@@ -24,8 +24,19 @@ pub struct Cli {
     pub timeout: BoundedDuration,
 
     /// State directory to use, equivalent to RDNY_STATE_DIR and taking precedence over it.
-    #[arg(long, global = true)]
+    /// Conflicts with any --instance/RDNY_INSTANCE selector.
+    #[arg(long, global = true, conflicts_with = "instance")]
     pub state_dir: Option<PathBuf>,
+
+    /// Registered instance id or unique exact label (env: RDNY_INSTANCE).
+    /// Conflicts with --state-dir and RDNY_STATE_DIR.
+    #[arg(
+        long,
+        global = true,
+        env = "RDNY_INSTANCE",
+        conflicts_with = "state_dir"
+    )]
+    pub instance: Option<String>,
 
     /// Output format for supported commands (schemaVersion 1 for structured output).
     #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Human)]
@@ -234,6 +245,56 @@ pub enum Command {
     StartVideo,
     /// Stop collecting frames and assemble a video file.
     StopVideo(ArtifactArgs),
+}
+
+impl Command {
+    fn targets_registered_instance(&self) -> bool {
+        match self {
+            Self::Start(_)
+            | Self::Connect { .. }
+            | Self::List
+            | Self::Completion { .. }
+            | Self::Cleanup(_)
+            | Self::Sleep { .. } => false,
+            Self::Stop
+            | Self::Status(_)
+            | Self::Open { .. }
+            | Self::Back
+            | Self::Forward
+            | Self::Reload(_)
+            | Self::ClearCache
+            | Self::Cookie(_)
+            | Self::Url
+            | Self::Title
+            | Self::Html { .. }
+            | Self::Text { .. }
+            | Self::Attr { .. }
+            | Self::Pdf(_)
+            | Self::Js { .. }
+            | Self::Logs(_)
+            | Self::Viewport(_)
+            | Self::Click { .. }
+            | Self::Input(_)
+            | Self::Clear { .. }
+            | Self::File { .. }
+            | Self::Download { .. }
+            | Self::Select { .. }
+            | Self::Submit { .. }
+            | Self::Hover { .. }
+            | Self::Focus { .. }
+            | Self::Wait { .. }
+            | Self::Waitload
+            | Self::Waitstable(_)
+            | Self::Waitidle(_)
+            | Self::Screenshot(_)
+            | Self::ScreenshotEl { .. }
+            | Self::Pages
+            | Self::Page { .. }
+            | Self::Newpage { .. }
+            | Self::StartVideo
+            | Self::StopVideo(_) => true,
+        }
+    }
 }
 
 /// Opt-ins for navigation targets that can expose local browser privileges.
@@ -515,11 +576,7 @@ pub fn run() -> Result<()> {
         _ => timeout,
     };
     let deadline = session::Deadline::after(command_budget);
-    if let Some(state_dir) = &cli.state_dir {
-        // SAFETY: rdny is still single-threaded here, before any command dispatch or
-        // background work, so mutating the process environment cannot race other threads.
-        unsafe { std::env::set_var("RDNY_STATE_DIR", state_dir) };
-    }
+    configure_instance_selection(&cli)?;
     // Avoid unconditional lifecycle state reads before lifecycle commands have
     // taken .lifecycle.lock. Page commands may opt into draining once connected.
     let mut drain_after_dispatch = false;
@@ -837,6 +894,59 @@ pub fn run() -> Result<()> {
     }
     if drain_after_dispatch && let Some(session) = page_session.as_mut() {
         session.drain_events(std::time::Duration::from_millis(300))?;
+    }
+    Ok(())
+}
+
+fn configure_instance_selection(cli: &Cli) -> Result<()> {
+    let env_state_dir = std::env::var_os("RDNY_STATE_DIR");
+    validate_selection_inputs(
+        cli.instance.as_deref(),
+        cli.state_dir.as_deref(),
+        env_state_dir.as_deref(),
+        cli.command.targets_registered_instance(),
+    )?;
+
+    let selected = cli
+        .instance
+        .as_deref()
+        .map(commands::instances::resolve_registered)
+        .transpose()?;
+    if let Some(selected) = &selected {
+        // Bind state reads/mutations to the identity verified by the registry,
+        // even if the directory is replaced between lookup and dispatch.
+        crate::state::select_instance(&selected.instance_id)?;
+    }
+    let effective_dir = selected
+        .as_ref()
+        .map(|selected| selected.dir.as_path())
+        .or(cli.state_dir.as_deref());
+    if let Some(state_dir) = effective_dir {
+        // SAFETY: rdny is still single-threaded here, before any command dispatch or
+        // background work, so mutating the process environment cannot race other threads.
+        unsafe { std::env::set_var("RDNY_STATE_DIR", state_dir) };
+    }
+    Ok(())
+}
+
+fn validate_selection_inputs(
+    instance: Option<&str>,
+    cli_state_dir: Option<&std::path::Path>,
+    env_state_dir: Option<&std::ffi::OsStr>,
+    targets_registered_instance: bool,
+) -> Result<()> {
+    let Some(instance) = instance else {
+        return Ok(());
+    };
+    if cli_state_dir.is_some() || env_state_dir.is_some() {
+        anyhow::bail!(
+            "instance selector `{instance}` conflicts with --state-dir/RDNY_STATE_DIR; unset the state-directory override or unset RDNY_INSTANCE/omit --instance"
+        );
+    }
+    if !targets_registered_instance {
+        anyhow::bail!(
+            "--instance/RDNY_INSTANCE does not apply to this command; start/connect choose their destination with --state-dir, list/cleanup inspect the registry, and completion/sleep need no instance"
+        );
     }
     Ok(())
 }
@@ -1450,6 +1560,110 @@ mod tests {
         assert!(
             matches!(cli.command, Command::Connect { address: Some(address), .. } if address == "foo")
         );
+    }
+
+    #[test]
+    fn parses_global_instance_and_rejects_cli_state_dir_conflict() {
+        let cli = parse_cli(&["rdny", "status", "--instance", "agent-a"]);
+        assert_eq!(cli.instance.as_deref(), Some("agent-a"));
+        assert!(
+            Cli::try_parse_from([
+                "rdny",
+                "--instance",
+                "agent-a",
+                "--state-dir",
+                "/tmp/state",
+                "status",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cli_instance_env_process_helper() {
+        let Ok(mode) = std::env::var("RDNY_CLI_INSTANCE_ENV_HELPER") else {
+            return;
+        };
+        match mode.as_str() {
+            "env" => {
+                let cli = parse_cli(&["rdny", "status"]);
+                assert_eq!(cli.instance.as_deref(), Some("from-env"));
+            }
+            "override" => {
+                let cli = parse_cli(&["rdny", "--instance", "from-cli", "status"]);
+                assert_eq!(cli.instance.as_deref(), Some("from-cli"));
+            }
+            _ => panic!("unknown helper mode"),
+        }
+    }
+
+    #[test]
+    fn rdny_instance_is_equivalent_and_cli_overrides_it() {
+        for mode in ["env", "override"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("cli::tests::cli_instance_env_process_helper")
+                .arg("--exact")
+                .env("RDNY_INSTANCE", "from-env")
+                .env("RDNY_CLI_INSTANCE_ENV_HELPER", mode)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "helper mode {mode} failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn effective_instance_conflicts_with_environment_state_dir() {
+        let error = validate_selection_inputs(
+            Some("agent-a"),
+            None,
+            Some(std::ffi::OsStr::new("/tmp/state")),
+            true,
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("conflicts with --state-dir/RDNY_STATE_DIR"));
+
+        assert!(
+            validate_selection_inputs(
+                None,
+                Some(std::path::Path::new("/cli")),
+                Some(std::ffi::OsStr::new("/env")),
+                true,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn non_target_commands_reject_instance_selector() {
+        for command in [
+            parse(&["rdny", "start"]),
+            parse(&["rdny", "connect", "127.0.0.1:9222"]),
+            parse(&["rdny", "list"]),
+            parse(&["rdny", "cleanup"]),
+            parse(&["rdny", "completion", "bash"]),
+            parse(&["rdny", "sleep", "1"]),
+        ] {
+            assert!(!command.targets_registered_instance());
+            let error = validate_selection_inputs(Some("agent-a"), None, None, false).unwrap_err();
+            assert!(format!("{error:#}").contains("does not apply to this command"));
+        }
+        for command in [
+            parse(&["rdny", "status"]),
+            parse(&["rdny", "stop"]),
+            parse(&["rdny", "title"]),
+            parse(&["rdny", "screenshot"]),
+            parse(&["rdny", "pages"]),
+            parse(&["rdny", "start-video"]),
+            parse(&["rdny", "stop-video"]),
+        ] {
+            assert!(command.targets_registered_instance());
+        }
     }
 
     fn connect_config(default: Option<&str>, targets: &[(&str, &str)]) -> config::Config {

@@ -28,6 +28,15 @@ a concurrent replacement. A stale pathname is never unlinked during bind; only
 lifecycle-locked cleanup may remove one after the recorded broker identity is no
 longer live and the pathname still validates as the current user's 0600 socket.
 
+`--instance`/`RDNY_INSTANCE` resolution reads only this secured registry and
+opens referenced state through the same owner/mode/type and no-symlink checks.
+The registry instance id must exactly match `state.json`; process-local identity
+binding then makes later reads and transactional mutations reject a lifecycle
+replacement in the selected directory. Selection errors never repair, prune,
+quarantine, or create registry/state data. `--state-dir` and `RDNY_STATE_DIR`
+conflict with any effective selector so an ambient path cannot redirect a
+registry-selected command.
+
 Each broker client gets a logical CDP transport. Request ids are rewritten,
 responses and attached-session events are routed only to the owner, disconnects
 detach owned target sessions, and bounded queues disconnect slow clients. Broker

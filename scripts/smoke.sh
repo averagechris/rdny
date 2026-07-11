@@ -14,18 +14,23 @@ if [[ $# -ge 1 ]]; then
 else
   RDNY=(cargo run -q --)
 fi
+RDNY_BASE=("${RDNY[@]}")
 
 workdir=${RDNY_SMOKE_WORKDIR:-$(mktemp -d)}
-export RDNY_STATE_DIR="$workdir/state"
+export XDG_STATE_HOME="$workdir/xdg"
+unset RDNY_STATE_DIR RDNY_INSTANCE
+state_a="$workdir/state-a"
+state_b="$workdir/state-b"
 failed=0
 
 cleanup() {
   local status=$?
   if [[ $status -ne 0 || $failed -ne 0 ]]; then
     printf 'smoke: preserving workdir after failure: %s\n' "$workdir" >&2
-    "${RDNY[@]}" status >"$workdir/final-status.txt" 2>&1 || true
+    "${RDNY_BASE[@]}" --state-dir "$state_a" status >"$workdir/final-status.txt" 2>&1 || true
   else
-    "${RDNY[@]}" stop >/dev/null 2>&1 || true
+    "${RDNY_BASE[@]}" --state-dir "$state_a" stop >/dev/null 2>&1 || true
+    "${RDNY_BASE[@]}" --state-dir "$state_b" stop >/dev/null 2>&1 || true
     if [[ -z ${RDNY_SMOKE_WORKDIR:-} ]]; then
       rm -rf "$workdir"
     fi
@@ -76,7 +81,26 @@ cat >"$page" <<'HTML'
 HTML
 
 # --- lifecycle -------------------------------------------------------
-"${RDNY[@]}" start
+"${RDNY_BASE[@]}" --state-dir "$state_a" start --label smoke-a
+"${RDNY_BASE[@]}" --state-dir "$state_b" start --label smoke-b
+list_output=$("${RDNY_BASE[@]}" list)
+expect_contains "list prints label a" "label=smoke-a" "$list_output"
+expect_contains "list prints copyable selector" "selector=" "$list_output"
+instance_b=""
+while IFS= read -r line; do
+  if [[ $line == *"label=smoke-b"* && $line =~ selector=([^[:space:]]+) ]]; then
+    instance_b=${BASH_REMATCH[1]}
+  fi
+done <<<"$list_output"
+[[ -n $instance_b && $instance_b != "-" ]] || fail "could not extract instance-b selector"
+
+# All remaining parity checks target A by its unique label. B is independently
+# addressed by exact id to exercise both selector forms against live browsers.
+RDNY=("${RDNY_BASE[@]}" --instance smoke-a)
+"${RDNY_BASE[@]}" --instance "$instance_b" open 'data:text/html,<title>instance b</title><h1>B</h1>' --allow-data-url >/dev/null
+expect "exact-id selects instance b" "instance b" "$("${RDNY_BASE[@]}" --instance "$instance_b" title)"
+"${RDNY[@]}" open 'data:text/html,<title>instance a</title><h1>A</h1>' --allow-data-url >/dev/null
+expect "label selects instance a" "instance a" "$("${RDNY[@]}" title)"
 expect_contains "status running" "running:" "$("${RDNY[@]}" status)"
 
 # --- navigation + waiting -------------------------------------------
@@ -173,7 +197,12 @@ fi
 echo "smoke: ok: wait timeout exits nonzero"
 
 # --- shutdown --------------------------------------------------------
+"${RDNY_BASE[@]}" --instance "$instance_b" stop
+expect_contains "selected stop preserves other instance" "running:" "$("${RDNY[@]}" status)"
 "${RDNY[@]}" stop
-expect "status cleared" "no session" "$("${RDNY[@]}" status)"
+if missing_error=$("${RDNY[@]}" status 2>&1); then
+  fail "stopped selector should no longer resolve"
+fi
+expect_contains "stopped selector is unregistered" "no registered rdny instance matches" "$missing_error"
 
 echo "smoke: PASS"

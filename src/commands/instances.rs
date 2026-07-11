@@ -1,8 +1,10 @@
 //! Discover, list, and clean up rdny instance state files.
 
 use std::collections::BTreeMap;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+#[cfg(test)]
+use std::{fs, path::Path};
 
 use anyhow::{Context, Result};
 
@@ -96,6 +98,15 @@ pub struct InstanceLine {
     pub pid: Option<u32>,
     pub liveness: Liveness,
     pub label: Option<String>,
+    /// Stable value accepted by `rdny --instance`; absent for unregistered state.
+    pub selector: Option<String>,
+}
+
+/// A registry-verified instance selected for command dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedInstance {
+    pub dir: PathBuf,
+    pub instance_id: String,
 }
 
 #[allow(dead_code)]
@@ -116,7 +127,11 @@ pub fn list_format_until(structured: bool, deadline: Deadline) -> Result<()> {
     for instance in discovery.instances {
         let liveness = probe_liveness_until(&instance.state, deadline);
         if structured {
-            rows.push(serde_json::json!({"dir":instance.dir,"pid":instance.state.pid,"liveness":format!("{:?}", liveness).to_lowercase(),"label":instance.state.label,"instance":instance.state.instance_id,"target":instance.state.target_id,"host":instance.state.host,"port":instance.state.port}));
+            let selector = instance
+                .registered
+                .then(|| instance.registry_instance_id.clone())
+                .flatten();
+            rows.push(serde_json::json!({"dir":instance.dir,"pid":instance.state.pid,"liveness":format!("{:?}", liveness).to_lowercase(),"label":instance.state.label,"instance":instance.state.instance_id,"selector":selector,"target":instance.state.target_id,"host":instance.state.host,"port":instance.state.port}));
         } else {
             println!(
                 "{}",
@@ -124,7 +139,12 @@ pub fn list_format_until(structured: bool, deadline: Deadline) -> Result<()> {
                     dir: instance.dir,
                     pid: instance.state.pid,
                     liveness,
-                    label: instance.state.label
+                    label: instance.state.label,
+                    selector: instance.registered.then(|| {
+                        instance
+                            .registry_instance_id
+                            .expect("registered discovery has a verified instance id")
+                    }),
                 })
             );
         }
@@ -180,6 +200,164 @@ pub fn discover() -> Result<Discovery> {
     discover_from_with_diagnostics(dirs, diagnostics)
 }
 
+/// Resolve an exact registered instance id or a unique exact label.
+///
+/// This path is deliberately read-only. It uses only the secured global
+/// registry, then verifies every referenced state directory before considering
+/// it selectable. Current/default legacy state discovered by `rdny list` is not
+/// implicitly promoted into the registry trust boundary.
+pub fn resolve_registered(selector: &str) -> Result<ResolvedInstance> {
+    let (registered, diagnostics) = state::registered_state_dirs_read_only()
+        .context("reading the secured rdny instance registry without modifying it")?;
+    let candidates = registered
+        .into_iter()
+        .map(|entry| (entry.dir, Some(entry.instance_id)))
+        .collect();
+    let discovery = discover_from_with_diagnostics_mode(candidates, diagnostics, true)?;
+    resolve_discovery(selector, &discovery)
+}
+
+fn resolve_discovery(selector: &str, discovery: &Discovery) -> Result<ResolvedInstance> {
+    let exact: Vec<_> = discovery
+        .instances
+        .iter()
+        .filter(|instance| instance.registry_instance_id.as_deref() == Some(selector))
+        .collect();
+    let stale_exact: Vec<_> = discovery
+        .stale_registered
+        .iter()
+        .filter(|(_, instance_id)| instance_id == selector)
+        .collect();
+    if exact.len() == 1 && stale_exact.is_empty() {
+        return selectable(exact[0], selector);
+    }
+    if exact.len() > 1 || (!exact.is_empty() && !stale_exact.is_empty()) {
+        let mut details = exact
+            .iter()
+            .map(|instance| format!("id={selector} dir={}", instance.dir.display()))
+            .collect::<Vec<_>>();
+        details.extend(
+            stale_exact
+                .iter()
+                .map(|(dir, _)| format!("id={selector} dir={} (stale)", dir.display())),
+        );
+        anyhow::bail!(
+            "ambiguous registered instance id `{selector}` has multiple registry entries: {}; no command was run. Run `rdny cleanup` after verifying each browser",
+            details.join(", ")
+        );
+    }
+    if !stale_exact.is_empty() {
+        let dirs = stale_exact
+            .iter()
+            .map(|(dir, _)| dir.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let details = discovery_diagnostics(discovery);
+        anyhow::bail!(
+            "registered instance `{selector}` is stale or unavailable at {dirs}; no command was run.{details} Run `rdny cleanup` after verifying the browser"
+        );
+    }
+
+    let labels: Vec<_> = discovery
+        .instances
+        .iter()
+        .filter(|instance| instance.state.label.as_deref() == Some(selector))
+        .collect();
+    if labels.len() == 1 {
+        if !discovery.stale_registered.is_empty() || !discovery.diagnostics.is_empty() {
+            let instance_id = labels[0]
+                .registry_instance_id
+                .as_deref()
+                .expect("registered label match has instance id");
+            let details = discovery_diagnostics(discovery);
+            anyhow::bail!(
+                "cannot establish that registered label `{selector}` is unique while registry entries are stale or unavailable; no command was run.{details} Retry with exact id `--instance {instance_id}`, or run `rdny cleanup` after verifying the affected browsers"
+            );
+        }
+        return selectable(labels[0], selector);
+    }
+    if labels.len() > 1 {
+        return Err(ambiguous_error("label", selector, &labels));
+    }
+
+    let skipped = discovery_diagnostics(discovery);
+    anyhow::bail!(
+        "no registered rdny instance matches `{selector}`.{skipped} Run `rdny list` and copy a `selector=...` value, or start an instance with `rdny --state-dir PATH start --label LABEL`"
+    )
+}
+
+fn discovery_diagnostics(discovery: &Discovery) -> String {
+    if discovery.diagnostics.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Registry diagnostics: {}.",
+            discovery.diagnostics.join("; ")
+        )
+    }
+}
+
+fn selectable(instance: &Instance, selector: &str) -> Result<ResolvedInstance> {
+    let instance_id = instance
+        .registry_instance_id
+        .as_deref()
+        .context("internal error: selected instance lacks registry identity")?;
+    if instance.state.instance_id.as_deref() != Some(instance_id) {
+        anyhow::bail!(
+            "registered instance `{selector}` points to unrelated state in {}; no command was run. Run `rdny cleanup` after verifying the browser",
+            instance.dir.display()
+        );
+    }
+    if let Some(identity) = &instance.state.process_identity {
+        process_identity::validate_persisted(
+            instance.state.pid,
+            instance.state.browser_path.as_deref(),
+            instance.state.user_data_dir.as_deref(),
+            identity,
+        )
+        .with_context(|| {
+            format!(
+                "registered instance `{selector}` has unrelated process state in {}; no command was run",
+                instance.dir.display()
+            )
+        })?;
+        if matches!(
+            process_identity::classify(instance.state.pid, Some(identity), false),
+            ProcessClass::PidReusedOrUnrelated
+        ) {
+            anyhow::bail!(
+                "registered instance `{selector}` refers to a reused or unrelated process in {}; no command was run. Verify the browser, then use `rdny cleanup`",
+                instance.dir.display()
+            );
+        }
+    }
+    Ok(ResolvedInstance {
+        dir: instance.dir.clone(),
+        instance_id: instance_id.to_string(),
+    })
+}
+
+fn ambiguous_error(kind: &str, selector: &str, matches: &[&Instance]) -> anyhow::Error {
+    let details = matches
+        .iter()
+        .map(|instance| {
+            format!(
+                "id={} dir={}",
+                instance
+                    .registry_instance_id
+                    .as_deref()
+                    .or(instance.state.instance_id.as_deref())
+                    .unwrap_or("<missing>"),
+                instance.dir.display()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::anyhow!(
+        "ambiguous registered instance {kind} `{selector}` matches {details}; retry with `--instance` and one of the listed ids"
+    )
+}
+
 fn candidate_dirs() -> Result<(Vec<CandidateDir>, Vec<String>)> {
     let current = state::resolved_state_dir()?;
     let default = state::default_state_dir()?;
@@ -204,18 +382,29 @@ pub fn discover_from(candidate_dirs: Vec<PathBuf>) -> Result<Vec<Instance>> {
 
 fn discover_from_with_diagnostics(
     candidate_dirs: Vec<CandidateDir>,
+    diagnostics: Vec<String>,
+) -> Result<Discovery> {
+    discover_from_with_diagnostics_mode(candidate_dirs, diagnostics, false)
+}
+
+fn discover_from_with_diagnostics_mode(
+    candidate_dirs: Vec<CandidateDir>,
     mut diagnostics: Vec<String>,
+    read_only: bool,
 ) -> Result<Discovery> {
     let mut found: BTreeMap<PathBuf, Instance> = BTreeMap::new();
     let mut stale_registered = Vec::new();
     let mut malformed_found = Vec::new();
     for (dir, registry_instance_id) in candidate_dirs {
         let registered = registry_instance_id.is_some();
-        let key = canonical_key(&dir);
+        // Registry paths are normalized absolute paths. Do not canonicalize:
+        // following a symlink here could deduplicate it before secure O_NOFOLLOW
+        // validation sees and rejects the untrusted registry pathname.
+        let key = dir.clone();
         if let Some(existing) = found.get_mut(&key) {
-            existing.registered |= registered;
             if let Some(observed_id) = registry_instance_id {
                 if existing.state.instance_id.as_deref() == Some(&observed_id) {
+                    existing.registered = true;
                     if existing.registry_instance_id.is_none() {
                         existing.registry_instance_id = Some(observed_id);
                     }
@@ -229,7 +418,11 @@ fn discover_from_with_diagnostics(
             }
             continue;
         }
-        let store = match state::open_store_at(&dir) {
+        let store = match if read_only {
+            state::open_store_at_read_only(&dir)
+        } else {
+            state::open_store_at(&dir)
+        } {
             Ok(store) => store,
             Err(err) => {
                 if registered {
@@ -244,7 +437,24 @@ fn discover_from_with_diagnostics(
                 continue;
             }
         };
-        let inspection = store.inspect::<SessionState>("state.json")?;
+        let inspection = match store.inspect::<SessionState>("state.json") {
+            Ok(inspection) => inspection,
+            Err(err) => {
+                if registered {
+                    diagnostics.push(format!(
+                        "registered state dir inaccessible: {} ({err})",
+                        dir.display()
+                    ));
+                    if let Some(observed_id) = registry_instance_id {
+                        stale_registered.push((dir, observed_id));
+                    }
+                } else {
+                    return Err(err)
+                        .with_context(|| format!("inspecting state in {}", dir.display()));
+                }
+                continue;
+            }
+        };
         let (state, generation) = match inspection {
             Inspection::Valid(state, generation) => (state, generation),
             Inspection::Missing => {
@@ -275,6 +485,9 @@ fn discover_from_with_diagnostics(
             }
             Inspection::Incompatible(err, _) => {
                 diagnostics.push(format!("incompatible state in {}: {err}", dir.display()));
+                if let Some(observed_id) = registry_instance_id {
+                    stale_registered.push((dir, observed_id));
+                }
                 continue;
             }
         };
@@ -307,13 +520,9 @@ fn discover_from_with_diagnostics(
     })
 }
 
-fn canonical_key(dir: &Path) -> PathBuf {
-    fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
-}
-
 pub fn format_line(line: &InstanceLine) -> String {
     format!(
-        "{}  pid={}  {}  label={}",
+        "{}  pid={}  {}  label={}  selector={}",
         line.dir.display(),
         display_pid(line.pid),
         match line.liveness {
@@ -323,7 +532,8 @@ pub fn format_line(line: &InstanceLine) -> String {
             Liveness::Unverifiable => "legacy-unverifiable",
             Liveness::Unrelated => "pid-reused/unrelated",
         },
-        display_label(line.label.as_deref())
+        display_label(line.label.as_deref()),
+        line.selector.as_deref().unwrap_or("-")
     )
 }
 
@@ -446,6 +656,17 @@ mod tests {
         }
     }
 
+    fn write_registered_state(dir: &Path, instance_id: &str, label: Option<&str>) {
+        fs::create_dir_all(dir).unwrap();
+        let mut value = state(None, label);
+        value.instance_id = Some(instance_id.to_string());
+        let path = dir.join("state.json");
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
     #[test]
     fn cleanup_replacement_helper() {
         let Some(dir) = std::env::var_os("RDNY_CLEANUP_REPLACE_DIR") else {
@@ -508,6 +729,28 @@ mod tests {
     }
 
     #[test]
+    fn discovery_stale_dedupe_never_advertises_unverified_selector() {
+        let temp = tempfile::tempdir().unwrap();
+        write_registered_state(temp.path(), "replacement", Some("current"));
+        let discovery = discover_from_with_diagnostics(
+            vec![
+                (temp.path().to_path_buf(), None),
+                (temp.path().to_path_buf(), Some("stale-id".into())),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(discovery.instances.len(), 1);
+        assert!(!discovery.instances[0].registered);
+        assert_eq!(discovery.instances[0].registry_instance_id, None);
+        assert_eq!(
+            discovery.stale_registered,
+            vec![(temp.path().to_path_buf(), "stale-id".into())]
+        );
+    }
+
+    #[test]
     fn malformed_state_discovery_is_read_only() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("state.json"), "not json").unwrap();
@@ -564,28 +807,274 @@ mod tests {
                 dir: "/tmp/rdny-a".into(),
                 pid: Some(7),
                 liveness: Liveness::Alive,
-                label: Some("x".into())
+                label: Some("x".into()),
+                selector: Some("abc123".into()),
             }),
-            "/tmp/rdny-a  pid=7  alive  label=x"
+            "/tmp/rdny-a  pid=7  alive  label=x  selector=abc123"
         );
         assert_eq!(
             format_line(&InstanceLine {
                 dir: "/tmp/rdny-b".into(),
                 pid: None,
                 liveness: Liveness::Dead,
-                label: None
+                label: None,
+                selector: None,
             }),
-            "/tmp/rdny-b  pid=-  dead  label=-"
+            "/tmp/rdny-b  pid=-  dead  label=-  selector=-"
         );
         assert_eq!(
             format_line(&InstanceLine {
                 dir: "/tmp/rdny-c".into(),
                 pid: None,
                 liveness: Liveness::Attached,
-                label: Some("me".into())
+                label: Some("me".into()),
+                selector: Some("def456".into()),
             }),
-            "/tmp/rdny-c  pid=-  attached  label=me"
+            "/tmp/rdny-c  pid=-  attached  label=me  selector=def456"
         );
+    }
+
+    #[test]
+    fn selector_exact_id_wins_over_matching_label() {
+        let temp = tempfile::tempdir().unwrap();
+        let exact = temp.path().join("exact");
+        let label = temp.path().join("label");
+        write_registered_state(&exact, "id-exact", Some("other"));
+        write_registered_state(&label, "id-label", Some("id-exact"));
+        let discovery = discover_from_with_diagnostics(
+            vec![
+                (exact.clone(), Some("id-exact".into())),
+                (label, Some("id-label".into())),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_discovery("id-exact", &discovery).unwrap(),
+            ResolvedInstance {
+                dir: exact,
+                instance_id: "id-exact".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn selector_accepts_unique_label_and_reports_ambiguous_ids_and_dirs() {
+        let temp = tempfile::tempdir().unwrap();
+        let one = temp.path().join("one");
+        let two = temp.path().join("two");
+        let unique = temp.path().join("unique");
+        write_registered_state(&one, "id-one", Some("shared"));
+        write_registered_state(&two, "id-two", Some("shared"));
+        write_registered_state(&unique, "id-unique", Some("solo"));
+        let discovery = discover_from_with_diagnostics(
+            vec![
+                (one.clone(), Some("id-one".into())),
+                (two.clone(), Some("id-two".into())),
+                (unique.clone(), Some("id-unique".into())),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_discovery("solo", &discovery).unwrap(),
+            ResolvedInstance {
+                dir: unique,
+                instance_id: "id-unique".into(),
+            }
+        );
+        let error = resolve_discovery("shared", &discovery).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("ambiguous registered instance label `shared`"));
+        assert!(message.contains("id=id-one"));
+        assert!(message.contains(&one.display().to_string()));
+        assert!(message.contains("id=id-two"));
+        assert!(message.contains(&two.display().to_string()));
+    }
+
+    #[test]
+    fn selector_rejects_stale_malformed_and_missing_registry_targets_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let stale = temp.path().join("stale");
+        let malformed = temp.path().join("malformed");
+        let missing = temp.path().join("missing");
+        let real = temp.path().join("real");
+        let inaccessible = temp.path().join("inaccessible-link");
+        write_registered_state(&stale, "replacement", Some("stale-label"));
+        fs::create_dir_all(&malformed).unwrap();
+        fs::write(malformed.join("state.json"), b"not json").unwrap();
+        write_registered_state(&real, "inaccessible-id", Some("hidden"));
+        std::os::unix::fs::symlink(&real, &inaccessible).unwrap();
+        let discovery = discover_from_with_diagnostics(
+            vec![
+                (stale.clone(), Some("stale-id".into())),
+                (malformed.clone(), Some("malformed-id".into())),
+                (missing.clone(), Some("missing-id".into())),
+                (inaccessible.clone(), Some("inaccessible-id".into())),
+            ],
+            vec!["registry test diagnostic".into()],
+        )
+        .unwrap();
+
+        for selector in ["stale-id", "malformed-id", "missing-id", "inaccessible-id"] {
+            let message = format!("{:#}", resolve_discovery(selector, &discovery).unwrap_err());
+            assert!(message.contains("stale or unavailable"), "{message}");
+            assert!(message.contains("no command was run"), "{message}");
+        }
+        let unknown = format!(
+            "{:#}",
+            resolve_discovery("unknown", &discovery).unwrap_err()
+        );
+        assert!(unknown.contains("Registry diagnostics"));
+        assert!(malformed.join("state.json").exists());
+        assert!(!missing.exists());
+        assert!(
+            inaccessible
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            !fs::read_dir(&malformed)
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().contains("quarantine"))
+        );
+    }
+
+    #[test]
+    fn selector_validates_each_registry_path_and_accounts_for_incompatible_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let valid = temp.path().join("valid");
+        let alias = temp.path().join("alias");
+        let incompatible = temp.path().join("incompatible");
+        write_registered_state(&valid, "duplicate-id", Some("valid"));
+        std::os::unix::fs::symlink(&valid, &alias).unwrap();
+        fs::create_dir_all(&incompatible).unwrap();
+        let incompatible_state = incompatible.join("state.json");
+        fs::write(&incompatible_state, b"{}").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&incompatible, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(incompatible_state, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let discovery = discover_from_with_diagnostics_mode(
+            vec![
+                (valid.clone(), Some("duplicate-id".into())),
+                (alias.clone(), Some("duplicate-id".into())),
+                (incompatible.clone(), Some("duplicate-id".into())),
+            ],
+            Vec::new(),
+            true,
+        )
+        .unwrap();
+        let message = format!(
+            "{:#}",
+            resolve_discovery("duplicate-id", &discovery).unwrap_err()
+        );
+        assert!(
+            message.contains("ambiguous registered instance id"),
+            "{message}"
+        );
+        assert!(message.contains(&valid.display().to_string()), "{message}");
+        assert!(message.contains(&alias.display().to_string()), "{message}");
+        assert!(
+            message.contains(&incompatible.display().to_string()),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn inaccessible_state_file_does_not_block_unrelated_exact_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let valid = temp.path().join("valid");
+        let bad = temp.path().join("bad");
+        write_registered_state(&valid, "wanted-id", Some("wanted"));
+        fs::create_dir_all(&bad).unwrap();
+        let target = temp.path().join("outside-state.json");
+        fs::write(&target, b"{}").unwrap();
+        std::os::unix::fs::symlink(&target, bad.join("state.json")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&bad, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let discovery = discover_from_with_diagnostics_mode(
+            vec![
+                (bad.clone(), Some("bad-id".into())),
+                (valid.clone(), Some("wanted-id".into())),
+            ],
+            Vec::new(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_discovery("wanted-id", &discovery).unwrap(),
+            ResolvedInstance {
+                dir: valid,
+                instance_id: "wanted-id".into(),
+            }
+        );
+        assert!(discovery.stale_registered.contains(&(bad, "bad-id".into())));
+    }
+
+    #[test]
+    fn selector_rejects_structurally_unrelated_process_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("unrelated");
+        fs::create_dir_all(&dir).unwrap();
+        let mut value = state(Some(7), Some("bad-process"));
+        value.instance_id = Some("id-unrelated".into());
+        value.process_identity = Some(crate::process_identity::ProcessIdentity {
+            pid: 8,
+            start_time: 1,
+            exe: "/browser".into(),
+            user_data_dir: None,
+            argv: Vec::new(),
+        });
+        fs::write(dir.join("state.json"), serde_json::to_vec(&value).unwrap()).unwrap();
+        let discovery = discover_from_with_diagnostics(
+            vec![(dir.clone(), Some("id-unrelated".into()))],
+            Vec::new(),
+        )
+        .unwrap();
+
+        let message = format!(
+            "{:#}",
+            resolve_discovery("id-unrelated", &discovery).unwrap_err()
+        );
+        assert!(message.contains("unrelated process state"), "{message}");
+        assert!(message.contains(&dir.display().to_string()), "{message}");
+    }
+
+    #[test]
+    fn selector_rejects_reused_or_unrelated_live_process() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("unrelated-live");
+        fs::create_dir_all(&dir).unwrap();
+        let pid = std::process::id();
+        let mut value = state(Some(pid), Some("unrelated-live"));
+        value.instance_id = Some("id-unrelated-live".into());
+        value.process_identity = Some(crate::process_identity::ProcessIdentity {
+            pid,
+            start_time: 0,
+            exe: "/definitely/not/this/test-binary".into(),
+            user_data_dir: None,
+            argv: Vec::new(),
+        });
+        fs::write(dir.join("state.json"), serde_json::to_vec(&value).unwrap()).unwrap();
+        let discovery = discover_from_with_diagnostics(
+            vec![(dir.clone(), Some("id-unrelated-live".into()))],
+            Vec::new(),
+        )
+        .unwrap();
+
+        let message = format!(
+            "{:#}",
+            resolve_discovery("id-unrelated-live", &discovery).unwrap_err()
+        );
+        assert!(message.contains("reused or unrelated process"), "{message}");
+        assert!(message.contains(&dir.display().to_string()), "{message}");
     }
 
     #[test]
