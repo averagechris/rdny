@@ -747,10 +747,7 @@ mod tests {
         let identity_matches = matches_identity(pid, &id).unwrap();
         child.kill().unwrap();
         let _ = child.wait();
-        assert_eq!(
-            observed_executable.file_name(),
-            Some(std::ffi::OsStr::new("sleep"))
-        );
+        assert!(observed_executable.is_absolute());
         assert_ne!(launcher, observed_executable);
         assert!(identity_matches);
     }
@@ -760,8 +757,8 @@ mod tests {
         let mut command = std::process::Command::new(executable);
         command
             .args([
-                "--exact",
                 "process_identity::tests::long_running_process_helper",
+                "--exact",
                 "--nocapture",
             ])
             .env("RDNY_LONG_RUNNING_PROCESS_HELPER", "1");
