@@ -7,6 +7,22 @@ use std::time::{Duration, Instant};
 
 use crate::session::PageSession;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenResult {
+    pub title: String,
+    pub url: String,
+}
+
+impl OpenResult {
+    pub fn human_summary(&self) -> String {
+        format!(
+            "{} — {}",
+            crate::commands::human_sanitize(&self.title),
+            crate::commands::human_sanitize(&self.url)
+        )
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct UrlPolicy {
     pub allow_file: bool,
@@ -110,7 +126,11 @@ fn history_target(current: usize, len: usize, delta: i64) -> Option<usize> {
     }
 }
 
-pub fn open_with_policy(sess: &mut PageSession, url: &str, policy: &UrlPolicy) -> Result<()> {
+pub fn open_with_policy(
+    sess: &mut PageSession,
+    url: &str,
+    policy: &UrlPolicy,
+) -> Result<OpenResult> {
     let url = normalize_url(url, policy)?;
     sess.ensure_page_instrumentation()?;
     sess.call("Page.enable", json!({}))?;
@@ -120,7 +140,18 @@ pub fn open_with_policy(sess: &mut PageSession, url: &str, policy: &UrlPolicy) -
     {
         bail!("open {url}: {err}");
     }
-    wait_for_load_event(sess)
+    wait_for_load_event(sess)?;
+    let title = sess
+        .eval("document.title")?
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let url = sess
+        .eval("location.href")?
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    Ok(OpenResult { title, url })
 }
 
 /// Wait until Page.loadEventFired (Page domain must be enabled), within
@@ -201,7 +232,27 @@ fn navigate_history(sess: &mut PageSession, delta: i64) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{UrlPolicy, history_target, normalize_url};
+    use super::{OpenResult, UrlPolicy, history_target, normalize_url};
+
+    #[test]
+    fn open_result_human_summary_includes_title_and_url() {
+        let result = OpenResult {
+            title: "Example".to_string(),
+            url: "https://example.com/path".to_string(),
+        };
+
+        assert_eq!(result.human_summary(), "Example — https://example.com/path");
+    }
+
+    #[test]
+    fn open_result_human_summary_sanitizes_page_control_text() {
+        let result = OpenResult {
+            title: "Ex\u{1b}ample".to_string(),
+            url: "https://example.com/\u{7f}".to_string(),
+        };
+
+        assert_eq!(result.human_summary(), "Example — https://example.com/");
+    }
 
     #[test]
     fn normalize_url_prefixes_bare_hosts() {

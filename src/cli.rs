@@ -679,7 +679,10 @@ pub fn run() -> Result<()> {
         }
         Command::Cleanup(args) => commands::instances::cleanup_until(args.all, deadline)?,
         Command::Open { url, policy } => {
-            commands::nav::open_with_policy(sess!(), &url, &(&policy).into())?
+            let opened = commands::nav::open_with_policy(sess!(), &url, &(&policy).into())?;
+            if cli.format == OutputFormat::Human {
+                println!("{}", opened.human_summary());
+            }
         }
         Command::Back => commands::nav::back(sess!())?,
         Command::Forward => commands::nav::forward(sess!())?,
