@@ -24,7 +24,7 @@
     </ul>
 
     <h2>Installation</h2>
-    <p>rdny builds through the Nix flake for <code>x86_64-linux</code>, <code>aarch64-linux</code>, <code>x86_64-darwin</code>, and <code>aarch64-darwin</code>. SourceHut CI builds and browser-smokes Linux x86_64, runs a native Linux aarch64 build/test manifest, and evaluates Darwin attributes from Linux. Native Darwin CI is unavailable on SourceHut.</p>
+    <p>rdny builds through the Nix flake for <code>x86_64-linux</code>, <code>aarch64-linux</code>, <code>x86_64-darwin</code>, and <code>aarch64-darwin</code>. SourceHut CI builds and browser-smokes Linux x86_64 and evaluates all four system outputs. Native aarch64 and Darwin runners are not currently part of the automatic build matrix.</p>
     <p>Release tarballs are Nix release outputs for matching Nix systems, not yet promised as portable binaries for non-Nix hosts. Verify and inspect them with:</p>
     <pre><code>sha256sum -c rdny-v0.1.0-x86_64-linux.tar.gz.sha256
 tar -xzf rdny-v0.1.0-x86_64-linux.tar.gz

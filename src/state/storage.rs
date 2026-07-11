@@ -9,7 +9,7 @@ use std::{
     },
     path::{Component, Path, PathBuf},
     sync::{
-        Mutex, OnceLock,
+        OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     thread,
@@ -19,6 +19,9 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
+
+#[cfg(target_os = "macos")]
+use std::sync::Mutex;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 static UNIQUE: AtomicU64 = AtomicU64::new(0);
@@ -1055,7 +1058,11 @@ fn validate_trusted_ancestor(file: &File, path: &Path, private: bool, euid: u32)
     }
     let mode = metadata.mode();
     let writable = mode & 0o022 != 0;
-    let root_sticky = uid == 0 && mode & libc::S_ISVTX as u32 != 0;
+    #[cfg(target_os = "macos")]
+    let sticky_bit = u32::from(libc::S_ISVTX);
+    #[cfg(not(target_os = "macos"))]
+    let sticky_bit = libc::S_ISVTX;
+    let root_sticky = uid == 0 && mode & sticky_bit != 0;
     if writable && !root_sticky {
         bail!(
             "external path ancestor {} is group/other writable",

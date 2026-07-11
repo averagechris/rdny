@@ -478,7 +478,11 @@ fn free_bytes(path: &Path) -> u64 {
     unsafe {
         if libc::statvfs(c.as_ptr(), stat.as_mut_ptr()) == 0 {
             let s = stat.assume_init();
-            (s.f_bavail as u64).saturating_mul(s.f_frsize)
+            #[cfg(target_os = "macos")]
+            let available = u64::from(s.f_bavail);
+            #[cfg(not(target_os = "macos"))]
+            let available = s.f_bavail;
+            available.saturating_mul(s.f_frsize)
         } else {
             u64::MAX
         }

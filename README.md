@@ -12,10 +12,9 @@ Protocol from Rust.
 
 rdny currently builds through the Nix flake for `x86_64-linux`,
 `aarch64-linux`, `x86_64-darwin`, and `aarch64-darwin`. SourceHut CI currently
-runs Linux x86_64 jobs for the full check and browser-smoke path. A separate
-native Linux aarch64 manifest builds and tests on SourceHut aarch64. Darwin
-attributes are evaluated from Linux, but native Darwin CI remains unavailable on
-SourceHut and is follow-up work for ticket #139.
+runs Linux x86_64 jobs for the full check and browser-smoke path and evaluates
+all four system outputs. Native aarch64 and Darwin CI runners are not currently
+part of the automatic build matrix.
 
 The most reproducible install path is Nix:
 

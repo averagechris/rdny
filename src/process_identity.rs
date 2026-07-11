@@ -259,7 +259,7 @@ impl ProcessOps for RealOps {
                 libc::SYS_pidfd_send_signal,
                 fd.0,
                 sig,
-                0 as *const libc::c_void,
+                std::ptr::null::<libc::c_void>(),
                 0,
             )
         };
@@ -297,7 +297,6 @@ struct Observed {
 
 #[cfg(target_os = "linux")]
 fn observe(pid: u32) -> Result<Option<Observed>> {
-    use std::os::unix::ffi::OsStringExt;
     let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
