@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use serde_json::json;
 
+use crate::commands::OutputFormat;
 use crate::session::PageSession;
 use crate::state::{self, ViewportOverride};
 
@@ -15,7 +16,15 @@ pub fn viewport(
     mobile: bool,
     reset: bool,
 ) -> Result<()> {
-    viewport_format(sess, width, height, scale, mobile, reset, false)
+    viewport_format(
+        sess,
+        width,
+        height,
+        scale,
+        mobile,
+        reset,
+        OutputFormat::Human,
+    )
 }
 
 pub fn viewport_format(
@@ -25,7 +34,7 @@ pub fn viewport_format(
     scale: f64,
     mobile: bool,
     reset: bool,
-    structured: bool,
+    format: OutputFormat,
 ) -> Result<()> {
     if reset {
         sess.call("Emulation.clearDeviceMetricsOverride", json!({}))?;
@@ -33,11 +42,8 @@ pub fn viewport_format(
             state.viewport = None;
             Ok(())
         })?;
-        if structured {
-            println!(
-                "{}",
-                serde_json::json!({"schemaVersion":1,"kind":"viewport","reset":true,"viewport":null})
-            );
+        if format.is_structured() {
+            format.emit_json(&serde_json::json!({"schemaVersion":1,"kind":"viewport","reset":true,"viewport":null}))?;
         }
         return Ok(());
     }
@@ -55,25 +61,22 @@ pub fn viewport_format(
                 state.viewport = Some(override_.clone());
                 Ok(())
             })?;
-            if structured {
-                println!("{}", viewport_json(&override_, true));
+            if format.is_structured() {
+                format.emit_json(&viewport_json(&override_, true))?;
             }
         }
         (None, None) => {
             if let Some(override_) = state::require()?.viewport {
-                if structured {
-                    println!("{}", viewport_json(&override_, false));
+                if format.is_structured() {
+                    format.emit_json(&viewport_json(&override_, false))?;
                 } else {
                     println!("{}", format_viewport(&override_));
                 }
             } else {
                 let width = value_as_u32(sess.eval("window.innerWidth")?, "window.innerWidth")?;
                 let height = value_as_u32(sess.eval("window.innerHeight")?, "window.innerHeight")?;
-                if structured {
-                    println!(
-                        "{}",
-                        serde_json::json!({"schemaVersion":1,"kind":"viewport","applied":false,"width":width,"height":height,"scale":1.0,"mobile":false})
-                    );
+                if format.is_structured() {
+                    format.emit_json(&serde_json::json!({"schemaVersion":1,"kind":"viewport","applied":false,"width":width,"height":height,"scale":1.0,"mobile":false}))?;
                 } else {
                     println!("{width}x{height}");
                 }

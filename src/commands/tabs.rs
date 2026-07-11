@@ -4,32 +4,28 @@
 use anyhow::Result;
 
 use crate::cdp::http::{self, TargetInfo};
+use crate::commands::OutputFormat;
 use crate::session::Deadline;
 
 /// List open pages with indices; the current page is marked with `*`.
 #[allow(dead_code)]
 pub fn pages() -> Result<()> {
-    pages_format(false)
+    pages_format(OutputFormat::Human)
 }
 
-pub fn pages_format(structured: bool) -> Result<()> {
-    pages_format_until(structured, Deadline::after(http::HTTP_TIMEOUT))
+pub fn pages_format(format: OutputFormat) -> Result<()> {
+    pages_format_until(format, Deadline::after(http::HTTP_TIMEOUT))
 }
 
-pub fn pages_format_until(structured: bool, deadline: Deadline) -> Result<()> {
+pub fn pages_format_until(format: OutputFormat, deadline: Deadline) -> Result<()> {
     let state = crate::state::require()?;
     let pages = page_targets(&state, deadline)?;
-    if structured {
+    if format.is_structured() {
         let rows: Vec<_> = pages.iter().enumerate().map(|(index, target)| serde_json::json!({
             "index": index, "current": state.target_id.as_deref() == Some(target.id.as_str()),
             "id": target.id, "url": target.url, "title": target.title
         })).collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(
-                &serde_json::json!({"schemaVersion":1,"kind":"pages","pages":rows})
-            )?
-        );
+        format.emit_json(&serde_json::json!({"schemaVersion":1,"kind":"pages","pages":rows}))?;
         return Ok(());
     }
     for (index, target) in pages.iter().enumerate() {

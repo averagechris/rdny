@@ -1,7 +1,7 @@
 //! Command-line surface and dispatch.
 
 use anyhow::{Context, Result};
-use clap::{ArgGroup, Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
@@ -9,6 +9,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use crate::browser::{self, BrowserStatus, LaunchOpts};
+use crate::commands::OutputFormat;
 use crate::input::{
     DEFAULT_DRAG_DURATION_MS, DEFAULT_DRAG_STEPS, KeyChord, MAX_DRAG_DURATION_MS, MAX_DRAG_STEPS,
     MIN_DRAG_DURATION_MS, MIN_DRAG_STEPS, MouseButton, PointerPoint, PointerTarget,
@@ -16,12 +17,16 @@ use crate::input::{
 use crate::selector::ElementSelector;
 use crate::{commands, config, session};
 
+const STRUCTURED_COMMAND_INVENTORY: &str = "status, list, cleanup, open, cookie list, viewport, logs, pages, screenshot, screenshot-el, pdf, download FILE, stop-video";
+const TOP_LEVEL_AFTER_HELP: &str = "Structured output commands: status, list, cleanup, open, cookie list, viewport, logs, pages, screenshot, screenshot-el, pdf, download FILE, stop-video.\n\nInput discovery: use `rdny key --help` for key names and `rdny pointer --help` for pointer targets. Trusted key names assume a US keyboard layout.\n\nArtifact commands accept an optional FILE positional. Omit FILE for the default artifact path; use FILE=- only where documented for raw stdout bytes.";
+
 /// Chrome automation from the command line.
 #[derive(Debug, Parser)]
 #[command(
     name = "rdny",
     version,
-    about = "Chrome automation from the command line"
+    about = "Chrome automation from the command line",
+    after_long_help = TOP_LEVEL_AFTER_HELP
 )]
 pub struct Cli {
     /// Seconds to wait for slow operations before giving up.
@@ -102,21 +107,9 @@ impl FromStr for BoundedDuration {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum OutputFormat {
-    Human,
-    Json,
-    Jsonl,
-}
-
 impl OutputFormat {
     fn emit(self, value: &serde_json::Value) -> Result<()> {
-        match self {
-            Self::Human => println!("{}", crate::commands::human_sanitize(&value.to_string())),
-            Self::Json => println!("{}", serde_json::to_string_pretty(value)?),
-            Self::Jsonl => println!("{}", serde_json::to_string(value)?),
-        }
-        Ok(())
+        self.emit_json(value)
     }
 
     fn render_artifact(self, artifact: &commands::artifacts::ProducedArtifact) -> Result<String> {
@@ -226,7 +219,7 @@ pub enum Command {
     },
     /// Press a named key or modifier chord using trusted browser input.
     #[command(
-        after_long_help = "Examples:\n  rdny key Enter\n  rdny key 'Control+Shift+K'\n  rdny key 'Meta+ArrowLeft'"
+        after_long_help = "Supported forms: named keys (Enter, Escape, ArrowLeft), literal US-layout printable keys, and modifier chords joined with '+'. Physical key codes assume a US keyboard layout.\nExamples:\n  rdny key Enter\n  rdny key 'Control+Shift+K'\n  rdny key 'Meta+ArrowLeft'"
     )]
     Key(KeyArgs),
     /// Send trusted pointer movement, button, and drag input.
@@ -261,6 +254,7 @@ pub enum Command {
         /// Replace an existing output file.
         #[arg(long)]
         force: bool,
+        /// Output file. Omit or pass `-` to write raw bytes to stdout in human mode; structured formats require a real file path.
         file: Option<PathBuf>,
     },
     /// Select an option by value.
@@ -307,9 +301,9 @@ pub enum Command {
     Waitidle(WaitQuietArgs),
     /// Sleep for a number of seconds.
     Sleep { seconds: BoundedDuration },
-    /// Capture a screenshot.
+    /// Capture a screenshot. FILE defaults to screenshot.png.
     Screenshot(ScreenshotArgs),
-    /// Capture an element screenshot.
+    /// Capture an element screenshot. SELECTOR chooses the element; FILE defaults to screenshot.png.
     ScreenshotEl {
         selector: String,
         /// Split SELECTOR on `>>>` and traverse nested open shadow roots.
@@ -318,6 +312,7 @@ pub enum Command {
         /// Replace an existing output file.
         #[arg(long)]
         force: bool,
+        /// Output file. Omit for screenshot.png.
         file: Option<PathBuf>,
     },
     /// List open pages.
@@ -332,11 +327,82 @@ pub enum Command {
     },
     /// Start collecting video frames from commands.
     StartVideo,
-    /// Stop collecting frames and assemble a video file.
+    /// Stop collecting frames and assemble a video file. FILE defaults to recording.mp4.
     StopVideo(ArtifactArgs),
 }
 
 impl Command {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Start(_) => "start",
+            Self::Connect { .. } => "connect",
+            Self::Stop => "stop",
+            Self::Status(_) => "status",
+            Self::List => "list",
+            Self::Completion { .. } => "completion",
+            Self::Cleanup(_) => "cleanup",
+            Self::Open { .. } => "open",
+            Self::Back => "back",
+            Self::Forward => "forward",
+            Self::Reload(_) => "reload",
+            Self::ClearCache => "clear-cache",
+            Self::Cookie(_) => "cookie",
+            Self::Url => "url",
+            Self::Title => "title",
+            Self::Html { .. } => "html",
+            Self::Text { .. } => "text",
+            Self::Attr { .. } => "attr",
+            Self::Pdf(_) => "pdf",
+            Self::Js { .. } => "js",
+            Self::Logs(_) => "logs",
+            Self::Viewport(_) => "viewport",
+            Self::Click { .. } => "click",
+            Self::Key(_) => "key",
+            Self::Pointer(_) => "pointer",
+            Self::Input(_) => "input",
+            Self::Clear { .. } => "clear",
+            Self::File { .. } => "file",
+            Self::Download { .. } => "download",
+            Self::Select { .. } => "select",
+            Self::Submit { .. } => "submit",
+            Self::Hover { .. } => "hover",
+            Self::Focus { .. } => "focus",
+            Self::Wait { .. } => "wait",
+            Self::Waitload => "waitload",
+            Self::Waitstable(_) => "waitstable",
+            Self::Waitidle(_) => "waitidle",
+            Self::Sleep { .. } => "sleep",
+            Self::Screenshot(_) => "screenshot",
+            Self::ScreenshotEl { .. } => "screenshot-el",
+            Self::Pages => "pages",
+            Self::Page { .. } => "page",
+            Self::Newpage { .. } => "newpage",
+            Self::StartVideo => "start-video",
+            Self::StopVideo(_) => "stop-video",
+        }
+    }
+
+    fn supports_structured_output(&self) -> bool {
+        matches!(
+            self,
+            Self::Status(_)
+                | Self::List
+                | Self::Cleanup(_)
+                | Self::Open { .. }
+                | Self::Cookie(CookieArgs {
+                    command: CookieCommand::List
+                })
+                | Self::Pdf(_)
+                | Self::Logs(_)
+                | Self::Viewport(_)
+                | Self::Download { .. }
+                | Self::Screenshot(_)
+                | Self::ScreenshotEl { .. }
+                | Self::Pages
+                | Self::StopVideo(_)
+        )
+    }
+
     fn targets_registered_instance(&self) -> bool {
         match self {
             Self::Start(_)
@@ -581,13 +647,13 @@ pub struct InputArgs {
 
 #[derive(Debug, Args)]
 pub struct KeyArgs {
-    /// Named key or `+`-separated modifier chord (for example Control+Shift+K).
+    /// Named key, literal US-layout key, or `+`-separated modifier chord (for example Control+Shift+K).
     pub chord: KeyChord,
 }
 
 #[derive(Debug, Args)]
 #[command(
-    after_long_help = "Examples:\n  rdny pointer move --selector '#handle'\n  rdny pointer move --at 120,80\n  rdny pointer down --selector '#handle' --button left\n  rdny pointer up --at 420,240 --button left\n  rdny pointer drag --from-selector '#handle' --to-selector '#drop-zone'\n  rdny pointer drag --from-at 100,120 --to-selector '#drop-zone'"
+    after_long_help = "Pointer targets are either selector hit-tested action points or explicit X,Y viewport coordinates.\nExamples:\n  rdny pointer move --selector '#handle'\n  rdny pointer move --at 120,80\n  rdny pointer down --selector '#handle' --button left\n  rdny pointer up --at 420,240 --button left\n  rdny pointer drag --from-selector '#handle' --to-selector '#drop-zone'\n  rdny pointer drag --from-at 100,120 --to-selector '#drop-zone'"
 )]
 pub struct PointerArgs {
     #[command(subcommand)]
@@ -732,7 +798,7 @@ pub struct ScreenshotArgs {
     /// Replace an existing output file.
     #[arg(long)]
     pub force: bool,
-    /// Output file.
+    /// Output file. Omit for screenshot.png.
     pub file: Option<PathBuf>,
 }
 
@@ -769,13 +835,13 @@ pub struct ArtifactArgs {
     /// Replace an existing output file.
     #[arg(long)]
     pub force: bool,
-    /// Output file.
+    /// Output file. Omit for page.pdf or recording.mp4, depending on command.
     pub file: Option<PathBuf>,
 }
 
 /// Parse argv and execute the selected command.
 pub fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_adjusted();
     if let Command::Download { file, .. } = &cli.command {
         // Validate stdout ownership before instance selection or browser I/O.
         validate_download_output(cli.format, file.as_deref())?;
@@ -946,14 +1012,14 @@ pub fn run() -> Result<()> {
                 }
             },
         },
-        Command::List => {
-            commands::instances::list_format_until(cli.format != OutputFormat::Human, deadline)?
-        }
+        Command::List => commands::instances::list_format_until(cli.format, deadline)?,
         Command::Completion { shell } => {
-            let mut cmd = Cli::command();
+            let mut cmd = adjusted_command();
             clap_complete::generate(shell, &mut cmd, "rdny", &mut std::io::stdout());
         }
-        Command::Cleanup(args) => commands::instances::cleanup_until(args.all, deadline)?,
+        Command::Cleanup(args) => {
+            commands::instances::cleanup_until(args.all, cli.format, deadline)?
+        }
         Command::Open { url, policy } => {
             let policy = (&policy).into();
             // Validate before `sess!()` connects so rejected input causes no browser I/O.
@@ -989,9 +1055,7 @@ pub fn run() -> Result<()> {
                     },
                 )?
             }
-            CookieCommand::List => {
-                commands::cookie::list_format(sess!(), cli.format != OutputFormat::Human)?
-            }
+            CookieCommand::List => commands::cookie::list_format(sess!(), cli.format)?,
             CookieCommand::Get { name } => commands::cookie::get(sess!(), &name)?,
             CookieCommand::Delete(args) => {
                 commands::cookie::delete(sess!(), &args.name, &args.domain, &args.path)?
@@ -1027,9 +1091,7 @@ pub fn run() -> Result<()> {
             let expression = resolve_js_expression(expression, stdin, stdin_is_tty)?;
             commands::interact::js(sess!(), &expression)?
         }
-        Command::Logs(args) => {
-            commands::logs::logs_format(sess!(), args.follow, cli.format != OutputFormat::Human)?
-        }
+        Command::Logs(args) => commands::logs::logs_format(sess!(), args.follow, cli.format)?,
         Command::Viewport(args) => commands::viewport::viewport_format(
             sess!(),
             args.width,
@@ -1037,7 +1099,7 @@ pub fn run() -> Result<()> {
             args.scale,
             args.mobile,
             args.reset,
-            cli.format != OutputFormat::Human,
+            cli.format,
         )?,
         Command::Click { selector, pierce } => {
             let selector = ElementSelector::parse(selector, pierce)?;
@@ -1178,9 +1240,7 @@ pub fn run() -> Result<()> {
                 commands::shot::screenshot_el(sess!(), &selector, file.as_deref(), force)?;
             cli.format.emit_artifact(&artifact)?;
         }
-        Command::Pages => {
-            commands::tabs::pages_format_until(cli.format != OutputFormat::Human, deadline)?
-        }
+        Command::Pages => commands::tabs::pages_format_until(cli.format, deadline)?,
         Command::Page { index } => commands::tabs::page_until(index, deadline)?,
         Command::Newpage { url, policy } => commands::tabs::newpage_with_policy(
             url.as_deref(),
@@ -1201,6 +1261,43 @@ pub fn run() -> Result<()> {
         session.drain_events(std::time::Duration::from_millis(300))?;
     }
     Ok(())
+}
+
+impl Cli {
+    fn parse_adjusted() -> Self {
+        Self::try_parse_adjusted_from(std::env::args_os()).unwrap_or_else(|err| err.exit())
+    }
+
+    fn try_parse_adjusted_from<I, T>(args: I) -> std::result::Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let mut matches = adjusted_command().try_get_matches_from(args)?;
+        let cli = Self::from_arg_matches_mut(&mut matches)?;
+        validate_format_support_clap(cli.format, &cli.command)?;
+        Ok(cli)
+    }
+}
+
+fn adjusted_command() -> clap::Command {
+    let mut command = Cli::command();
+    command.build();
+    hide_instance_for_non_target_subcommands(&mut command);
+    command
+}
+
+fn hide_instance_for_non_target_subcommands(command: &mut clap::Command) {
+    for name in ["start", "connect", "list", "completion", "cleanup", "sleep"] {
+        if let Some(subcommand) = command.find_subcommand_mut(name)
+            && subcommand
+                .get_arguments()
+                .any(|arg| arg.get_id() == "instance")
+        {
+            let updated = subcommand.clone().mut_arg("instance", |arg| arg.hide(true));
+            *subcommand = updated;
+        }
+    }
 }
 
 fn pointer_target(
@@ -1224,6 +1321,23 @@ fn validate_download_output(format: OutputFormat, file: Option<&Path>) -> Result
         );
     }
     Ok(())
+}
+
+fn validate_format_support_clap(
+    format: OutputFormat,
+    command: &Command,
+) -> std::result::Result<(), clap::Error> {
+    if format == OutputFormat::Human || command.supports_structured_output() {
+        return Ok(());
+    }
+    Err(clap::Error::raw(
+        clap::error::ErrorKind::ValueValidation,
+        format!(
+            "--format json/jsonl is not supported for `{}`; supported structured commands are {}",
+            command.name(),
+            STRUCTURED_COMMAND_INVENTORY
+        ),
+    ))
 }
 
 fn configure_instance_selection(cli: &Cli) -> Result<()> {
@@ -1530,6 +1644,224 @@ mod tests {
 
     fn parse_cli(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).unwrap()
+    }
+
+    fn help_for(path: &[&str]) -> String {
+        let mut command = adjusted_command();
+        for name in path {
+            command = command.find_subcommand(name).unwrap().clone();
+        }
+        let mut buf = Vec::new();
+        command.write_long_help(&mut buf).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn adjusted_help_hides_instance_only_where_inapplicable() {
+        for name in ["start", "connect", "list", "completion", "cleanup", "sleep"] {
+            let help = help_for(&[name]);
+            assert!(!help.contains("--instance <INSTANCE>"), "{name}\n{help}");
+        }
+        for name in ["status", "open", "title", "pages", "screenshot"] {
+            let help = help_for(&[name]);
+            assert!(help.contains("--instance <INSTANCE>"), "{name}\n{help}");
+        }
+        Cli::try_parse_adjusted_from(["rdny", "--instance", "x", "start"]).unwrap();
+    }
+
+    #[test]
+    fn command_specific_help_documents_exact_defaults_and_input_forms() {
+        let download = help_for(&["download"]);
+        assert!(download.contains("Omit or pass `-` to write raw bytes to stdout"));
+        assert!(download.contains("structured formats require a real file path"));
+        let screenshot = help_for(&["screenshot"]);
+        assert!(screenshot.contains("FILE defaults to screenshot.png"));
+        assert!(screenshot.contains("Omit for screenshot.png"));
+        let screenshot_el = help_for(&["screenshot-el"]);
+        assert!(screenshot_el.contains("SELECTOR chooses the element"));
+        assert!(screenshot_el.contains("FILE defaults to screenshot.png"));
+        let pdf = help_for(&["pdf"]);
+        assert!(pdf.contains("page.pdf"));
+        let stop_video = help_for(&["stop-video"]);
+        assert!(stop_video.contains("FILE defaults to recording.mp4"));
+        let key = help_for(&["key"]);
+        assert!(key.contains("US-layout"));
+        assert!(key.contains("modifier chord"));
+        let pointer = help_for(&["pointer"]);
+        assert!(pointer.contains("selector hit-tested action points"));
+        assert!(pointer.contains("X,Y viewport coordinates"));
+    }
+
+    #[test]
+    fn unsupported_structured_formats_are_clap_exit_2_errors() {
+        for format in ["json", "jsonl"] {
+            let cli = Cli::try_parse_adjusted_from([
+                "rdny",
+                "--format",
+                format,
+                "open",
+                "https://example.com/",
+            ])
+            .expect("open supports structured output");
+            assert!(matches!(cli.command, Command::Open { .. }));
+        }
+
+        let err = Cli::try_parse_adjusted_from(["rdny", "--format", "json", "title"])
+            .expect_err("unsupported format should be a clap validation error");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        assert_eq!(err.exit_code(), 2);
+        let message = err.to_string();
+        assert!(message.contains("--format json/jsonl is not supported for `title`"));
+        assert!(message.contains(STRUCTURED_COMMAND_INVENTORY));
+    }
+
+    #[test]
+    fn documented_structured_schema_contract_matrix() {
+        let contracts: Vec<(&str, serde_json::Value, &str)> = vec![
+            (
+                "status",
+                serde_json::json!({"schemaVersion":1,"kind":"status","status":"missing","healthy":false}),
+                "no session",
+            ),
+            (
+                "list",
+                serde_json::json!({"schemaVersion":1,"kind":"list","instances":[]}),
+                "",
+            ),
+            (
+                "cleanup",
+                serde_json::json!({"schemaVersion":1,"kind":"cleanup","results":[{"dir":"/state/a","pid":null,"label":null,"action":"cleaned","reason":"cleaned"},{"dir":"/state/b","pid":42,"label":"b","action":"preserved_inconclusive_timeout","reason":"probe timed out"}]}),
+                "cleaned: /state/a",
+            ),
+            (
+                "open",
+                serde_json::json!({"schemaVersion":1,"kind":"open","url":"https://example.com/"}),
+                "Example — https://example.com/",
+            ),
+            (
+                "cookie list",
+                serde_json::json!({"schemaVersion":1,"kind":"cookies","url":"https://example.com/","cookies":[]}),
+                "",
+            ),
+            (
+                "viewport",
+                serde_json::json!({"schemaVersion":1,"kind":"viewport","applied":false,"width":800,"height":600,"scale":1.0,"mobile":false}),
+                "800x600",
+            ),
+            (
+                "logs",
+                serde_json::json!({"schemaVersion":1,"kind":"log","timestamp":1.0,"instance":"inst","target":"target","cdpSession":"cdp","severity":"log","message":"[log] hi"}),
+                "[log] hi",
+            ),
+            (
+                "pages",
+                serde_json::json!({"schemaVersion":1,"kind":"pages","pages":[{"index":0,"current":true,"id":"target","url":"https://example.com/","title":"Example"},{"index":1,"current":false,"id":"target-2","url":"about:blank","title":""}]}),
+                "* 0: https://example.com/ (Example)",
+            ),
+            (
+                "screenshot",
+                serde_json::from_str(
+                    &OutputFormat::Jsonl
+                        .render_artifact(&output_artifact())
+                        .unwrap(),
+                )
+                .unwrap(),
+                "saved example.png",
+            ),
+            (
+                "screenshot-el",
+                serde_json::from_str(
+                    &OutputFormat::Jsonl
+                        .render_artifact(&output_artifact())
+                        .unwrap(),
+                )
+                .unwrap(),
+                "saved example.png",
+            ),
+            (
+                "pdf",
+                serde_json::from_str(
+                    &OutputFormat::Jsonl
+                        .render_artifact(&output_artifact())
+                        .unwrap(),
+                )
+                .unwrap(),
+                "saved example.png",
+            ),
+            (
+                "download FILE",
+                serde_json::from_str(
+                    &OutputFormat::Jsonl
+                        .render_artifact(&output_artifact())
+                        .unwrap(),
+                )
+                .unwrap(),
+                "saved example.png",
+            ),
+            (
+                "stop-video",
+                serde_json::from_str(
+                    &OutputFormat::Jsonl
+                        .render_artifact(&output_artifact())
+                        .unwrap(),
+                )
+                .unwrap(),
+                "saved example.png",
+            ),
+        ];
+        assert_eq!(
+            contracts
+                .iter()
+                .map(|(name, _, _)| *name)
+                .collect::<Vec<_>>()
+                .join(", "),
+            STRUCTURED_COMMAND_INVENTORY
+        );
+        for (name, value, human_hint) in contracts {
+            assert_eq!(value["schemaVersion"], 1, "{name}");
+            assert!(value["kind"].is_string(), "{name}");
+            let pretty = OutputFormat::Json.render_json(&value).unwrap();
+            assert!(pretty.contains('\n'), "{name} json should be pretty");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&pretty).unwrap(),
+                value
+            );
+            let jsonl = OutputFormat::Jsonl.render_json(&value).unwrap();
+            assert!(
+                !jsonl.contains('\n'),
+                "{name} jsonl should be compact one record"
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&jsonl).unwrap(),
+                value
+            );
+            if !human_hint.is_empty() {
+                assert!(!human_hint.contains('\u{1b}'), "{name} human stdout purity");
+            }
+        }
+
+        let log_one = serde_json::json!({"schemaVersion":1,"kind":"log","timestamp":1.0,"target":"t","severity":"log","message":"one"});
+        let log_two = serde_json::json!({"schemaVersion":1,"kind":"log","timestamp":2.0,"target":"t","severity":"error","message":"two"});
+        let stream = format!(
+            "{}\n{}\n",
+            OutputFormat::Jsonl.render_json(&log_one).unwrap(),
+            OutputFormat::Jsonl.render_json(&log_two).unwrap()
+        );
+        assert_eq!(
+            stream.lines().count(),
+            2,
+            "multi-event logs are one record per line"
+        );
+        let empty_finite = OutputFormat::Jsonl
+            .render_json(&serde_json::json!({"schemaVersion":1,"kind":"list","instances":[]}))
+            .unwrap();
+        assert!(empty_finite.contains("\"instances\":[]"));
+        let multi_finite = OutputFormat::Jsonl.render_json(&serde_json::json!({"schemaVersion":1,"kind":"pages","pages":[{"index":0},{"index":1}]})).unwrap();
+        assert_eq!(
+            multi_finite.lines().count(),
+            1,
+            "finite multi-item jsonl stays one envelope"
+        );
     }
 
     #[test]

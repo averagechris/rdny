@@ -3,13 +3,18 @@
 # CLI output formats and schema version 1
 
 `rdny --format human|json|jsonl` selects output for commands that expose stable
-structured output. Human output is for terminals; page-controlled text is stripped
-of terminal-control bytes before printing. Progress, warnings, and diagnostics are
-written to stderr so stdout remains parseable.
+structured output: `status`, `list`, `cleanup`, `cookie list`, `viewport`,
+`logs`, `pages`, and artifact-producing commands. Human output is for terminals;
+page-controlled text is stripped of terminal-control bytes before printing.
+Progress, warnings, and diagnostics are written to stderr so stdout remains
+parseable. Commands without structured output reject unsupported formats rather
+than silently printing human text.
 
 Every structured record includes `schemaVersion: 1` and `kind`. `json` prints a
 single pretty JSON document. `jsonl` prints one compact JSON document per line;
-streaming commands such as `logs --follow` emit one record per event.
+streaming commands such as `logs --follow` emit one record per event. Empty lists
+are represented as `[]`. Finite multi-item commands wrap results in one document
+containing an array; `jsonl` still uses one compact line for that document.
 
 ## status
 
@@ -30,6 +35,15 @@ running/reachable and non-zero when missing or stale.
 `rdny --instance VALUE` or `RDNY_INSTANCE=VALUE`; it is `null` for discovered
 legacy state that is not registered. Human output prints the same value as
 `selector=...`.
+
+## cleanup
+
+Cleanup records preserve the distinction between dead states and inconclusive
+probes:
+
+```json
+{"schemaVersion":1,"kind":"cleanup","results":[{"dir":"/state","pid":123,"label":"optional","action":"cleaned|preserved_changed|preserved_dead|preserved_inconclusive_expired|preserved_inconclusive_timeout|preserved_inconclusive_unavailable|preserved_live_alive|preserved_live_attached|preserved_live_unverifiable|preserved_live_unrelated","reason":"human diagnostic"}]}
+```
 
 ## pages
 
@@ -60,10 +74,14 @@ and reset/applied state when available.
 ## logs
 
 Use `rdny logs --duration SECONDS` for an explicit finite capture, or
-`rdny logs --follow` for streaming. Structured log records contain:
+`rdny logs --follow` for streaming. Structured log records identify the selected
+rdny browser instance separately from the selected page target. `instance` is
+omitted when the session was not selected from a registered instance;
+`cdpSession` is the lower-level flat CDP session id and is present only when
+Chrome supplied it. Structured log records contain:
 
 ```json
-{"schemaVersion":1,"kind":"log","timestamp":1783737600.123,"instance":"...","target":"...","severity":"info|warning|error|log|warn","message":"..."}
+{"schemaVersion":1,"kind":"log","timestamp":1783737600.123,"instance":"optional selected instance id","target":"selected page target id","cdpSession":"optional flat CDP session id","severity":"info|warning|error|log|warn","message":"..."}
 ```
 
 ## artifacts

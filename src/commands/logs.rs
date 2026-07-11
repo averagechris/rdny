@@ -6,24 +6,28 @@ use anyhow::Result;
 use serde_json::{Value, json};
 
 use crate::cdp::client::Event;
+use crate::commands::OutputFormat;
 use crate::session::PageSession;
 
 /// Enable log domains and print console/log events.
 #[allow(dead_code)]
 pub fn logs(sess: &mut PageSession, follow: bool) -> Result<()> {
-    logs_format(sess, follow, false)
+    logs_format(sess, follow, OutputFormat::Human)
 }
 
-pub fn logs_format(sess: &mut PageSession, follow: bool, structured: bool) -> Result<()> {
+pub fn logs_format(sess: &mut PageSession, follow: bool, format: OutputFormat) -> Result<()> {
     sess.call("Runtime.enable", json!({}))?;
     sess.call("Log.enable", json!({}))?;
 
     let session_id = sess.session_id().to_string();
+    let instance_id = sess.instance_id().map(str::to_string);
+    let target_id = sess.target_id().to_string();
     if follow {
         loop {
             if let Some(event) = sess.next_event_follow(Duration::from_secs(1))?
                 && event.session_id.as_deref() == Some(session_id.as_str())
-                && let Some(line) = event_line_format(&event, structured)
+                && let Some(line) =
+                    event_line_format(&event, format, instance_id.as_deref(), &target_id)
             {
                 println!("{line}");
             }
@@ -34,7 +38,8 @@ pub fn logs_format(sess: &mut PageSession, follow: bool, structured: bool) -> Re
     while !deadline.expired() {
         if let Some(event) = sess.next_event_until(deadline)?
             && event.session_id.as_deref() == Some(session_id.as_str())
-            && let Some(line) = event_line_format(&event, structured)
+            && let Some(line) =
+                event_line_format(&event, format, instance_id.as_deref(), &target_id)
         {
             println!("{line}");
         }
@@ -45,12 +50,17 @@ pub fn logs_format(sess: &mut PageSession, follow: bool, structured: bool) -> Re
 /// Convert a CDP event into the single stdout line rdny logs should print.
 #[allow(dead_code)]
 pub fn event_line(event: &Event) -> Option<String> {
-    event_line_format(event, false)
+    event_line_format(event, OutputFormat::Human, None, "")
 }
 
-pub fn event_line_format(event: &Event, structured: bool) -> Option<String> {
-    if structured {
-        return structured_event(event).map(|v| v.to_string());
+pub fn event_line_format(
+    event: &Event,
+    format: OutputFormat,
+    instance: Option<&str>,
+    target: &str,
+) -> Option<String> {
+    if format.is_structured() {
+        return structured_event(event, instance, target).and_then(|v| format.render_json(&v).ok());
     }
     match event.method.as_str() {
         "Runtime.consoleAPICalled" => console_api_line(&event.params),
@@ -60,7 +70,7 @@ pub fn event_line_format(event: &Event, structured: bool) -> Option<String> {
     }
 }
 
-fn structured_event(event: &Event) -> Option<Value> {
+fn structured_event(event: &Event, instance: Option<&str>, target: &str) -> Option<Value> {
     let (severity, text) = match event.method.as_str() {
         "Runtime.consoleAPICalled" => (
             event
@@ -86,9 +96,14 @@ fn structured_event(event: &Event) -> Option<Value> {
         .duration_since(UNIX_EPOCH)
         .ok()?
         .as_secs_f64();
-    Some(
-        json!({"schemaVersion":1,"kind":"log","timestamp":ts,"instance":event.session_id,"target":event.session_id,"severity":severity,"message":text}),
-    )
+    let mut record = json!({"schemaVersion":1,"kind":"log","timestamp":ts,"target":target,"severity":severity,"message":text});
+    if let Some(instance) = instance {
+        record["instance"] = json!(instance);
+    }
+    if let Some(cdp_session) = event.session_id.as_deref() {
+        record["cdpSession"] = json!(cdp_session);
+    }
+    Some(record)
 }
 
 fn console_api_line(params: &Value) -> Option<String> {
@@ -203,5 +218,47 @@ mod tests {
         ));
         assert_eq!(line.as_deref(), Some("[error] (javascript) failed"));
         assert!(event_line(&event("Page.loadEventFired", json!({}))).is_none());
+    }
+
+    #[test]
+    fn structured_log_uses_instance_target_and_separate_cdp_session() {
+        let raw = event_line_format(
+            &event(
+                "Runtime.consoleAPICalled",
+                json!({"type":"log","args":[{"type":"string","value":"hi"}]}),
+            ),
+            OutputFormat::Jsonl,
+            Some("inst-1"),
+            "target-1",
+        )
+        .unwrap();
+        assert!(!raw.contains('\n'));
+        let parsed: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["schemaVersion"], 1);
+        assert_eq!(parsed["kind"], "log");
+        assert_eq!(parsed["instance"], "inst-1");
+        assert_eq!(parsed["target"], "target-1");
+        assert_eq!(parsed["cdpSession"], "s1");
+        assert_ne!(parsed["instance"], parsed["cdpSession"]);
+        assert_ne!(parsed["target"], parsed["cdpSession"]);
+    }
+
+    #[test]
+    fn structured_log_omits_absent_instance() {
+        let raw = event_line_format(
+            &event(
+                "Log.entryAdded",
+                json!({"entry":{"level":"info","text":"ok"}}),
+            ),
+            OutputFormat::Json,
+            None,
+            "target-2",
+        )
+        .unwrap();
+        assert!(raw.contains('\n'));
+        let parsed: Value = serde_json::from_str(&raw).unwrap();
+        assert!(parsed.get("instance").is_none());
+        assert_eq!(parsed["target"], "target-2");
+        assert_eq!(parsed["cdpSession"], "s1");
     }
 }

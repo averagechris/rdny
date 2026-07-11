@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
+use crate::commands::OutputFormat;
 use crate::session::PageSession;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,19 +50,14 @@ pub fn set(sess: &mut PageSession, cookie: &SetCookie<'_>) -> Result<()> {
 
 #[allow(dead_code)]
 pub fn list(sess: &mut PageSession) -> Result<()> {
-    list_format(sess, false)
+    list_format(sess, OutputFormat::Human)
 }
 
-pub fn list_format(sess: &mut PageSession, structured: bool) -> Result<()> {
+pub fn list_format(sess: &mut PageSession, format: OutputFormat) -> Result<()> {
     let url = current_url(sess)?;
     let cookies = cookies_for_urls(sess, std::slice::from_ref(&url))?;
-    if structured {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(
-                &json!({"schemaVersion":1,"kind":"cookies","url":url,"cookies": normalize_cookie_list(&cookies)})
-            )?
-        );
+    if format.is_structured() {
+        format.emit_json(&json!({"schemaVersion":1,"kind":"cookies","url":url,"cookies": normalize_cookie_list(&cookies)}))?;
     } else {
         for line in format_cookie_list(&cookies) {
             println!("{line}");

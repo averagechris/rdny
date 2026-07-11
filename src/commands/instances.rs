@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 
 use crate::browser;
 use crate::cdp::http;
+use crate::commands::OutputFormat;
 use crate::process_identity::{self, ProcessClass};
 use crate::session::Deadline;
 use crate::state::{self, Generation, Inspection, SessionState};
@@ -254,14 +255,14 @@ pub struct ResolvedInstance {
 
 #[allow(dead_code)]
 pub fn list() -> Result<()> {
-    list_format(false)
+    list_format(OutputFormat::Human)
 }
 
-pub fn list_format(structured: bool) -> Result<()> {
-    list_format_until(structured, Deadline::after(http::HTTP_TIMEOUT))
+pub fn list_format(format: OutputFormat) -> Result<()> {
+    list_format_until(format, Deadline::after(http::HTTP_TIMEOUT))
 }
 
-pub fn list_format_until(structured: bool, deadline: Deadline) -> Result<()> {
+pub fn list_format_until(format: OutputFormat, deadline: Deadline) -> Result<()> {
     let discovery = discover()?;
     for diagnostic in &discovery.diagnostics {
         eprintln!("warning: {diagnostic}");
@@ -269,7 +270,7 @@ pub fn list_format_until(structured: bool, deadline: Deadline) -> Result<()> {
     let mut rows = Vec::new();
     for instance in discovery.instances {
         let liveness = probe_liveness_until(&instance.state, deadline);
-        if structured {
+        if format.is_structured() {
             let selector = instance
                 .registered
                 .then(|| instance.registry_instance_id.clone())
@@ -292,18 +293,13 @@ pub fn list_format_until(structured: bool, deadline: Deadline) -> Result<()> {
             );
         }
     }
-    if structured {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(
-                &serde_json::json!({"schemaVersion":1,"kind":"list","instances":rows})
-            )?
-        );
+    if format.is_structured() {
+        format.emit_json(&serde_json::json!({"schemaVersion":1,"kind":"list","instances":rows}))?;
     }
     Ok(())
 }
 
-pub fn cleanup_until(all: bool, deadline: Deadline) -> Result<()> {
+pub fn cleanup_until(all: bool, format: OutputFormat, deadline: Deadline) -> Result<()> {
     let discovery = discover()?;
     for diagnostic in &discovery.diagnostics {
         eprintln!("warning: {diagnostic}");
@@ -327,6 +323,10 @@ pub fn cleanup_until(all: bool, deadline: Deadline) -> Result<()> {
         |state| cleanup_probe_liveness_until(state, deadline),
         Some(deadline),
     )?;
+    if format.is_structured() {
+        format.emit_json(&serde_json::json!({"schemaVersion":1,"kind":"cleanup","results":report.structured_rows()}))?;
+        return Ok(());
+    }
     for entry in &report.entries {
         if entry.decision != CleanupDecision::Cleaned {
             eprintln!(
