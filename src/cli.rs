@@ -245,6 +245,12 @@ pub struct UrlPolicyArgs {
     /// Permit data: URLs.
     #[arg(long)]
     allow_data_url: bool,
+    /// Permit privileged chrome: browser-internal URLs.
+    #[arg(long)]
+    allow_chrome_url: bool,
+    /// Permit chrome-extension: URLs for installed 32-character extension IDs.
+    #[arg(long)]
+    allow_chrome_extension_url: bool,
     /// Permit RFC1918/ULA literal addresses (loopback stays enabled).
     #[arg(long)]
     allow_private_url: bool,
@@ -261,6 +267,8 @@ impl From<&UrlPolicyArgs> for commands::nav::UrlPolicy {
         Self {
             allow_file: args.allow_file_url,
             allow_data: args.allow_data_url,
+            allow_chrome: args.allow_chrome_url,
+            allow_chrome_extension: args.allow_chrome_extension_url,
             allow_private: args.allow_private_url,
             allow_link_local: args.allow_link_local_url,
             allow_local: args.allow_local_url,
@@ -679,7 +687,10 @@ pub fn run() -> Result<()> {
         }
         Command::Cleanup(args) => commands::instances::cleanup_until(args.all, deadline)?,
         Command::Open { url, policy } => {
-            let opened = commands::nav::open_with_policy(sess!(), &url, &(&policy).into())?;
+            let policy = (&policy).into();
+            // Validate before `sess!()` connects so rejected input causes no browser I/O.
+            commands::nav::normalize_url(&url, &policy)?;
+            let opened = commands::nav::open_with_policy(sess!(), &url, &policy)?;
             if cli.format == OutputFormat::Human {
                 println!("{}", opened.human_summary());
             }
@@ -1244,6 +1255,30 @@ mod tests {
         assert!(
             matches!(parse(&["rdny", "download", "a.link", "-"]), Command::Download { selector, file: Some(file), force: false, max_bytes: None } if selector == "a.link" && file.as_os_str() == "-")
         );
+    }
+
+    #[test]
+    fn parses_separate_chromium_internal_url_opt_ins() {
+        match parse(&["rdny", "open", "chrome://version", "--allow-chrome-url"]) {
+            Command::Open { policy, .. } => {
+                assert!(policy.allow_chrome_url);
+                assert!(!policy.allow_chrome_extension_url);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        match parse(&[
+            "rdny",
+            "newpage",
+            "chrome-extension://abcdefghijklmnopabcdefghijklmnop/page.html",
+            "--allow-chrome-extension-url",
+        ]) {
+            Command::Newpage { policy, .. } => {
+                assert!(!policy.allow_chrome_url);
+                assert!(policy.allow_chrome_extension_url);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]

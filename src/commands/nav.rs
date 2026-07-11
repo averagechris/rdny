@@ -27,6 +27,8 @@ impl OpenResult {
 pub struct UrlPolicy {
     pub allow_file: bool,
     pub allow_data: bool,
+    pub allow_chrome: bool,
+    pub allow_chrome_extension: bool,
     pub allow_private: bool,
     pub allow_link_local: bool,
     pub allow_local: bool,
@@ -61,12 +63,29 @@ pub fn normalize_url(url: &str, policy: &UrlPolicy) -> Result<String> {
     if !parsed.username().is_empty() || parsed.password().is_some() {
         bail!("URLs containing embedded credentials are not supported");
     }
+    validate_chromium_internal_url(&parsed, &candidate)?;
     match parsed.scheme() {
         "http" | "https" | "about" => {}
         "file" if policy.allow_file => {}
         "data" if policy.allow_data => {}
+        "chrome" if policy.allow_chrome => {}
+        "chrome-extension" if policy.allow_chrome_extension => {}
         "file" => bail!("file: URLs require --allow-file-url"),
         "data" => bail!("data: URLs require --allow-data-url"),
+        "chrome" => {
+            return Err(crate::hint::hint_error(
+                "chrome: URLs require --allow-chrome-url",
+                "retry with `--allow-chrome-url` only for a trusted Chromium internal page",
+                None,
+            ));
+        }
+        "chrome-extension" => {
+            return Err(crate::hint::hint_error(
+                "chrome-extension: URLs require --allow-chrome-extension-url",
+                "retry with `--allow-chrome-extension-url` only for a trusted installed extension",
+                None,
+            ));
+        }
         scheme => bail!("unsupported URL scheme `{scheme}`"),
     }
     if let Some(host) = parsed.host_str() {
@@ -97,6 +116,53 @@ pub fn normalize_url(url: &str, policy: &UrlPolicy) -> Result<String> {
         }
     }
     Ok(parsed.into())
+}
+
+fn validate_chromium_internal_url(parsed: &url::Url, candidate: &str) -> Result<()> {
+    match parsed.scheme() {
+        "chrome" => {
+            if parsed.port().is_some() {
+                bail!("malformed chrome: URL: ports are not supported");
+            }
+            let Some(url::Host::Domain(page)) = parsed.host() else {
+                bail!("malformed chrome: URL: expected chrome://PAGE");
+            };
+            if page.is_empty()
+                || page.starts_with('-')
+                || page.ends_with('-')
+                || !page
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            {
+                bail!("malformed chrome: URL: invalid internal page name");
+            }
+        }
+        "chrome-extension" => {
+            if parsed.port().is_some() {
+                bail!("malformed chrome-extension: URL: ports are not supported");
+            }
+            let Some(url::Host::Domain(extension_id)) = parsed.host() else {
+                bail!(
+                    "malformed chrome-extension: URL: expected a 32-character extension ID after //"
+                );
+            };
+            if extension_id.len() != 32
+                || !extension_id
+                    .bytes()
+                    .all(|byte| (b'a'..=b'p').contains(&byte))
+                || candidate
+                    .split_once("://")
+                    .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or_default())
+                    != Some(extension_id)
+            {
+                bail!(
+                    "malformed chrome-extension: URL: extension ID must be 32 lowercase letters from a to p"
+                );
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn ipv6_is_unique_local(ip: Ipv6Addr) -> bool {
@@ -293,6 +359,101 @@ mod tests {
         assert!(normalize_url("https://example.com/\r\nX: y", &policy).is_err());
         assert!(normalize_url("http://[broken", &policy).is_err());
         assert!(normalize_url("https://example.com/%zz", &policy).is_err());
+    }
+
+    #[test]
+    fn chromium_internal_urls_are_denied_with_exact_retry_flags() {
+        let chrome_error = normalize_url("chrome://version", &UrlPolicy::default()).unwrap_err();
+        assert_eq!(
+            chrome_error.to_string(),
+            "chrome: URLs require --allow-chrome-url\nhint: retry with `--allow-chrome-url` only for a trusted Chromium internal page"
+        );
+
+        let extension_error = normalize_url(
+            "chrome-extension://abcdefghijklmnopabcdefghijklmnop/page.html",
+            &UrlPolicy::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            extension_error.to_string(),
+            "chrome-extension: URLs require --allow-chrome-extension-url\nhint: retry with `--allow-chrome-extension-url` only for a trusted installed extension"
+        );
+    }
+
+    #[test]
+    fn explicit_internal_url_flags_are_independent() {
+        let chrome_policy = UrlPolicy {
+            allow_chrome: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            normalize_url("chrome://settings/content", &chrome_policy).unwrap(),
+            "chrome://settings/content"
+        );
+        assert!(
+            normalize_url(
+                "chrome-extension://abcdefghijklmnopabcdefghijklmnop/page.html",
+                &chrome_policy,
+            )
+            .is_err()
+        );
+
+        let extension_policy = UrlPolicy {
+            allow_chrome_extension: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            normalize_url(
+                "chrome-extension://abcdefghijklmnopabcdefghijklmnop/page.html",
+                &extension_policy,
+            )
+            .unwrap(),
+            "chrome-extension://abcdefghijklmnopabcdefghijklmnop/page.html"
+        );
+        assert!(normalize_url("chrome://version", &extension_policy).is_err());
+    }
+
+    #[test]
+    fn malformed_internal_urls_are_rejected_even_with_opt_ins() {
+        let policy = UrlPolicy {
+            allow_chrome: true,
+            allow_chrome_extension: true,
+            ..Default::default()
+        };
+        for url in [
+            "chrome:///version",
+            "chrome://-version",
+            "chrome://version-",
+            "chrome://version.example",
+            "chrome://version:80",
+            "chrome-extension:///page.html",
+            "chrome-extension://abcdefghijklmnop/page.html",
+            "chrome-extension://abcdefghijklmnopabcdefghijklmnopq/page.html",
+            "chrome-extension://ABCDEFGHIJKLMNOPABCDEFGHIJKLMNOP/page.html",
+            "chrome-extension://qrstuvwxyzabcdefqrstuvwxyzabcdef/page.html",
+            "chrome-extension://abcdefghijklmnopabcdefghijklmnop:80/page.html",
+        ] {
+            assert!(normalize_url(url, &policy).is_err(), "accepted {url}");
+        }
+    }
+
+    #[test]
+    fn internal_opt_ins_do_not_allow_credentials_controls_or_other_schemes() {
+        let policy = UrlPolicy {
+            allow_chrome: true,
+            allow_chrome_extension: true,
+            ..Default::default()
+        };
+        for url in [
+            "chrome://user@version/",
+            "chrome-extension://user@abcdefghijklmnopabcdefghijklmnop/page.html",
+            "chrome://version/\nsettings",
+            "chrome-extension://abcdefghijklmnopabcdefghijklmnop/%zz",
+            "devtools://devtools/bundled/inspector.html",
+            "javascript:alert(1)",
+        ] {
+            assert!(normalize_url(url, &policy).is_err(), "accepted {url}");
+        }
     }
 
     #[test]

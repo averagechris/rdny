@@ -88,6 +88,32 @@ expect_contains "status running" "running:" "$("${RDNY[@]}" status)"
 expect "url" "file://$page" "$("${RDNY[@]}" url)"
 expect "title" "rdny smoke" "$("${RDNY[@]}" title)"
 
+# Chromium internal URLs stay denied by default, fail without changing the
+# current page when malformed, and navigate only with the explicit privilege.
+if internal_error=$("${RDNY[@]}" open "chrome://version" 2>&1); then
+  fail "chrome URL without opt-in should fail"
+fi
+expect_contains "chrome denial retry flag" "--allow-chrome-url" "$internal_error"
+expect "denied chrome URL leaves page unchanged" "file://$page" "$("${RDNY[@]}" url)"
+if extension_error=$("${RDNY[@]}" open "chrome-extension://abcdefghijklmnopabcdefghijklmnop/page.html" 2>&1); then
+  fail "chrome-extension URL without opt-in should fail"
+fi
+expect_contains "chrome-extension denial retry flag" "--allow-chrome-extension-url" "$extension_error"
+expect "denied chrome-extension URL leaves page unchanged" "file://$page" "$("${RDNY[@]}" url)"
+if malformed_error=$("${RDNY[@]}" open "chrome:///version" --allow-chrome-url 2>&1); then
+  fail "malformed chrome URL should fail"
+fi
+expect_contains "malformed chrome URL" "malformed chrome: URL" "$malformed_error"
+expect "malformed chrome URL leaves page unchanged" "file://$page" "$("${RDNY[@]}" url)"
+if malformed_extension_error=$("${RDNY[@]}" open "chrome-extension://too-short/page.html" --allow-chrome-extension-url 2>&1); then
+  fail "malformed chrome-extension URL should fail"
+fi
+expect_contains "malformed chrome-extension URL" "malformed chrome-extension: URL" "$malformed_extension_error"
+expect "malformed chrome-extension URL leaves page unchanged" "file://$page" "$("${RDNY[@]}" url)"
+"${RDNY[@]}" open "chrome://version" --allow-chrome-url >/dev/null
+expect_contains "allowed chrome open" "chrome://version" "$("${RDNY[@]}" url)"
+"${RDNY[@]}" open "file://$page" --allow-file-url >/dev/null
+
 # --- page info -------------------------------------------------------
 expect "text" "Smoke Page" "$("${RDNY[@]}" text '#heading')"
 expect "attr" "https://example.com/dl" "$("${RDNY[@]}" attr '#link' href)"
@@ -135,6 +161,8 @@ echo "smoke: ok: video"
 # --- tabs ------------------------------------------------------------
 "${RDNY[@]}" newpage "file://$page" --allow-file-url >/dev/null
 expect_contains "pages lists two" "1: " "$("${RDNY[@]}" pages)"
+"${RDNY[@]}" newpage "chrome://version" --allow-chrome-url >/dev/null
+expect_contains "allowed chrome newpage" "chrome://version" "$("${RDNY[@]}" url)"
 "${RDNY[@]}" page 0 >/dev/null
 expect_contains "pages marker moved" "* 0:" "$("${RDNY[@]}" pages)"
 

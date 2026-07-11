@@ -327,9 +327,23 @@ embedded credentials, and unsupported schemes are rejected. `file:`, `data:`,
 RFC1918/ULA literals, link-local literals, and `.local` names require their
 corresponding explicit flags: `--allow-file-url`, `--allow-data-url`,
 `--allow-private-url`, `--allow-link-local-url`, or `--allow-local-url`.
-Loopback remains allowed by default. The policy is checked before navigation;
-pages can still redirect, and hostname DNS can change after validation, so use
-an isolated browser profile/network when automating untrusted pages.
+Loopback remains allowed by default.
+
+Chromium's internal pages are a separate privilege boundary and are denied by
+default. Use `--allow-chrome-url` on `open` or a URL-bearing `newpage` to permit
+a trusted `chrome://` page. Use the separate `--allow-chrome-extension-url`
+flag for `chrome-extension://` pages: those pages can execute with the installed
+extension's permissions, not ordinary web-page permissions. The URL authority
+must be the extension's exact 32-character lowercase ID (letters `a` through
+`p`), for example
+`chrome-extension://abcdefghijklmnopabcdefghijklmnop/page.html`. The flag does
+not install or load an extension; an unknown or unavailable ID can still be
+rejected by Chromium. Do not pass either opt-in for untrusted input.
+
+All URL policy checks happen before browser I/O. Pages can still redirect, and
+hostname DNS can change after validation, so use an isolated browser
+profile/network when automating untrusted pages. Internal-URL opt-ins do not
+weaken the independent private-network, file, or data URL policies.
 
 ## Wait semantics
 

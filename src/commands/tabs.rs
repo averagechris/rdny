@@ -70,10 +70,10 @@ pub fn newpage_with_policy(
     deadline: Deadline,
     policy: &crate::commands::nav::UrlPolicy,
 ) -> Result<()> {
-    let state = crate::state::require()?;
     let normalized = url
         .map(|url| crate::commands::nav::normalize_url(url, policy))
         .transpose()?;
+    let state = crate::state::require()?;
     let target = crate::session::create_target_until(&state, deadline)?;
     crate::state::update(|state| {
         state.target_id = Some(target.id.clone());
