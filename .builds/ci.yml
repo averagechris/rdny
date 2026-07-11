@@ -54,5 +54,3 @@ tasks:
   - release-facing: |
       cd rdny
       nix run .#ci-release-facing
-artifacts:
-  - rdny/smoke-artifacts

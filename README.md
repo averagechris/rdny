@@ -53,11 +53,11 @@ additionally requires ffmpeg. Provide paths with
 `RDNY_CHROME` and `RDNY_FFMPEG`, config file entries, or use the Nix wrappers
 described below.
 
-SourceHut only uploads declared build artifacts for successful jobs. The smoke
-wrapper therefore records status and artifacts, prints captured smoke logs inline
+The smoke wrapper records status and evidence, prints captured smoke logs inline
 on failure, exits successfully, and lets a following gate task fail the build
-from the recorded status. Failed smoke evidence is retained in the SourceHut task
-log; successful smoke artifacts are also exposed as build artifacts.
+from the recorded status. Smoke evidence is retained in the SourceHut task log;
+the provider's directory-artifact upload is not used because it is unreliable for
+this browser-backed job.
 
 ## Quickstart
 

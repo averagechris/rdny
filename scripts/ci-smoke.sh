@@ -59,8 +59,8 @@ else
   printf 'ci-smoke: PASS; artifacts in %s\n' "$RDNY_SMOKE_WORKDIR"
 fi
 
-# Deliberately exit success so SourceHut proceeds to ci-smoke-gate. SourceHut
-# only uploads declared artifacts for successful jobs, so failed smoke evidence
-# is primarily retained in the always-addressable task log; successful jobs also
-# expose smoke-artifacts as declared build artifacts.
+# Deliberately exit success so SourceHut proceeds to ci-smoke-gate. Smoke
+# evidence is retained in the always-addressable task log; directory artifact
+# uploads are intentionally avoided because the provider rejects them
+# inconsistently for this browser-backed job.
 exit 0

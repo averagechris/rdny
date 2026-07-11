@@ -16,7 +16,7 @@
       <p class="nav"><a href="https://averagechris.srht.site/">~averagechris</a> / <a href="index.html">rdny</a> / demo</p>
 
         <h1>rdny demo</h1>
-        <p>This demo uses only commands available in the current CLI. CI generates the actual browser-backed transcript as <code>smoke-artifacts/docs-demo-transcript.txt</code>, alongside screenshots, PDF, video, browser state, and logs. SourceHut uploads those artifacts for successful jobs; failed smoke logs are printed inline before the gate task fails the build. Port, pid, and browser path values are intentionally run-specific.</p>
+        <p>This demo uses only commands available in the current CLI. CI generates an actual browser-backed transcript alongside screenshots, PDF, video, and logs. Smoke evidence is retained in the SourceHut task log, and failed smoke logs are printed inline before the gate task fails the build. Browser state is never published. Port, pid, and browser path values are intentionally run-specific.</p>
         <pre><code>$ scripts/ci-smoke.sh ./result-rdny-bundled/bin/rdny
 ci-smoke: PASS; artifacts in .../smoke-artifacts
 $ scripts/ci-smoke-gate.sh
