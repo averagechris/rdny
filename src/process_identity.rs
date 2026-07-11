@@ -746,12 +746,15 @@ mod tests {
         let mut child = test_helper_command(&wrapper).spawn().unwrap();
         let pid = child.id();
         let id = capture(pid, &wrapper, None).unwrap();
-        assert_eq!(normalize(&id.exe), normalize(&executable));
-        assert_ne!(normalize(&wrapper), normalize(&id.exe));
-        assert!(matches_identity(pid, &id).unwrap());
+        let observed_executable = normalize(&id.exe);
+        let identity_matches = matches_identity(pid, &id).unwrap();
         terminate(&id).unwrap();
-        assert!(!matches_identity(pid, &id).unwrap());
+        let identity_gone = !matches_identity(pid, &id).unwrap();
         let _ = child.wait();
+        assert_eq!(observed_executable, normalize(&executable));
+        assert_ne!(wrapper, id.exe);
+        assert!(identity_matches);
+        assert!(identity_gone);
     }
 
     #[cfg(target_os = "linux")]
