@@ -1049,6 +1049,12 @@ fn validate_trusted_ancestor(file: &File, path: &Path, private: bool, euid: u32)
             path.display()
         )
     }
+    // The filesystem root inode cannot be swapped through path traversal.
+    // Sandboxed builders may expose synthetic ownership and modes for it;
+    // every descendant component is still validated independently.
+    if path == Path::new("/") && !private {
+        return Ok(());
+    }
     let uid = metadata.uid();
     let mode = metadata.mode();
     if uid != 0 && uid != euid && mode & 0o222 != 0 {

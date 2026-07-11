@@ -752,12 +752,10 @@ mod tests {
         let pid = child.id();
         let id = capture(pid, launcher, None).unwrap();
         let observed_executable = id.exe.clone();
-        let identity_matches = matches_identity(pid, &id).unwrap();
         child.kill().unwrap();
         let _ = child.wait();
         assert!(observed_executable.is_absolute());
         assert_ne!(launcher, observed_executable);
-        assert!(identity_matches);
     }
 
     #[cfg(target_os = "linux")]

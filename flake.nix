@@ -102,6 +102,9 @@
         version = package.version;
         src = lib.cleanSource ./.;
         cargoLock.lockFile = ./Cargo.lock;
+        # Tests run as a dedicated mandatory CI task. Avoid rerunning the
+        # process-heavy suite inside every package and wrapper build.
+        doCheck = false;
         postInstall = ''
           install -Dm644 LICENSE "$out/share/licenses/rdny/LICENSE"
         '';
