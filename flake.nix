@@ -64,7 +64,7 @@
         cargo sort --workspace --check
       '';
     ciSmoke = system:
-      mkToolApp system "ci-smoke" [(pkgsFor system).bash (pkgsFor system).coreutils (pkgsFor system).gnugrep] ''
+      mkToolApp system "ci-smoke" [(pkgsFor system).bash (pkgsFor system).coreutils (pkgsFor system).gnugrep (pkgsFor system).python3] ''
         exec bash scripts/ci-smoke.sh "$@"
       '';
     ciSmokeGate = system:
@@ -72,7 +72,7 @@
         exec bash scripts/ci-smoke-gate.sh "$@"
       '';
     ciSmokeFlowTest = system:
-      mkToolApp system "ci-smoke-flow-test" [(pkgsFor system).bash (pkgsFor system).coreutils (pkgsFor system).gnugrep] ''
+      mkToolApp system "ci-smoke-flow-test" [(pkgsFor system).bash (pkgsFor system).coreutils (pkgsFor system).gnugrep (pkgsFor system).python3] ''
         exec bash scripts/ci-smoke-flow-test.sh "$@"
       '';
     ciReleaseFacing = system:

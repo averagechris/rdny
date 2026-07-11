@@ -3,8 +3,8 @@
 # CLI output formats and schema version 1
 
 `rdny --format human|json|jsonl` selects output for commands that expose stable
-structured output: `status`, `list`, `cleanup`, `cookie list`, `viewport`,
-`logs`, `pages`, and artifact-producing commands. Human output is for terminals;
+structured output: `status`, `list`, `cleanup`, `open`, `cookie list`,
+`viewport`, `logs`, `pages`, and artifact-producing commands. Human output is for terminals;
 page-controlled text is stripped of terminal-control bytes before printing.
 Progress, warnings, and diagnostics are written to stderr so stdout remains
 parseable. Commands without structured output reject unsupported formats rather
@@ -43,6 +43,15 @@ probes:
 
 ```json
 {"schemaVersion":1,"kind":"cleanup","results":[{"dir":"/state","pid":123,"label":"optional","action":"cleaned|preserved_changed|preserved_dead|preserved_inconclusive_expired|preserved_inconclusive_timeout|preserved_inconclusive_unavailable|preserved_live_alive|preserved_live_attached|preserved_live_unverifiable|preserved_live_unrelated","reason":"human diagnostic"}]}
+```
+
+## open
+
+`rdny open URL --format json|jsonl` reports the committed navigation URL without
+suppressing stdout:
+
+```json
+{"schemaVersion":1,"kind":"open","url":"https://example.com/"}
 ```
 
 ## pages

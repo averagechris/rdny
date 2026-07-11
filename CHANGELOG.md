@@ -2,9 +2,28 @@
 
 ## Unreleased
 
-- Added trusted named-key chords plus explicit selector/coordinate pointer
-  move, down, up, and bounded drag commands with hit testing and best-effort
-  release cleanup (~averagechris/projects#181).
+- Added explicit opt-ins for Chromium internal URLs and aliases
+  (~averagechris/projects#179).
+- Added exact instance selection help and registry selector ergonomics for
+  multi-session workflows (~averagechris/projects#180).
+- Added trusted keyboard and pointer input commands with documented US-layout key
+  behavior and selector/coordinate pointer forms (~averagechris/projects#181).
+- Added occluded-click diagnosis with actionable hit-test details
+  (~averagechris/projects#182).
+- Added open-shadow-root selector traversal with `--pierce` help coverage
+  (~averagechris/projects#183).
+- Added artifact output schemas and download raw-stdout compatibility: omitted
+  `download FILE` or `FILE=-` keeps raw stdout only in human mode, while
+  structured formats require a real file path (~averagechris/projects#184).
+- Improved CLI output/help ergonomics: structured commands now share exact
+  `json`/`jsonl` serialization, unsupported `--format` combinations fail early,
+  `open --format json|jsonl` reports navigation, top-level help inventories
+  structured commands, key/pointer help documents discovery and the US-layout key
+  limitation, artifact FILE/stdout help is explicit, and smoke wrappers verify
+  Python-backed schema checks. Compatibility note: scripts that passed
+  `--format json|jsonl` to commands without structured schemas must remove it or
+  switch to one of the documented structured commands
+  (~averagechris/projects#221, ~averagechris/projects#225).
 - Made `rdny cleanup` preserve inconclusive attached-session probes by default
   and documented `--all` as the explicit state-removal override
   (~averagechris/projects#220).

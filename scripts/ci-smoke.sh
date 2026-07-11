@@ -20,6 +20,11 @@ if [[ -n ${RDNY_SMOKE_FAKE_STATUS:-} ]]; then
   status=$RDNY_SMOKE_FAKE_STATUS
   {
     printf 'fake smoke status: %s\n' "$status"
+    command -v python3 >/dev/null
+    python3 - <<'PY'
+import json
+assert json.loads('{"schemaVersion":1}')["schemaVersion"] == 1
+PY
     printf 'fake smoke evidence line\n'
   } >"$RDNY_SMOKE_WORKDIR/smoke.log" 2>&1
 else
