@@ -723,10 +723,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn real_spawned_process_capture_and_terminate() {
-        let sleep = Path::new("/bin/sleep");
-        let mut child = std::process::Command::new(sleep).arg("30").spawn().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut child = test_helper_command(&executable).spawn().unwrap();
         let pid = child.id();
-        let id = capture(pid, sleep, None).unwrap();
+        let id = capture(pid, &executable, None).unwrap();
         assert!(matches_identity(pid, &id).unwrap());
         terminate(&id).unwrap();
         assert!(!matches_identity(pid, &id).unwrap());
@@ -736,24 +736,46 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn wrapper_script_exec_runtime_exe_capture_and_terminate() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
         let wrapper = dir.path().join("chrome-wrapper");
-        std::fs::write(&wrapper, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
-        let mut perms = std::fs::metadata(&wrapper).unwrap().permissions();
-        perms.set_mode(0o700);
-        std::fs::set_permissions(&wrapper, perms).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        symlink(&executable, &wrapper).unwrap();
 
-        let mut child = std::process::Command::new(&wrapper).spawn().unwrap();
+        let mut child = test_helper_command(&wrapper).spawn().unwrap();
         let pid = child.id();
         let id = capture(pid, &wrapper, None).unwrap();
-        assert_eq!(normalize(&id.exe), normalize(Path::new("/bin/sleep")));
+        assert_eq!(normalize(&id.exe), normalize(&executable));
         assert_ne!(normalize(&wrapper), normalize(&id.exe));
         assert!(matches_identity(pid, &id).unwrap());
         terminate(&id).unwrap();
         assert!(!matches_identity(pid, &id).unwrap());
         let _ = child.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_helper_command(executable: &Path) -> std::process::Command {
+        let mut command = std::process::Command::new(executable);
+        command
+            .args([
+                "--exact",
+                "process_identity::tests::long_running_process_helper",
+                "--nocapture",
+            ])
+            .env("RDNY_LONG_RUNNING_PROCESS_HELPER", "1");
+        command
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn long_running_process_helper() {
+        if std::env::var_os("RDNY_LONG_RUNNING_PROCESS_HELPER").is_none() {
+            return;
+        }
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

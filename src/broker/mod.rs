@@ -841,7 +841,15 @@ mod tests {
             let _: StartupControl = protocol::read_frame(&mut server).unwrap();
             // Simulate broker death after receiving commit but before ACK.
         });
-        let child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "broker::tests::long_running_process_helper",
+                "--nocapture",
+            ])
+            .env("RDNY_BROKER_LONG_RUNNING_HELPER", "1")
+            .spawn()
+            .unwrap();
         let pid = child.id();
         let mut provisional = ProvisionalBroker {
             startup: client,
@@ -854,6 +862,16 @@ mod tests {
         drop(provisional);
         reader.join().unwrap();
         assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+    }
+
+    #[test]
+    fn long_running_process_helper() {
+        if std::env::var_os("RDNY_BROKER_LONG_RUNNING_HELPER").is_none() {
+            return;
+        }
+        loop {
+            thread::sleep(Duration::from_secs(60));
+        }
     }
 
     #[test]

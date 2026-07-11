@@ -1168,10 +1168,15 @@ mod tests {
         command
             .arg("state::tests::lifecycle_overlap_process_helper")
             .arg("--exact")
+            .env_remove("RDNY_TEST_CONTENTION_LOCK")
+            .env_remove("RDNY_TEST_CONTENTION_MARKER")
+            .env_remove("RDNY_TEST_CRASH_BEFORE_BROKER_COMMIT")
             .env("XDG_STATE_HOME", xdg)
             .env("RDNY_STATE_DIR", state_dir)
             .env("RDNY_LIFECYCLE_TEST_ROOT", root)
-            .env("RDNY_LIFECYCLE_TEST_ROLE", role);
+            .env("RDNY_LIFECYCLE_TEST_ROLE", role)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
         if let (Some(lock_name), Some(marker)) = (lock_name, contention_marker) {
             command
                 .env("RDNY_TEST_CONTENTION_LOCK", lock_name)
@@ -1193,8 +1198,14 @@ mod tests {
     }
 
     fn initialize_lifecycle(root: &Path, xdg: &Path, state_dir: &Path) {
-        let mut child = spawn_lifecycle_role(root, xdg, state_dir, "replacement");
-        assert!(child.wait().unwrap().success());
+        let child = spawn_lifecycle_role(root, xdg, state_dir, "replacement");
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "replacement helper failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         std::fs::remove_file(root.join("done-replacement")).unwrap();
     }
 
