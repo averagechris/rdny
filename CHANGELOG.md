@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added trusted named-key chords plus explicit selector/coordinate pointer
+  move, down, up, and bounded drag commands with hit testing and best-effort
+  release cleanup (~averagechris/projects#181).
 - Added global `--instance` / `RDNY_INSTANCE` selection by exact registered id
   or unique label, with strict `--state-dir` conflict handling and copyable
   selectors in `rdny list` (~averagechris/projects#180).

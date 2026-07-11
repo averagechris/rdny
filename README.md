@@ -104,6 +104,67 @@ access them. Shadow traversal also does not cross iframe boundaries; in
 particular, cross-origin frames are unsupported. Selectors operate only in the
 current page document.
 
+### Trusted keyboard and pointer input
+
+`rdny key` dispatches one browser-level key press. A chord is a `+`-separated
+list of zero or more modifiers and exactly one named key:
+
+```sh
+rdny key Enter
+rdny key 'Control+Shift+K'
+rdny key 'Meta+ArrowLeft'
+```
+
+Modifier names are `Control`/`Ctrl`, `Shift`, `Alt`/`Option`, and
+`Meta`/`Cmd`/`Command` (case-insensitive). Common navigation, editing, function,
+letter, digit, and punctuation keys are supported. Use names such as `Space`,
+`Plus`, or `Slash` where punctuation would make a chord ambiguous. Empty chord
+segments, duplicate modifiers, unknown names, modifier-only chords, and multiple
+non-modifier keys are rejected before browser input is sent. Unlike `rdny input`,
+which inserts arbitrary text into an element, `rdny key` models physical key
+down/up events and shortcuts.
+
+Pointer primitives choose their target explicitly. `--selector` first tries the
+visible center, then uses the shared
+scrolling, geometry, composed-descendant, and real hit-test checks used by
+`click`; `--at X,Y` uses finite main-frame viewport CSS coordinates and requires
+that the coordinate be inside the viewport and hit a rendered element:
+
+```sh
+rdny pointer move --selector '#handle'
+rdny pointer move --at 120,80
+rdny pointer down --selector '#handle' --button left
+rdny pointer up --at 420,240 --button left
+rdny pointer move --selector 'app-shell >>> #handle' --pierce
+```
+
+The selector and coordinate forms are mutually exclusive. `--pierce` is accepted
+only when at least one selected endpoint is a selector. Mouse buttons are
+`left`, `right`, `middle`, `back`, and `forward`.
+
+`pointer drag` independently names both endpoints, so mixed selector/coordinate
+drags remain unambiguous:
+
+```sh
+rdny pointer drag --from-selector '#handle' --to-selector '#drop-zone'
+rdny pointer drag --from-at 100,120 --to-selector '#drop-zone'
+rdny pointer drag --from-selector '#handle' --to-at 500,300 \
+  --steps 30 --duration-ms 750
+```
+
+Drag uses 20 interpolated movements over 500 ms by default. `--steps` is bounded
+to 1–1000 and `--duration-ms` to 1–30000. Selector points are revalidated against
+the same resolved nodes immediately before state-changing dispatch, and the
+destination is recomputed after press. Once a drag press is attempted, rdny
+always makes a separately bounded best-effort release; if both the action and
+release fail, the original error is preserved with release context.
+The global `--timeout` covers connection, validation, and interpolation together;
+set it above the requested duration when using long drags (for example,
+`--timeout 35 --duration-ms 30000`).
+
+These commands generate trusted Chrome DevTools Protocol input in the current
+page. They do not provide OS-level input and are not a general interaction DSL.
+
 Use an isolated state directory while experimenting or in tests:
 
 ```sh

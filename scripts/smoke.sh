@@ -141,6 +141,9 @@ cat >"$page" <<'HTML'
       #pointer-underlay, #pointer-none { position: absolute; inset: 0; }
       #pointer-none { z-index: 1; pointer-events: none; }
       #detached-target { left: 20px; top: 100px; width: 140px; height: 44px; }
+      #trusted-pointer { left: 220px; top: 100px; width: 140px; height: 60px; }
+      #drag-source { left: 220px; top: 220px; width: 100px; height: 60px; background: #9cf; }
+      #drop-target { left: 440px; top: 220px; width: 120px; height: 80px; background: #cfc; }
       outer-shell, slot-shell { display: inline-block; }
     </style>
   </head>
@@ -166,6 +169,10 @@ cat >"$page" <<'HTML'
       <button id="pointer-none" class="disabled-target">no pointer events</button>
     </div>
     <button id="detached-target" class="interaction-fixture">detach on move</button>
+    <input id="key-target" aria-label="trusted keyboard target">
+    <button id="trusted-pointer" class="interaction-fixture">pointer target</button>
+    <div id="drag-source" class="interaction-fixture" draggable="true">drag source</div>
+    <div id="drop-target" class="interaction-fixture">drop target</div>
     <slot-shell id="slot-host"><button id="slotted-button"><span>slotted child</span></button></slot-shell>
     <outer-shell id="shadow-outer"></outer-shell>
     <script>
@@ -181,6 +188,9 @@ cat >"$page" <<'HTML'
         detachedMoves: 0,
         detachedClicks: 0,
         slotTrusted: false,
+        key: null,
+        pointerEvents: [],
+        drag: {start: false, over: false, drop: false, target: '', data: ''},
       };
       const ordinary = document.querySelector('#btn');
       ordinary.addEventListener('click', (event) => {
@@ -206,6 +216,45 @@ cat >"$page" <<'HTML'
         detached.remove();
       });
       detached.addEventListener('click', () => window.interactions.detachedClicks++);
+      document.querySelector('#key-target').addEventListener('keydown', (event) => {
+        if (event.key === 'K') {
+          window.interactions.key = {
+            trusted: event.isTrusted,
+            key: event.key,
+            code: event.code,
+            control: event.ctrlKey,
+            shift: event.shiftKey,
+          };
+        }
+      });
+      const trustedPointer = document.querySelector('#trusted-pointer');
+      for (const type of ['pointermove', 'pointerdown', 'pointerup']) {
+        trustedPointer.addEventListener(type, (event) => {
+          window.interactions.pointerEvents.push({
+            type,
+            trusted: event.isTrusted,
+            target: event.target.id,
+            buttons: event.buttons,
+            button: event.button,
+          });
+        });
+      }
+      const dragSource = document.querySelector('#drag-source');
+      const dropTarget = document.querySelector('#drop-target');
+      dragSource.addEventListener('dragstart', (event) => {
+        window.interactions.drag.start = event.isTrusted;
+        event.dataTransfer.setData('text/plain', 'rdny-smoke');
+      });
+      dropTarget.addEventListener('dragover', (event) => {
+        event.preventDefault();
+        window.interactions.drag.over = window.interactions.drag.over || event.isTrusted;
+      });
+      dropTarget.addEventListener('drop', (event) => {
+        event.preventDefault();
+        window.interactions.drag.drop = event.isTrusted;
+        window.interactions.drag.target = event.target.id;
+        window.interactions.drag.data = event.dataTransfer.getData('text/plain');
+      });
       document.querySelector('#slot-host').attachShadow({mode: 'open'}).innerHTML = '<slot style="display: inline-block"></slot>';
       document.querySelector('#slotted-button').addEventListener('click', (event) => {
         window.interactions.slotTrusted = event.isTrusted && event.target.localName === 'span';
@@ -341,6 +390,23 @@ expect "select" "dog" "$("${RDNY[@]}" js "document.querySelector('#pet').value")
 expect "focus" "name" "$("${RDNY[@]}" js 'document.activeElement.id')"
 "${RDNY[@]}" hover "#btn"
 expect "hover stays trusted" "true" "$("${RDNY[@]}" js 'window.interactions.hoverTrusted')"
+"${RDNY[@]}" focus "#key-target"
+"${RDNY[@]}" key 'Control+Shift+K'
+expect "keyboard chord is trusted with key/code/modifiers" "true,K,KeyK,true,true" "$("${RDNY[@]}" js 'const e = window.interactions.key; [e.trusted,e.key,e.code,e.control,e.shift].join()')"
+"${RDNY[@]}" pointer move --pierce --selector '#slot-host >>> slot'
+"${RDNY[@]}" js "document.querySelector('#trusted-pointer').style.display = 'block'" >/dev/null
+"${RDNY[@]}" pointer move --selector '#trusted-pointer'
+"${RDNY[@]}" pointer down --at 290,130 --button left
+"${RDNY[@]}" pointer up --selector '#trusted-pointer' --button left
+expect "pointer primitives are trusted and hit the real target" "pointermove:true:trusted-pointer:0,pointermove:true:trusted-pointer:0,pointerdown:true:trusted-pointer:1,pointerup:true:trusted-pointer:0" "$("${RDNY[@]}" js "window.interactions.pointerEvents.map(e => [e.type,e.trusted,e.target,e.buttons].join(':')).join()")"
+# Reload to isolate native HTML drag state from the preceding cross-process
+# down/up primitive smoke while preserving a deterministic fixture.
+"${RDNY[@]}" open "file://$page" --allow-file-url >/dev/null
+"${RDNY[@]}" js "document.querySelector('#drag-source').style.display = 'block'; document.querySelector('#drop-target').style.display = 'block'" >/dev/null
+"${RDNY[@]}" pointer drag --from-selector '#drag-source' --to-selector '#drop-target' --steps 20 --duration-ms 300
+expect "native drag/drop is trusted and reaches actual target" "true,true,true,drop-target,rdny-smoke" "$("${RDNY[@]}" js 'const d = window.interactions.drag; [d.start,d.over,d.drop,d.target,d.data].join()')"
+expect "drag leaves mouse button released" "0" "$("${RDNY[@]}" js 'window.__releaseButtons = null; const t = document.querySelector("#drop-target"); t.addEventListener("pointermove", e => window.__releaseButtons = e.buttons, {once:true}); 0' >/dev/null; "${RDNY[@]}" pointer move --selector '#drop-target'; "${RDNY[@]}" js 'window.__releaseButtons')"
+"${RDNY[@]}" js "document.querySelector('#drag-source').style.display = 'none'; document.querySelector('#drop-target').style.display = 'none'" >/dev/null
 "${RDNY[@]}" submit "#f"
 expect "submit" "submitted" "$("${RDNY[@]}" js 'document.title')"
 expect "js math" "3" "$("${RDNY[@]}" js '1+2')"

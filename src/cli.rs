@@ -1,7 +1,7 @@
 //! Command-line surface and dispatch.
 
 use anyhow::{Context, Result};
-use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
@@ -9,6 +9,10 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use crate::browser::{self, BrowserStatus, LaunchOpts};
+use crate::input::{
+    DEFAULT_DRAG_DURATION_MS, DEFAULT_DRAG_STEPS, KeyChord, MAX_DRAG_DURATION_MS, MAX_DRAG_STEPS,
+    MIN_DRAG_DURATION_MS, MIN_DRAG_STEPS, MouseButton, PointerPoint, PointerTarget,
+};
 use crate::selector::ElementSelector;
 use crate::{commands, config, session};
 
@@ -220,6 +224,13 @@ pub enum Command {
         #[arg(long)]
         pierce: bool,
     },
+    /// Press a named key or modifier chord using trusted browser input.
+    #[command(
+        after_long_help = "Examples:\n  rdny key Enter\n  rdny key 'Control+Shift+K'\n  rdny key 'Meta+ArrowLeft'"
+    )]
+    Key(KeyArgs),
+    /// Send trusted pointer movement, button, and drag input.
+    Pointer(PointerArgs),
     /// Type text into an element.
     Input(InputArgs),
     /// Clear an element's value.
@@ -352,6 +363,8 @@ impl Command {
             | Self::Logs(_)
             | Self::Viewport(_)
             | Self::Click { .. }
+            | Self::Key(_)
+            | Self::Pointer(_)
             | Self::Input(_)
             | Self::Clear { .. }
             | Self::File { .. }
@@ -564,6 +577,119 @@ pub struct InputArgs {
     /// Read input text from this file descriptor to avoid argv leakage.
     #[arg(long = "text-fd", conflicts_with_all = ["text", "text_stdin", "text_file"])]
     pub text_fd: Option<i32>,
+}
+
+#[derive(Debug, Args)]
+pub struct KeyArgs {
+    /// Named key or `+`-separated modifier chord (for example Control+Shift+K).
+    pub chord: KeyChord,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    after_long_help = "Examples:\n  rdny pointer move --selector '#handle'\n  rdny pointer move --at 120,80\n  rdny pointer down --selector '#handle' --button left\n  rdny pointer up --at 420,240 --button left\n  rdny pointer drag --from-selector '#handle' --to-selector '#drop-zone'\n  rdny pointer drag --from-at 100,120 --to-selector '#drop-zone'"
+)]
+pub struct PointerArgs {
+    #[command(subcommand)]
+    pub command: PointerCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PointerCommand {
+    /// Move to a selector's hit-tested action point or an explicit viewport coordinate.
+    Move(PointerTargetArgs),
+    /// Move and press a mouse button, leaving it pressed for a later `up` command.
+    Down(PointerButtonArgs),
+    /// Release a mouse button at a selector or explicit viewport coordinate.
+    Up(PointerButtonArgs),
+    /// Drag between independently explicit selector or coordinate endpoints.
+    Drag(DragArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("pointer_target")
+        .required(true)
+        .args(["selector", "at"])
+))]
+pub struct PointerTargetArgs {
+    /// Target the first matching CSS selector at a hit-tested action point.
+    #[arg(long)]
+    pub selector: Option<String>,
+    /// Target an explicit `X,Y` viewport coordinate in CSS pixels.
+    #[arg(long, value_name = "X,Y")]
+    pub at: Option<PointerPoint>,
+    /// Split --selector on `>>>` and traverse nested open shadow roots.
+    #[arg(long, requires = "selector", conflicts_with = "at")]
+    pub pierce: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct PointerButtonArgs {
+    #[command(flatten)]
+    pub target: PointerTargetArgs,
+    /// Mouse button to press or release.
+    #[arg(long, default_value = "left")]
+    pub button: MouseButton,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    group(ArgGroup::new("drag_from").required(true).args(["from_selector", "from_at"])),
+    group(ArgGroup::new("drag_to").required(true).args(["to_selector", "to_at"])),
+    group(ArgGroup::new("drag_selector").multiple(true).args(["from_selector", "to_selector"]))
+)]
+pub struct DragArgs {
+    /// Start at the first matching CSS selector's hit-tested action point.
+    #[arg(long)]
+    pub from_selector: Option<String>,
+    /// Start at an explicit `X,Y` viewport coordinate in CSS pixels.
+    #[arg(long, value_name = "X,Y")]
+    pub from_at: Option<PointerPoint>,
+    /// End at the first matching CSS selector's hit-tested action point.
+    #[arg(long)]
+    pub to_selector: Option<String>,
+    /// End at an explicit `X,Y` viewport coordinate in CSS pixels.
+    #[arg(long, value_name = "X,Y")]
+    pub to_at: Option<PointerPoint>,
+    /// Split selector endpoints on `>>>` and traverse nested open shadow roots.
+    #[arg(long, requires = "drag_selector")]
+    pub pierce: bool,
+    /// Mouse button held during the drag.
+    #[arg(long, default_value = "left")]
+    pub button: MouseButton,
+    /// Number of evenly interpolated mouse movements (1 through 1000).
+    #[arg(long, default_value_t = DEFAULT_DRAG_STEPS, value_parser = parse_drag_steps)]
+    pub steps: u32,
+    /// Total interpolation duration in milliseconds (1 through 30000).
+    #[arg(long, default_value_t = DEFAULT_DRAG_DURATION_MS, value_parser = parse_drag_duration_ms)]
+    pub duration_ms: u64,
+}
+
+fn parse_drag_steps(raw: &str) -> std::result::Result<u32, String> {
+    let value: u32 = raw
+        .parse()
+        .map_err(|_| "drag steps must be an integer".to_string())?;
+    if (MIN_DRAG_STEPS..=MAX_DRAG_STEPS).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "drag steps must be between {MIN_DRAG_STEPS} and {MAX_DRAG_STEPS}"
+        ))
+    }
+}
+
+fn parse_drag_duration_ms(raw: &str) -> std::result::Result<u64, String> {
+    let value: u64 = raw
+        .parse()
+        .map_err(|_| "drag duration-ms must be an integer".to_string())?;
+    if (MIN_DRAG_DURATION_MS..=MAX_DRAG_DURATION_MS).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "drag duration-ms must be between {MIN_DRAG_DURATION_MS} and {MAX_DRAG_DURATION_MS}"
+        ))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -917,6 +1043,35 @@ pub fn run() -> Result<()> {
             let selector = ElementSelector::parse(selector, pierce)?;
             commands::interact::click(sess!(), &selector)?
         }
+        Command::Key(args) => crate::input::key(sess!(), &args.chord)?,
+        Command::Pointer(args) => match args.command {
+            PointerCommand::Move(args) => {
+                let target = pointer_target(args.selector, args.at, args.pierce)?;
+                crate::input::pointer_move(sess!(), &target)?
+            }
+            PointerCommand::Down(args) => {
+                let target =
+                    pointer_target(args.target.selector, args.target.at, args.target.pierce)?;
+                crate::input::pointer_down(sess!(), &target, args.button)?
+            }
+            PointerCommand::Up(args) => {
+                let target =
+                    pointer_target(args.target.selector, args.target.at, args.target.pierce)?;
+                crate::input::pointer_up(sess!(), &target, args.button)?
+            }
+            PointerCommand::Drag(args) => {
+                let from = pointer_target(args.from_selector, args.from_at, args.pierce)?;
+                let to = pointer_target(args.to_selector, args.to_at, args.pierce)?;
+                crate::input::drag(
+                    sess!(),
+                    &from,
+                    &to,
+                    args.button,
+                    args.steps,
+                    Duration::from_millis(args.duration_ms),
+                )?
+            }
+        },
         Command::Input(args) => {
             let selector = ElementSelector::parse(args.selector, args.pierce)?;
             let text = resolve_secret(
@@ -1046,6 +1201,20 @@ pub fn run() -> Result<()> {
         session.drain_events(std::time::Duration::from_millis(300))?;
     }
     Ok(())
+}
+
+fn pointer_target(
+    selector: Option<String>,
+    point: Option<PointerPoint>,
+    pierce: bool,
+) -> Result<PointerTarget> {
+    match (selector, point) {
+        (Some(selector), None) => Ok(PointerTarget::selector(ElementSelector::parse(
+            selector, pierce,
+        )?)),
+        (None, Some(point)) => Ok(PointerTarget::point(point)),
+        _ => anyhow::bail!("choose exactly one selector or coordinate pointer target"),
+    }
 }
 
 fn validate_download_output(format: OutputFormat, file: Option<&Path>) -> Result<()> {
@@ -1593,6 +1762,193 @@ mod tests {
     }
 
     #[test]
+    fn parses_key_and_unambiguous_pointer_targets() {
+        assert!(matches!(
+            parse(&["rdny", "key", "Control+Shift+K"]),
+            Command::Key(_)
+        ));
+        assert!(Cli::try_parse_from(["rdny", "key", "Control++K"]).is_err());
+
+        assert!(matches!(
+            parse(&["rdny", "pointer", "move", "--selector", "#handle"]),
+            Command::Pointer(PointerArgs {
+                command: PointerCommand::Move(PointerTargetArgs {
+                    selector: Some(selector),
+                    at: None,
+                    pierce: false,
+                })
+            }) if selector == "#handle"
+        ));
+        assert!(matches!(
+            parse(&["rdny", "pointer", "move", "--at", "12.5,40"]),
+            Command::Pointer(PointerArgs {
+                command: PointerCommand::Move(PointerTargetArgs {
+                    selector: None,
+                    at: Some(_),
+                    pierce: false,
+                })
+            })
+        ));
+        assert!(matches!(
+            parse(&[
+                "rdny",
+                "pointer",
+                "down",
+                "--selector",
+                "button",
+                "--button",
+                "right"
+            ]),
+            Command::Pointer(PointerArgs {
+                command: PointerCommand::Down(PointerButtonArgs {
+                    button: MouseButton::Right,
+                    ..
+                })
+            })
+        ));
+        assert!(matches!(
+            parse(&["rdny", "pointer", "up", "--at", "10,20"]),
+            Command::Pointer(PointerArgs {
+                command: PointerCommand::Up(PointerButtonArgs {
+                    button: MouseButton::Left,
+                    ..
+                })
+            })
+        ));
+
+        for args in [
+            vec!["rdny", "pointer", "move"],
+            vec!["rdny", "pointer", "move", "--selector", "#x", "--at", "1,2"],
+            vec!["rdny", "pointer", "move", "--at", "1,2", "--pierce"],
+            vec![
+                "rdny", "pointer", "down", "--at", "1,2", "--button", "primary",
+            ],
+            vec!["rdny", "pointer", "up", "--at", "NaN,2"],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_err(), "accepted {args:?}");
+        }
+    }
+
+    #[test]
+    fn parses_every_drag_endpoint_combination_and_bounds_options() {
+        for endpoints in [
+            vec!["--from-selector", "#source", "--to-selector", "#target"],
+            vec!["--from-selector", "#source", "--to-at", "20,30"],
+            vec!["--from-at", "10,15", "--to-selector", "#target"],
+            vec!["--from-at", "10,15", "--to-at", "20,30"],
+        ] {
+            let mut args = vec!["rdny", "pointer", "drag"];
+            args.extend(endpoints);
+            assert!(matches!(
+                parse(&args),
+                Command::Pointer(PointerArgs {
+                    command: PointerCommand::Drag(_)
+                })
+            ));
+        }
+
+        let command = parse(&[
+            "rdny",
+            "pointer",
+            "drag",
+            "--from-selector",
+            "outer >>> #source",
+            "--to-at",
+            "20,30",
+            "--pierce",
+            "--button",
+            "middle",
+            "--steps",
+            "1000",
+            "--duration-ms",
+            "30000",
+        ]);
+        assert!(matches!(
+            command,
+            Command::Pointer(PointerArgs {
+                command: PointerCommand::Drag(DragArgs {
+                    pierce: true,
+                    button: MouseButton::Middle,
+                    steps: 1000,
+                    duration_ms: 30000,
+                    ..
+                })
+            })
+        ));
+
+        for args in [
+            vec![
+                "rdny",
+                "pointer",
+                "drag",
+                "--from-at",
+                "1,2",
+                "--to-at",
+                "3,4",
+                "--pierce",
+            ],
+            vec![
+                "rdny",
+                "pointer",
+                "drag",
+                "--from-at",
+                "1,2",
+                "--to-at",
+                "3,4",
+                "--steps",
+                "0",
+            ],
+            vec![
+                "rdny",
+                "pointer",
+                "drag",
+                "--from-at",
+                "1,2",
+                "--to-at",
+                "3,4",
+                "--steps",
+                "1001",
+            ],
+            vec![
+                "rdny",
+                "pointer",
+                "drag",
+                "--from-at",
+                "1,2",
+                "--to-at",
+                "3,4",
+                "--duration-ms",
+                "0",
+            ],
+            vec![
+                "rdny",
+                "pointer",
+                "drag",
+                "--from-at",
+                "1,2",
+                "--to-at",
+                "3,4",
+                "--duration-ms",
+                "30001",
+            ],
+            vec![
+                "rdny",
+                "pointer",
+                "drag",
+                "--from-at",
+                "1,2",
+                "--from-selector",
+                "#x",
+                "--to-at",
+                "3,4",
+            ],
+            vec!["rdny", "pointer", "drag", "--from-at", "1,2"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
     fn parses_pierced_selectors_for_every_element_command() {
         const SHADOW: &str = "outer-host >>> inner-host >>> .target";
 
@@ -1960,6 +2316,8 @@ mod tests {
             parse(&["rdny", "pages"]),
             parse(&["rdny", "start-video"]),
             parse(&["rdny", "stop-video"]),
+            parse(&["rdny", "key", "Enter"]),
+            parse(&["rdny", "pointer", "move", "--at", "1,2"]),
         ] {
             assert!(command.targets_registered_instance());
         }

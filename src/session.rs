@@ -585,6 +585,22 @@ fn check_exception(result: &Value, what: &str) -> Result<()> {
 }
 
 impl PageSession {
+    /// Minimal page session for focused fake-CDP input protocol tests.
+    #[cfg(test)]
+    pub(crate) fn connect_for_input_test(ws_url: &str) -> Result<Self> {
+        let timeout = Duration::from_secs(2);
+        Ok(Self {
+            client: CdpClient::connect(ws_url)?,
+            session_id: "page-session".into(),
+            instance_id: None,
+            target_id: "target".into(),
+            frames_dir: None,
+            instrumentation_registered: true,
+            timeout,
+            deadline: Deadline::after(timeout),
+        })
+    }
+
     pub(crate) fn is_recording(&self) -> bool {
         self.frames_dir.is_some()
     }

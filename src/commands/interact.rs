@@ -9,6 +9,7 @@ use serde_json::json;
 
 use crate::commands::artifacts::{HumanArtifactOutput, ProducedArtifact};
 use crate::commands::{artifacts, decode_base64, print_value};
+use crate::input::{MouseButton, PointerTarget, pointer_click, pointer_move};
 use crate::selector::ElementSelector;
 use crate::session::PageSession;
 
@@ -21,13 +22,11 @@ pub fn js(sess: &mut PageSession, expression: &str) -> Result<()> {
 
 /// Click the first selector match (real mouse events).
 pub fn click(_sess: &mut PageSession, _selector: &ElementSelector) -> Result<()> {
-    let id = _sess.element(_selector)?;
-    let point = _sess.element_action_point(&id)?;
-    dispatch_mouse(_sess, "mouseMoved", point.x, point.y, None)?;
-    _sess.revalidate_element_action_point(&id, point)?;
-    dispatch_mouse(_sess, "mousePressed", point.x, point.y, Some("left"))?;
-    dispatch_mouse(_sess, "mouseReleased", point.x, point.y, Some("left"))?;
-    Ok(())
+    pointer_click(
+        _sess,
+        &PointerTarget::selector(_selector.clone()),
+        MouseButton::Left,
+    )
 }
 
 /// Type text into the first selector match.
@@ -182,32 +181,13 @@ pub fn submit(_sess: &mut PageSession, _selector: &ElementSelector) -> Result<()
 
 /// Hover over the first selector match (real mouse events).
 pub fn hover(_sess: &mut PageSession, _selector: &ElementSelector) -> Result<()> {
-    let id = _sess.element(_selector)?;
-    let point = _sess.element_action_point(&id)?;
-    dispatch_mouse(_sess, "mouseMoved", point.x, point.y, None)?;
-    Ok(())
+    pointer_move(_sess, &PointerTarget::selector(_selector.clone()))
 }
 
 /// Focus the first selector match.
 pub fn focus(_sess: &mut PageSession, _selector: &ElementSelector) -> Result<()> {
     let id = _sess.element(_selector)?;
     _sess.call_on(&id, "function() { this.focus(); }", &[])?;
-    Ok(())
-}
-
-fn dispatch_mouse(
-    sess: &mut PageSession,
-    event_type: &str,
-    x: f64,
-    y: f64,
-    button: Option<&str>,
-) -> Result<()> {
-    let mut params = json!({ "type": event_type, "x": x, "y": y });
-    if let Some(button) = button {
-        params["button"] = json!(button);
-        params["clickCount"] = json!(1);
-    }
-    sess.call("Input.dispatchMouseEvent", params)?;
     Ok(())
 }
 

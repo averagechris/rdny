@@ -168,6 +168,52 @@ impl PageSession {
             .context("revalidating selected target immediately before input dispatch")
     }
 
+    /// Validate an explicit coordinate in the live page viewport.  A trusted
+    /// coordinate must be finite before crossing CDP, lie inside the CSS
+    /// viewport, and currently resolve to an element in the composed page.
+    pub(crate) fn coordinate_action_point(&mut self, point: ActionPoint) -> Result<ActionPoint> {
+        self.check_coordinate_action_point(point)
+            .context("checking explicit pointer coordinate in the page viewport")
+    }
+
+    /// Re-run coordinate validation immediately before a state-changing mouse
+    /// event so navigation, resize, or page mutation cannot make an old point
+    /// silently unsafe.
+    pub(crate) fn revalidate_coordinate_action_point(&mut self, point: ActionPoint) -> Result<()> {
+        self.check_coordinate_action_point(point)
+            .map(|_| ())
+            .context("revalidating explicit pointer coordinate immediately before input dispatch")
+    }
+
+    fn check_coordinate_action_point(&mut self, point: ActionPoint) -> Result<ActionPoint> {
+        if !point.x.is_finite() || !point.y.is_finite() {
+            bail!("explicit pointer coordinates must be finite numbers");
+        }
+        let expression = format!(
+            "({COORDINATE_POINT_FUNCTION})({}, {})",
+            serde_json::to_string(&point.x).expect("finite x coordinate serializes"),
+            serde_json::to_string(&point.y).expect("finite y coordinate serializes"),
+        );
+        let check = self.eval(&expression)?;
+        let status = check["status"]
+            .as_str()
+            .context("browser returned an invalid coordinate hit-test result")?;
+        match status {
+            "ready" => Ok(point),
+            "outside_viewport" => bail!(
+                "pointer coordinate ({}, {}) is outside the current page viewport",
+                point.x,
+                point.y
+            ),
+            "not_hit_testable" => bail!(
+                "pointer coordinate ({}, {}) does not hit a rendered page element",
+                point.x,
+                point.y
+            ),
+            other => bail!("browser returned unknown coordinate hit-test status `{other}`"),
+        }
+    }
+
     fn check_element_action_point(
         &mut self,
         object_id: &str,
@@ -301,6 +347,19 @@ const TARGET_POINT_FUNCTION: &str = r#"function(mode, pointX, pointY) {
         }
     }
     return result('intercepted', firstIntercepting);
+}"#;
+
+const COORDINATE_POINT_FUNCTION: &str = r#"function(pointX, pointY) {
+    const x = Number(pointX);
+    const y = Number(pointY);
+    const viewportWidth = Math.max(0, document.documentElement.clientWidth || window.innerWidth || 0);
+    const viewportHeight = Math.max(0, document.documentElement.clientHeight || window.innerHeight || 0);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0 || x >= viewportWidth || y >= viewportHeight) {
+        return {status: 'outside_viewport'};
+    }
+    return document.elementFromPoint(x, y) instanceof Element
+        ? {status: 'ready'}
+        : {status: 'not_hit_testable'};
 }"#;
 
 #[cfg(test)]

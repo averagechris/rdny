@@ -5,6 +5,7 @@ mod cli;
 mod commands;
 mod config;
 mod hint;
+mod input;
 mod interaction_target;
 mod process_identity;
 mod selector;
