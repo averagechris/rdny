@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
+use crate::commands::artifacts::{HumanArtifactOutput, ProducedArtifact, PublishedArtifact};
 use crate::commands::decode_base64;
 use crate::config;
 use crate::hint::hint_error;
@@ -50,7 +51,17 @@ pub fn start() -> Result<()> {
     result
 }
 
-pub fn stop(session: Option<&mut PageSession>, output: Option<&Path>, force: bool) -> Result<()> {
+pub fn stop(
+    mut session: Option<&mut PageSession>,
+    output: Option<&Path>,
+    force: bool,
+) -> Result<ProducedArtifact> {
+    // Recovery must not depend on a live browser. Even URL evaluation failures
+    // only remove optional context from the final record.
+    let context = session
+        .as_deref_mut()
+        .map(PageSession::artifact_context_best_effort)
+        .unwrap_or_default();
     if let Some(session) = session {
         let _ = session.call("Page.stopScreencast", serde_json::json!({}));
         session.drain_events(std::time::Duration::from_millis(300))?;
@@ -71,6 +82,7 @@ pub fn stop(session: Option<&mut PageSession>, output: Option<&Path>, force: boo
             None,
         ));
     }
+    let dimensions = video_dimensions(&frames);
 
     let output = output.unwrap_or_else(|| Path::new("recording.mp4"));
     let list = concat_list(&frames);
@@ -81,7 +93,7 @@ pub fn stop(session: Option<&mut PageSession>, output: Option<&Path>, force: boo
 
     let config = config::load()?;
     let ffmpeg = config::resolve_ffmpeg(std::env::var_os("RDNY_FFMPEG"), &config);
-    assemble_video(&ffmpeg, &frames_dir, &list_path, output, force)?;
+    let published = assemble_video(&ffmpeg, &frames_dir, &list_path, output, force)?;
     clear_recoverable_recording(&recording_id)?;
     guard.disarm();
     if let Err(err) = remove_recording_frames(&recording_id, &frames_dir) {
@@ -90,8 +102,14 @@ pub fn stop(session: Option<&mut PageSession>, output: Option<&Path>, force: boo
             frames_dir.path().display()
         );
     }
-    println!("{}", output.display());
-    Ok(())
+    Ok(ProducedArtifact::new(
+        published,
+        output.to_path_buf(),
+        HumanArtifactOutput::BarePath,
+        video_media_type(output),
+        dimensions,
+        context,
+    ))
 }
 
 fn assemble_video(
@@ -100,7 +118,7 @@ fn assemble_video(
     list_path: &Path,
     output: &Path,
     force: bool,
-) -> Result<()> {
+) -> Result<PublishedArtifact> {
     let reservation = crate::commands::artifacts::ReservedArtifact::reserve(output, force)?;
     let mut command = Command::new(ffmpeg);
     command
@@ -119,10 +137,7 @@ fn assemble_video(
     let status = command.arg(reservation.tmp_path()).status();
 
     match status {
-        Ok(status) if status.success() => {
-            reservation.finalize(force)?;
-            Ok(())
-        }
+        Ok(status) if status.success() => reservation.finalize(force),
         Ok(status) => Err(hint_error(
             format!("ffmpeg failed with status {status}"),
             format!(
@@ -140,6 +155,28 @@ fn assemble_video(
             None,
         )),
     }
+}
+
+fn video_media_type(output: &Path) -> &'static str {
+    match output
+        .extension()
+        .and_then(OsStr::to_str)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("mp4" | "m4v") => "video/mp4",
+        Some("mov") => "video/quicktime",
+        Some("mkv") => "video/x-matroska",
+        Some("webm") => "video/webm",
+        _ => "application/octet-stream",
+    }
+}
+
+fn video_dimensions(frames: &[(f64, PathBuf)]) -> Option<(u32, u32)> {
+    let bytes = fs::read(&frames.first()?.1).ok()?;
+    let (width, height) = crate::commands::artifacts::jpeg_dimensions(&bytes)?;
+    // Keep metadata aligned with the ffmpeg pad filter used for yuv420p.
+    Some((width.next_multiple_of(2), height.next_multiple_of(2)))
 }
 
 fn muxer_for_output(output: &Path) -> Option<&'static str> {
@@ -664,7 +701,7 @@ mod tests {
                 }
             }),
             "stop" => stop(None, Some(&root.join("out.mp4")), false)
-                .map(|()| "stopped".to_string())
+                .map(|_| "stopped".to_string())
                 .or_else(|err| {
                     if err.to_string().contains("ffmpeg failed") {
                         Ok("failed".to_string())
@@ -1021,20 +1058,42 @@ mod tests {
         let st = state::load().unwrap().unwrap();
         let frames = st.recording_frames_dir.as_ref().unwrap();
         assert!(frames.is_absolute());
-        fs::write(frames.join("1.000000.jpg"), [0xff, 0xd8, 0xff, 0xd9]).unwrap();
+        fs::write(
+            frames.join("1.000000.jpg"),
+            [
+                0xff, 0xd8, 0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x03, 0x00, 0x05, 0x03, 0x01, 0x11,
+                0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00,
+            ],
+        )
+        .unwrap();
         let other = root.path().join("other cwd");
         fs::create_dir(&other).unwrap();
         env::set_current_dir(&other).unwrap();
         let ffmpeg = root.path().join("ffmpeg");
         fs::write(
             &ffmpeg,
-            "#!/bin/sh\nfor last do :; done\ntouch \"$last\"\nexit 0\n",
+            "#!/bin/sh\nfor last do :; done\nprintf video > \"$last\"\nexit 0\n",
         )
         .unwrap();
         fs::set_permissions(&ffmpeg, fs::Permissions::from_mode(0o755)).unwrap();
         unsafe { env::set_var("RDNY_FFMPEG", &ffmpeg) };
-        stop(None, Some(&root.path().join("out.mp4")), false).unwrap();
+        let artifact = stop(None, Some(&root.path().join("out.mp4")), false).unwrap();
         assert!(root.path().join("out.mp4").exists());
+        assert_eq!(
+            artifact.path,
+            root.path()
+                .join("out.mp4")
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+        );
+        assert_eq!(artifact.media_type, "video/mp4");
+        assert_eq!(artifact.bytes, 5);
+        assert_eq!((artifact.width, artifact.height), (Some(6), Some(4)));
+        assert_eq!(
+            (artifact.instance, artifact.target, artifact.url),
+            (None, None, None)
+        );
     }
 
     #[test]

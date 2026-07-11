@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use std::io::{IsTerminal, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -111,6 +111,19 @@ impl OutputFormat {
             Self::Json => println!("{}", serde_json::to_string_pretty(value)?),
             Self::Jsonl => println!("{}", serde_json::to_string(value)?),
         }
+        Ok(())
+    }
+
+    fn render_artifact(self, artifact: &commands::artifacts::ProducedArtifact) -> Result<String> {
+        match self {
+            Self::Human => Ok(artifact.human_summary()),
+            Self::Json => Ok(serde_json::to_string_pretty(artifact)?),
+            Self::Jsonl => Ok(serde_json::to_string(artifact)?),
+        }
+    }
+
+    fn emit_artifact(self, artifact: &commands::artifacts::ProducedArtifact) -> Result<()> {
+        println!("{}", self.render_artifact(artifact)?);
         Ok(())
     }
 }
@@ -569,6 +582,10 @@ pub struct ArtifactArgs {
 /// Parse argv and execute the selected command.
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
+    if let Command::Download { file, .. } = &cli.command {
+        // Validate stdout ownership before instance selection or browser I/O.
+        validate_download_output(cli.format, file.as_deref())?;
+    }
     let timeout = cli.timeout.get();
     let command_budget = match &cli.command {
         Command::Logs(args) if !args.follow => args.duration.unwrap_or(cli.timeout).get(),
@@ -791,7 +808,10 @@ pub fn run() -> Result<()> {
         Command::Html { selector } => commands::pageinfo::html(sess!(), selector.as_deref())?,
         Command::Text { selector } => commands::pageinfo::text(sess!(), &selector)?,
         Command::Attr { selector, name } => commands::pageinfo::attr(sess!(), &selector, &name)?,
-        Command::Pdf(args) => commands::pageinfo::pdf(sess!(), args.file.as_deref(), args.force)?,
+        Command::Pdf(args) => {
+            let artifact = commands::pageinfo::pdf(sess!(), args.file.as_deref(), args.force)?;
+            cli.format.emit_artifact(&artifact)?;
+        }
         Command::Js { expression } => {
             let stdin = std::io::stdin();
             let stdin_is_tty = stdin.is_terminal();
@@ -828,7 +848,13 @@ pub fn run() -> Result<()> {
             max_bytes,
             force,
             file,
-        } => commands::interact::download(sess!(), &selector, file.as_deref(), force, max_bytes)?,
+        } => {
+            if let Some(artifact) =
+                commands::interact::download(sess!(), &selector, file.as_deref(), force, max_bytes)?
+            {
+                cli.format.emit_artifact(&artifact)?;
+            }
+        }
         Command::Select { selector, value } => {
             commands::interact::select(sess!(), &selector, &value)?
         }
@@ -860,20 +886,25 @@ pub fn run() -> Result<()> {
         Command::Sleep { .. } => commands::wait::sleep(deadline)?,
         Command::Screenshot(args) => {
             let state = crate::state::require()?;
-            commands::shot::screenshot(
+            let artifact = commands::shot::screenshot(
                 sess!(),
                 args.width,
                 args.height,
                 args.file.as_deref(),
                 args.force,
                 state.viewport.as_ref(),
-            )?
+            )?;
+            cli.format.emit_artifact(&artifact)?;
         }
         Command::ScreenshotEl {
             selector,
             force,
             file,
-        } => commands::shot::screenshot_el(sess!(), &selector, file.as_deref(), force)?,
+        } => {
+            let artifact =
+                commands::shot::screenshot_el(sess!(), &selector, file.as_deref(), force)?;
+            cli.format.emit_artifact(&artifact)?;
+        }
         Command::Pages => {
             commands::tabs::pages_format_until(cli.format != OutputFormat::Human, deadline)?
         }
@@ -889,11 +920,21 @@ pub fn run() -> Result<()> {
             // Assemble even when the browser is gone: frames on disk
             // should never be stranded behind a dead session.
             let mut live = session::connect(deadline, timeout).ok();
-            commands::video::stop(live.as_mut(), args.file.as_deref(), args.force)?
+            let artifact = commands::video::stop(live.as_mut(), args.file.as_deref(), args.force)?;
+            cli.format.emit_artifact(&artifact)?;
         }
     }
     if drain_after_dispatch && let Some(session) = page_session.as_mut() {
         session.drain_events(std::time::Duration::from_millis(300))?;
+    }
+    Ok(())
+}
+
+fn validate_download_output(format: OutputFormat, file: Option<&Path>) -> Result<()> {
+    if format != OutputFormat::Human && file.is_none_or(|path| path == Path::new("-")) {
+        anyhow::bail!(
+            "download to stdout (omitted FILE or `FILE=-`) writes raw bytes and is incompatible with --format json/jsonl; use --format human or choose a file path"
+        );
     }
     Ok(())
 }
@@ -1182,12 +1223,75 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    fn output_artifact() -> commands::artifacts::ProducedArtifact {
+        commands::artifacts::ProducedArtifact::new(
+            commands::artifacts::PublishedArtifact {
+                path: PathBuf::from("/tmp/example.png"),
+                bytes: 42,
+            },
+            PathBuf::from("example.png"),
+            commands::artifacts::HumanArtifactOutput::Saved,
+            "image/png",
+            Some((10, 20)),
+            commands::artifacts::ArtifactContext::default(),
+        )
+    }
+
     fn parse(args: &[&str]) -> Command {
         Cli::try_parse_from(args).unwrap().command
     }
 
     fn parse_cli(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).unwrap()
+    }
+
+    #[test]
+    fn artifact_output_formats_are_executable_schema_snapshots() {
+        let artifact = output_artifact();
+        assert_eq!(
+            OutputFormat::Human.render_artifact(&artifact).unwrap(),
+            "saved example.png"
+        );
+
+        let json = OutputFormat::Json.render_artifact(&artifact).unwrap();
+        assert!(json.contains('\n'));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+            serde_json::json!({
+                "schemaVersion": 1,
+                "kind": "artifact",
+                "path": "/tmp/example.png",
+                "type": "image/png",
+                "bytes": 42,
+                "width": 10,
+                "height": 20
+            })
+        );
+
+        let jsonl = OutputFormat::Jsonl.render_artifact(&artifact).unwrap();
+        assert_eq!(
+            jsonl,
+            r#"{"schemaVersion":1,"kind":"artifact","path":"/tmp/example.png","type":"image/png","bytes":42,"width":10,"height":20}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&jsonl).unwrap()["kind"],
+            "artifact"
+        );
+    }
+
+    #[test]
+    fn structured_raw_download_is_rejected_before_dispatch() {
+        for format in [OutputFormat::Json, OutputFormat::Jsonl] {
+            let error = validate_download_output(format, Some(Path::new("-"))).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("raw bytes"));
+            assert!(message.contains("--format human"));
+            assert!(message.contains("file path"));
+        }
+        assert!(validate_download_output(OutputFormat::Human, Some(Path::new("-"))).is_ok());
+        assert!(validate_download_output(OutputFormat::Json, Some(Path::new("out.bin"))).is_ok());
+        assert!(validate_download_output(OutputFormat::Human, None).is_ok());
+        assert!(validate_download_output(OutputFormat::Jsonl, None).is_err());
     }
 
     #[test]

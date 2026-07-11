@@ -202,9 +202,8 @@ RDNY_FFMPEG=/opt/homebrew/bin/ffmpeg rdny stop-video video.mp4
 Commands that create artifacts (`download`, `pdf`, `screenshot`,
 `screenshot-el`, and `stop-video`) refuse to overwrite existing paths by
 default, including symlinks. Pass `--force` to replace an output intentionally.
-When `download` infers a filename from page-controlled URLs, rdny keeps the file
-in the current directory and sanitizes separators, dotfiles, control characters,
-`.`/`..`, and overlong names before creating it on Linux/macOS.
+`download SELECTOR FILE` writes a protected artifact; omitting `FILE` (or using
+`-`) streams raw bytes to stdout.
 Downloads perform a best-effort `HEAD` preflight and reject payloads larger than
 256 MiB by default before fetching when `Content-Length` is available. Use
 `rdny download --max-bytes N ...` or `RDNY_MAX_DOWNLOAD_BYTES=N` to tune this.

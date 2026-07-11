@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+use crate::commands::artifacts::{HumanArtifactOutput, ProducedArtifact};
 use crate::commands::print_value;
 use crate::session::PageSession;
 
@@ -57,17 +58,58 @@ pub fn attr(sess: &mut PageSession, selector: &str, name: &str) -> Result<()> {
 }
 
 /// Save the page as PDF (default file: page.pdf).
-pub fn pdf(sess: &mut PageSession, file: Option<&Path>, force: bool) -> Result<()> {
+pub fn pdf(sess: &mut PageSession, file: Option<&Path>, force: bool) -> Result<ProducedArtifact> {
     let path = file
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("page.pdf"));
+    let context = sess.artifact_context()?;
     let result = sess.call("Page.printToPDF", json!({}))?;
     let data = result["data"]
         .as_str()
         .context("Page.printToPDF response missing data")?;
     let bytes = crate::commands::decode_base64(data)?;
-    crate::commands::artifacts::write_artifact(&path, &bytes, force)
+    save_pdf(path, &bytes, force, context)
+}
+
+fn save_pdf(
+    path: PathBuf,
+    bytes: &[u8],
+    force: bool,
+    context: crate::commands::artifacts::ArtifactContext,
+) -> Result<ProducedArtifact> {
+    let published = crate::commands::artifacts::write_artifact(&path, bytes, force)
         .with_context(|| format!("writing PDF to {}", path.display()))?;
-    println!("saved {}", path.display());
-    Ok(())
+    Ok(ProducedArtifact::new(
+        published,
+        path,
+        HumanArtifactOutput::Saved,
+        "application/pdf",
+        None,
+        context,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pdf_file_result_has_final_metadata_and_mime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page.pdf");
+        let artifact = save_pdf(
+            path.clone(),
+            b"%PDF-test",
+            false,
+            crate::commands::artifacts::ArtifactContext::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            artifact.path,
+            path.canonicalize().unwrap().to_string_lossy()
+        );
+        assert_eq!(artifact.media_type, "application/pdf");
+        assert_eq!(artifact.bytes, 9);
+        assert_eq!((artifact.width, artifact.height), (None, None));
+    }
 }

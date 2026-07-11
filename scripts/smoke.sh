@@ -60,6 +60,69 @@ expect_contains() {
   echo "smoke: ok: $desc"
 }
 
+expect_artifact_json() {
+  local desc=$1 format=$2 output=$3 want_path=$4 want_type=$5
+  ARTIFACT_FORMAT=$format ARTIFACT_OUTPUT=$output ARTIFACT_PATH=$want_path ARTIFACT_TYPE=$want_type ARTIFACT_URL="file://$page" python3 - <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+fmt = os.environ["ARTIFACT_FORMAT"]
+text = os.environ["ARTIFACT_OUTPUT"]
+want_path = pathlib.Path(os.environ["ARTIFACT_PATH"]).resolve()
+want_type = os.environ["ARTIFACT_TYPE"]
+want_url = os.environ["ARTIFACT_URL"]
+
+try:
+    if fmt == "jsonl":
+        if "\n" in text:
+            raise AssertionError("jsonl output must be exactly one line")
+        obj = json.loads(text)
+        if json.dumps(obj, separators=(",", ":")) != text:
+            raise AssertionError("jsonl output must be compact")
+    else:
+        obj = json.loads(text)
+        if "\n" not in text:
+            raise AssertionError("json output must be pretty-printed")
+except Exception as exc:
+    print(f"invalid structured artifact output: {exc}: {text!r}", file=sys.stderr)
+    sys.exit(1)
+
+required = {
+    "schemaVersion": 1,
+    "kind": "artifact",
+    "path": str(want_path),
+    "type": want_type,
+}
+for key, value in required.items():
+    if obj.get(key) != value:
+        print(f"{key}: expected {value!r}, got {obj.get(key)!r}; object={obj!r}", file=sys.stderr)
+        sys.exit(1)
+for key in ("instance", "target"):
+    if not isinstance(obj.get(key), str) or not obj[key]:
+        print(f"{key} must identify the live page; object={obj!r}", file=sys.stderr)
+        sys.exit(1)
+if obj.get("url") != want_url:
+    print(f"url: expected {want_url!r}, got {obj.get('url')!r}; object={obj!r}", file=sys.stderr)
+    sys.exit(1)
+if not isinstance(obj.get("bytes"), int) or obj["bytes"] <= 0:
+    print(f"bytes must be a positive integer; object={obj!r}", file=sys.stderr)
+    sys.exit(1)
+if not want_path.is_file() or want_path.stat().st_size != obj["bytes"]:
+    print(f"bytes does not match file size for {want_path}; object={obj!r}", file=sys.stderr)
+    sys.exit(1)
+for key in ("width", "height"):
+    if key in obj and (not isinstance(obj[key], int) or obj[key] <= 0):
+        print(f"{key} must be a positive integer when present; object={obj!r}", file=sys.stderr)
+        sys.exit(1)
+if want_type == "image/png" and not all(isinstance(obj.get(key), int) and obj[key] > 0 for key in ("width", "height")):
+    print(f"PNG artifacts must report dimensions; object={obj!r}", file=sys.stderr)
+    sys.exit(1)
+PY
+  echo "smoke: ok: $desc"
+}
+
 page="$workdir/page.html"
 cat >"$page" <<'HTML'
 <!DOCTYPE html>
@@ -67,7 +130,7 @@ cat >"$page" <<'HTML'
   <head><title>rdny smoke</title></head>
   <body>
     <h1 id="heading">Smoke Page</h1>
-    <a id="link" href="https://example.com/dl">a link</a>
+    <a id="link" href="data:text/plain;base64,U21va2UgZG93bmxvYWQK">a link</a>
     <button id="btn" onclick="document.title = 'clicked'">press</button>
     <form id="f" onsubmit="event.preventDefault(); document.title = 'submitted'">
       <input id="name" type="text">
@@ -140,7 +203,7 @@ expect_contains "allowed chrome open" "chrome://version" "$("${RDNY[@]}" url)"
 
 # --- page info -------------------------------------------------------
 expect "text" "Smoke Page" "$("${RDNY[@]}" text '#heading')"
-expect "attr" "https://example.com/dl" "$("${RDNY[@]}" attr '#link' href)"
+expect "attr" "data:text/plain;base64,U21va2UgZG93bmxvYWQK" "$("${RDNY[@]}" attr '#link' href)"
 expect_contains "html selector" '<h1 id="heading">' "$("${RDNY[@]}" html '#heading')"
 expect_contains "html page" "</html>" "$("${RDNY[@]}" html)"
 
@@ -164,12 +227,49 @@ expect "js math" "3" "$("${RDNY[@]}" js '1+2')"
 "${RDNY[@]}" screenshot "$workdir/shot.png" >/dev/null
 LC_ALL=C grep -a -q 'PNG' "$workdir/shot.png" || fail "screenshot is not a PNG"
 echo "smoke: ok: screenshot"
+shot_json=$("${RDNY[@]}" --format json screenshot --force "$workdir/shot-json.png")
+expect_artifact_json "screenshot json artifact" json "$shot_json" "$workdir/shot-json.png" "image/png"
+shot_jsonl=$("${RDNY[@]}" --format jsonl screenshot --force "$workdir/shot-jsonl.png")
+expect_artifact_json "screenshot jsonl artifact" jsonl "$shot_jsonl" "$workdir/shot-jsonl.png" "image/png"
 "${RDNY[@]}" screenshot-el "#heading" "$workdir/shot-el.png" >/dev/null
 LC_ALL=C grep -a -q 'PNG' "$workdir/shot-el.png" || fail "screenshot-el is not a PNG"
 echo "smoke: ok: screenshot-el"
+shot_el_json=$("${RDNY[@]}" --format json screenshot-el "#heading" --force "$workdir/shot-el-json.png")
+expect_artifact_json "screenshot-el json artifact" json "$shot_el_json" "$workdir/shot-el-json.png" "image/png"
+shot_el_jsonl=$("${RDNY[@]}" --format jsonl screenshot-el "#heading" --force "$workdir/shot-el-jsonl.png")
+expect_artifact_json "screenshot-el jsonl artifact" jsonl "$shot_el_jsonl" "$workdir/shot-el-jsonl.png" "image/png"
 "${RDNY[@]}" pdf "$workdir/page.pdf" >/dev/null
 LC_ALL=C grep -a -q '%PDF' "$workdir/page.pdf" || fail "pdf is not a PDF"
 echo "smoke: ok: pdf"
+pdf_json=$("${RDNY[@]}" --format json pdf --force "$workdir/page-json.pdf")
+expect_artifact_json "pdf json artifact" json "$pdf_json" "$workdir/page-json.pdf" "application/pdf"
+pdf_jsonl=$("${RDNY[@]}" --format jsonl pdf --force "$workdir/page-jsonl.pdf")
+expect_artifact_json "pdf jsonl artifact" jsonl "$pdf_jsonl" "$workdir/page-jsonl.pdf" "application/pdf"
+
+# --- downloads --------------------------------------------------------
+"${RDNY[@]}" download "#link" "$workdir/download-human.txt" >/dev/null
+expect "download human file" "Smoke download" "$(<"$workdir/download-human.txt")"
+download_json=$("${RDNY[@]}" --format json download "#link" --force "$workdir/download-json.txt")
+expect_artifact_json "download explicit json artifact" json "$download_json" "$workdir/download-json.txt" "text/plain"
+download_jsonl=$("${RDNY[@]}" --format jsonl download "#link" --force "$workdir/download-jsonl.txt")
+expect_artifact_json "download explicit jsonl artifact" jsonl "$download_jsonl" "$workdir/download-jsonl.txt" "text/plain"
+"${RDNY[@]}" download "#link" >"$workdir/download-raw-omitted.txt"
+expect "download omitted FILE raw stdout" "Smoke download" "$(<"$workdir/download-raw-omitted.txt")"
+"${RDNY[@]}" download "#link" - >"$workdir/download-raw.txt"
+expect "download raw stdout" "Smoke download" "$(<"$workdir/download-raw.txt")"
+for structured_format in json jsonl; do
+  if raw_structured_error=$("${RDNY[@]}" --format "$structured_format" download "#link" - 2>&1); then
+    fail "$structured_format raw download should fail"
+  fi
+  expect_contains "$structured_format raw download suggests human" "human" "$raw_structured_error"
+  expect_contains "$structured_format raw download suggests file path" "file path" "$raw_structured_error"
+done
+for structured_format in json jsonl; do
+  if raw_structured_error=$("${RDNY[@]}" --format "$structured_format" download "#link" 2>&1); then
+    fail "$structured_format omitted-FILE raw download should fail"
+  fi
+  expect_contains "$structured_format omitted-FILE rejection" "raw bytes" "$raw_structured_error"
+done
 
 # --- video ------------------------------------------------------------
 "${RDNY[@]}" start-video
@@ -177,10 +277,18 @@ echo "smoke: ok: pdf"
 "${RDNY[@]}" wait "#heading"
 "${RDNY[@]}" click "#btn"
 "${RDNY[@]}" screenshot "$workdir/video-frame.png" >/dev/null
-"${RDNY[@]}" stop-video "$workdir/smoke.mp4" >/dev/null
+expect "stop-video human path" "$workdir/smoke.mp4" "$("${RDNY[@]}" stop-video "$workdir/smoke.mp4")"
 [[ -s "$workdir/smoke.mp4" ]] || fail "video was not created"
 LC_ALL=C grep -a -q 'ftyp' "$workdir/smoke.mp4" || fail "video is not an MP4"
 echo "smoke: ok: video"
+"${RDNY[@]}" start-video
+"${RDNY[@]}" screenshot "$workdir/video-frame-json.png" >/dev/null
+video_json=$("${RDNY[@]}" --format json stop-video "$workdir/smoke-json.mp4")
+expect_artifact_json "stop-video json artifact" json "$video_json" "$workdir/smoke-json.mp4" "video/mp4"
+"${RDNY[@]}" start-video
+"${RDNY[@]}" screenshot "$workdir/video-frame-jsonl.png" >/dev/null
+video_jsonl=$("${RDNY[@]}" --format jsonl stop-video "$workdir/smoke-jsonl.mp4")
+expect_artifact_json "stop-video jsonl artifact" jsonl "$video_jsonl" "$workdir/smoke-jsonl.mp4" "video/mp4"
 
 # --- tabs ------------------------------------------------------------
 "${RDNY[@]}" newpage "file://$page" --allow-file-url >/dev/null

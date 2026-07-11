@@ -5,6 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
+use crate::commands::artifacts::{ArtifactContext, HumanArtifactOutput, ProducedArtifact};
 use crate::session::PageSession;
 use crate::state::ViewportOverride;
 
@@ -16,7 +17,8 @@ pub fn screenshot(
     file: Option<&Path>,
     force: bool,
     persisted_viewport: Option<&ViewportOverride>,
-) -> Result<()> {
+) -> Result<ProducedArtifact> {
+    let context = sess.artifact_context()?;
     let override_set = width.is_some() || height.is_some();
     if override_set {
         let w = match width {
@@ -35,7 +37,7 @@ pub fn screenshot(
 
     let result = (|| {
         let result = sess.call("Page.captureScreenshot", json!({"format": "png"}))?;
-        save_screenshot(result, file, force)
+        save_screenshot(result, file, force, context)
     })();
 
     if override_set {
@@ -51,7 +53,8 @@ pub fn screenshot_el(
     selector: &str,
     file: Option<&Path>,
     force: bool,
-) -> Result<()> {
+) -> Result<ProducedArtifact> {
+    let context = sess.artifact_context()?;
     let object_id = sess.element(selector)?;
     let _ = sess.call("DOM.scrollIntoViewIfNeeded", json!({"objectId": object_id}));
     let result = sess.call("DOM.getBoxModel", json!({"objectId": object_id}))?;
@@ -71,20 +74,31 @@ pub fn screenshot_el(
             "captureBeyondViewport": true,
         }),
     )?;
-    save_screenshot(result, file, force)
+    save_screenshot(result, file, force, context)
 }
 
-fn save_screenshot(result: Value, file: Option<&Path>, force: bool) -> Result<()> {
+fn save_screenshot(
+    result: Value,
+    file: Option<&Path>,
+    force: bool,
+    context: ArtifactContext,
+) -> Result<ProducedArtifact> {
     let data = result["data"]
         .as_str()
         .context("screenshot response missing data")?;
     let bytes = crate::commands::decode_base64(data)?;
     let default = Path::new("screenshot.png");
     let path = file.unwrap_or(default);
-    crate::commands::artifacts::write_artifact(path, &bytes, force)
+    let published = crate::commands::artifacts::write_artifact(path, &bytes, force)
         .with_context(|| format!("writing screenshot {}", path.display()))?;
-    println!("saved {}", path.display());
-    Ok(())
+    Ok(ProducedArtifact::new(
+        published,
+        path.to_path_buf(),
+        HumanArtifactOutput::Saved,
+        "image/png",
+        crate::commands::artifacts::png_dimensions(&bytes),
+        context,
+    ))
 }
 
 fn value_as_u32(value: Value, name: &str) -> Result<u32> {
@@ -107,6 +121,7 @@ fn quad_to_rect(quad: &[f64]) -> (f64, f64, f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
 
     #[test]
     fn quad_to_rect_handles_typical_quad() {
@@ -122,5 +137,38 @@ mod tests {
             quad_to_rect(&[5.0, 6.0, 5.0, 6.0, 5.0, 6.0, 5.0, 6.0]),
             (5.0, 6.0, 0.0, 0.0)
         );
+    }
+
+    #[test]
+    fn screenshot_file_result_has_png_dimensions_and_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shot.png");
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend_from_slice(&321_u32.to_be_bytes());
+        png.extend_from_slice(&123_u32.to_be_bytes());
+        let response = serde_json::json!({
+            "data": base64::engine::general_purpose::STANDARD.encode(&png)
+        });
+        let artifact = save_screenshot(
+            response,
+            Some(&path),
+            false,
+            ArtifactContext {
+                instance: Some("i".into()),
+                target: Some("t".into()),
+                url: Some("https://example.test/".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            artifact.path,
+            path.canonicalize().unwrap().to_string_lossy()
+        );
+        assert_eq!(artifact.media_type, "image/png");
+        assert_eq!(artifact.bytes, png.len() as u64);
+        assert_eq!((artifact.width, artifact.height), (Some(321), Some(123)));
+        assert_eq!(artifact.instance.as_deref(), Some("i"));
+        assert_eq!(artifact.target.as_deref(), Some("t"));
+        assert_eq!(artifact.url.as_deref(), Some("https://example.test/"));
     }
 }

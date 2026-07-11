@@ -2,9 +2,10 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 
 pub const STDIN_UPLOAD_LIMIT: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
@@ -22,7 +23,100 @@ pub fn configured_max_download_bytes(cli: Option<u64>) -> Result<u64> {
     }
 }
 
-pub fn write_artifact(path: &Path, bytes: &[u8], force: bool) -> Result<()> {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ArtifactContext {
+    pub instance: Option<String>,
+    pub target: Option<String>,
+    pub url: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HumanArtifactOutput {
+    Saved,
+    BarePath,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProducedArtifact {
+    pub schema_version: u8,
+    pub kind: &'static str,
+    pub path: String,
+    #[serde(rename = "type")]
+    pub media_type: String,
+    pub bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip)]
+    human_path: PathBuf,
+    #[serde(skip)]
+    human_output: HumanArtifactOutput,
+}
+
+impl ProducedArtifact {
+    pub fn new(
+        published: PublishedArtifact,
+        human_path: PathBuf,
+        human_output: HumanArtifactOutput,
+        media_type: impl Into<String>,
+        dimensions: Option<(u32, u32)>,
+        context: ArtifactContext,
+    ) -> Self {
+        let (width, height) =
+            dimensions.map_or((None, None), |(width, height)| (Some(width), Some(height)));
+        Self {
+            schema_version: 1,
+            kind: "artifact",
+            path: published.path.to_string_lossy().into_owned(),
+            media_type: media_type.into(),
+            bytes: published.bytes,
+            width,
+            height,
+            instance: context.instance,
+            target: context.target,
+            url: context.url,
+            human_path,
+            human_output,
+        }
+    }
+
+    pub fn human_summary(&self) -> String {
+        let path: String = self
+            .human_path
+            .to_string_lossy()
+            .chars()
+            .filter_map(|character| {
+                if character.is_control() || character == '\u{7f}' {
+                    None
+                } else if is_dangerous_format_char(character) {
+                    Some('_')
+                } else {
+                    Some(character)
+                }
+            })
+            .collect();
+        match self.human_output {
+            HumanArtifactOutput::Saved => format!("saved {path}"),
+            HumanArtifactOutput::BarePath => path,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublishedArtifact {
+    pub path: PathBuf,
+    pub bytes: u64,
+}
+
+pub fn write_artifact(path: &Path, bytes: &[u8], force: bool) -> Result<PublishedArtifact> {
     let mut reservation = ReservedArtifact::reserve(path, force)?;
     reservation
         .as_file_mut()
@@ -74,7 +168,7 @@ impl ReservedArtifact {
     pub fn as_file_mut(&mut self) -> &mut fs::File {
         self.tmp.as_file_mut()
     }
-    pub fn finalize(self, force: bool) -> Result<()> {
+    pub fn finalize(self, force: bool) -> Result<PublishedArtifact> {
         self.tmp.as_file().sync_all().with_context(|| {
             format!(
                 "syncing temporary artifact for {}",
@@ -84,39 +178,103 @@ impl ReservedArtifact {
         if force {
             self.tmp
                 .persist(&self.final_path)
-                .map(|_| ())
                 .map_err(|err| err.error)
-                .with_context(|| format!("publishing {}", self.final_path.display()))
+                .with_context(|| format!("publishing {}", self.final_path.display()))?;
         } else {
             self.tmp
                 .persist_noclobber(&self.final_path)
-                .map(|_| ())
                 .map_err(|err| err.error)
-                .with_context(|| overwrite_hint(&self.final_path))
+                .with_context(|| overwrite_hint(&self.final_path))?;
         }
+        published_metadata(&self.final_path)
     }
 }
 
-pub fn sanitize_download_name(raw: &str) -> String {
-    let leaf = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
-    let was_dotfile = leaf.trim_start().starts_with('.');
-    let mut out: String = leaf
-        .chars()
-        .map(|c| {
-            if c.is_control() || is_dangerous_format_char(c) || matches!(c, '/' | '\\' | ':') {
-                '_'
-            } else {
-                c
+fn published_metadata(path: &Path) -> Result<PublishedArtifact> {
+    let bytes = fs::metadata(path)
+        .with_context(|| format!("reading final artifact metadata for {}", path.display()))?
+        .len();
+    let path = path
+        .canonicalize()
+        .unwrap_or_else(|_| absolute_normalized(path));
+    Ok(PublishedArtifact { path, bytes })
+}
+
+fn absolute_normalized(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/"))
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normalized.file_name().is_some() {
+                    normalized.pop();
+                }
             }
-        })
-        .collect();
-    out = out
-        .trim_matches(|c: char| c.is_whitespace() || c == '.')
-        .to_string();
-    if out.is_empty() || out == "." || out == ".." || was_dotfile || out.starts_with('.') {
-        out = "download.bin".to_string();
+            other => normalized.push(other.as_os_str()),
+        }
     }
-    truncate_utf8_bytes(&out, 180)
+    normalized
+}
+
+pub fn normalize_media_type(content_type: Option<&str>) -> String {
+    content_type
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .filter(|value| {
+            let mut parts = value.split('/');
+            parts.next().is_some_and(|part| !part.is_empty())
+                && parts.next().is_some_and(|part| !part.is_empty())
+                && parts.next().is_none()
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"!#$&^_.+-/".contains(&byte))
+        })
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| "application/octet-stream".to_string())
+}
+
+pub fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 24 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+pub fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 4 || bytes[..2] != [0xff, 0xd8] {
+        return None;
+    }
+    let mut offset = 2;
+    while offset + 4 <= bytes.len() {
+        while offset < bytes.len() && bytes[offset] == 0xff {
+            offset += 1;
+        }
+        let marker = *bytes.get(offset)?;
+        offset += 1;
+        if matches!(marker, 0xd8 | 0xd9) {
+            continue;
+        }
+        let length = u16::from_be_bytes(bytes.get(offset..offset + 2)?.try_into().ok()?) as usize;
+        if length < 2 || offset + length > bytes.len() {
+            return None;
+        }
+        if matches!(marker, 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf) {
+            let height = u16::from_be_bytes(bytes.get(offset + 3..offset + 5)?.try_into().ok()?);
+            let width = u16::from_be_bytes(bytes.get(offset + 5..offset + 7)?.try_into().ok()?);
+            return (width > 0 && height > 0).then_some((u32::from(width), u32::from(height)));
+        }
+        offset += length;
+    }
+    None
 }
 
 fn is_dangerous_format_char(c: char) -> bool {
@@ -139,17 +297,6 @@ fn is_dangerous_format_char(c: char) -> bool {
             | '\u{1d173}'..='\u{1d17a}'
             | '\u{e0100}'..='\u{e01ef}'
     )
-}
-
-fn truncate_utf8_bytes(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s[..end].to_string()
 }
 
 #[derive(Debug)]
@@ -235,12 +382,122 @@ fn overwrite_hint(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn artifact_fixture() -> ProducedArtifact {
+        ProducedArtifact::new(
+            PublishedArtifact {
+                path: PathBuf::from("/tmp/capture.png"),
+                bytes: 123,
+            },
+            PathBuf::from("capture\n\u{1b}[31m\u{202e}.png"),
+            HumanArtifactOutput::Saved,
+            "image/png",
+            Some((640, 480)),
+            ArtifactContext {
+                instance: Some("instance-1".into()),
+                target: Some("target-1".into()),
+                url: Some("https://example.test/page".into()),
+            },
+        )
+    }
+
     #[test]
-    fn sanitizes_malicious_names() {
-        assert_eq!(sanitize_download_name("../.ssh/id"), "id");
-        assert_eq!(sanitize_download_name(".profile"), "download.bin");
-        assert_eq!(sanitize_download_name("a/b\0c"), "b_c");
-        assert_eq!(sanitize_download_name(".."), "download.bin");
+    fn artifact_schema_snapshot_is_exact() {
+        assert_eq!(
+            serde_json::to_value(artifact_fixture()).unwrap(),
+            serde_json::json!({
+                "schemaVersion": 1,
+                "kind": "artifact",
+                "path": "/tmp/capture.png",
+                "type": "image/png",
+                "bytes": 123,
+                "width": 640,
+                "height": 480,
+                "instance": "instance-1",
+                "target": "target-1",
+                "url": "https://example.test/page"
+            })
+        );
+    }
+
+    #[test]
+    fn artifact_optional_fields_are_omitted() {
+        let artifact = ProducedArtifact::new(
+            PublishedArtifact {
+                path: PathBuf::from("/tmp/page.pdf"),
+                bytes: 10,
+            },
+            PathBuf::from("page.pdf"),
+            HumanArtifactOutput::Saved,
+            "application/pdf",
+            None,
+            ArtifactContext::default(),
+        );
+        assert_eq!(
+            serde_json::to_value(artifact).unwrap(),
+            serde_json::json!({
+                "schemaVersion": 1,
+                "kind": "artifact",
+                "path": "/tmp/page.pdf",
+                "type": "application/pdf",
+                "bytes": 10
+            })
+        );
+    }
+
+    #[test]
+    fn human_artifact_paths_are_sanitized() {
+        assert_eq!(artifact_fixture().human_summary(), "saved capture[31m_.png");
+        let mut artifact = artifact_fixture();
+        artifact.human_output = HumanArtifactOutput::BarePath;
+        assert_eq!(artifact.human_summary(), "capture[31m_.png");
+    }
+
+    #[test]
+    fn publication_returns_canonical_path_and_final_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/../artifact.bin");
+        fs::create_dir(dir.path().join("nested")).unwrap();
+        let published = write_artifact(&path, b"final bytes", false).unwrap();
+        assert!(published.path.is_absolute());
+        assert_eq!(
+            published.path,
+            dir.path().join("artifact.bin").canonicalize().unwrap()
+        );
+        assert_eq!(published.bytes, 11);
+        assert_eq!(
+            absolute_normalized(Path::new("/../../artifact.bin")),
+            Path::new("/artifact.bin")
+        );
+    }
+
+    #[test]
+    fn parses_png_and_jpeg_dimensions() {
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend_from_slice(&640_u32.to_be_bytes());
+        png.extend_from_slice(&480_u32.to_be_bytes());
+        assert_eq!(png_dimensions(&png), Some((640, 480)));
+        assert_eq!(png_dimensions(b"not png"), None);
+
+        let jpeg = [
+            0xff, 0xd8, 0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x03, 0x00, 0x05, 0x03, 0x01, 0x11,
+            0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00,
+        ];
+        assert_eq!(jpeg_dimensions(&jpeg), Some((5, 3)));
+        assert_eq!(jpeg_dimensions(&jpeg[..8]), None);
+    }
+
+    #[test]
+    fn normalizes_download_content_type_with_fallback() {
+        assert_eq!(
+            normalize_media_type(Some(" Text/Plain; Charset=UTF-8 ")),
+            "text/plain"
+        );
+        assert_eq!(normalize_media_type(None), "application/octet-stream");
+        assert_eq!(
+            normalize_media_type(Some("not a media type")),
+            "application/octet-stream"
+        );
     }
     #[test]
     fn no_overwrite_or_symlink_by_default() {
@@ -386,29 +643,5 @@ mod tests {
         let data = vec![0u8; (STDIN_UPLOAD_LIMIT + 1) as usize];
         let e = stdin_upload(&data[..]).unwrap_err();
         assert!(format!("{e}").contains("pass a file path"));
-    }
-
-    #[test]
-    fn unicode_length_limit_is_char_safe() {
-        let name = format!("{}x", "é".repeat(180));
-        let sanitized = sanitize_download_name(&name);
-        assert!(sanitized.len() <= 180);
-        assert!(sanitized.ends_with('é'));
-    }
-
-    #[test]
-    fn dangerous_unicode_format_chars_are_removed_or_bounded() {
-        assert_eq!(
-            sanitize_download_name("safe\u{202e}gnp.exe"),
-            "safe_gnp.exe"
-        );
-        assert_eq!(
-            sanitize_download_name("zero\u{200b}width.txt"),
-            "zero_width.txt"
-        );
-        let many = format!("{}ok.txt", "\u{200d}".repeat(400));
-        let sanitized = sanitize_download_name(&many);
-        assert!(sanitized.len() <= 180);
-        assert!(!sanitized.contains('\u{200d}'));
     }
 }

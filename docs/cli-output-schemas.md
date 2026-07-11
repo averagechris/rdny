@@ -1,4 +1,4 @@
-<!-- Refs #135 #136 #143 -->
+<!-- Refs #135 #136 #143 #184 -->
 
 # CLI output formats and schema version 1
 
@@ -69,5 +69,40 @@ Use `rdny logs --duration SECONDS` for an explicit finite capture, or
 ## artifacts
 
 Artifact-producing commands keep their existing human messages and overwrite
-protection. Structured artifact records use `kind: "artifact"` with `path`,
-`type`, and byte size as available.
+protection. Human output prints `saved PATH` for `screenshot`,
+`screenshot-el`, `pdf`, and `download FILE`; `stop-video` prints the bare
+`PATH`. Displayed paths are terminal-safe.
+
+Structured artifact records have exactly these required fields:
+
+```json
+{
+  "schemaVersion": 1,
+  "kind": "artifact",
+  "path": "canonical absolute path",
+  "type": "MIME media type",
+  "bytes": 123
+}
+```
+
+Screenshot records include `width` and `height` when the PNG header can be
+parsed. Video records may include them when the first JPEG frame can be parsed;
+reported video dimensions include the even-pixel padding applied by the encoder.
+`instance`, `target`, and `url` may be included when available and are omitted
+otherwise. `json` prints one pretty JSON document. `jsonl` prints one compact
+JSON document on one line.
+
+`type` is the artifact's MIME media type: screenshots use `image/png`, PDFs use
+`application/pdf`, downloads use the normalized response `Content-Type` (or
+`application/octet-stream` when it is absent or invalid), and known video
+extensions use their corresponding video media type. `path` is canonicalized
+after atomic publication, with an absolute normalized fallback, and `bytes` is
+the final published file's metadata size. Page artifacts collect context from
+the selected instance, attached target, and `location.href` before capture or
+download. Recovered video assembly remains available without a browser, so its
+context fields can be absent.
+
+`download SELECTOR` and `download SELECTOR -` write raw bytes to stdout in human
+mode. Structured formats for raw stdout downloads are rejected before instance
+selection or browser/session I/O and suggest using human output or an explicit
+file path instead.

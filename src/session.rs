@@ -182,6 +182,7 @@ mod tests {
         let mut session = PageSession {
             client,
             session_id: "page-session".into(),
+            instance_id: Some("instance".into()),
             target_id: "target".into(),
             frames_dir: Some(frames),
             instrumentation_registered: true,
@@ -189,7 +190,12 @@ mod tests {
             deadline: Deadline::after(Duration::from_secs(1)),
         };
         assert!(session.is_recording());
-        assert_eq!(session.eval("'command'").unwrap(), json!("ok"));
+        assert_eq!(session.instance_id(), Some("instance"));
+        assert_eq!(session.target_id(), "target");
+        let context = session.artifact_context().unwrap();
+        assert_eq!(context.instance.as_deref(), Some("instance"));
+        assert_eq!(context.target.as_deref(), Some("target"));
+        assert_eq!(context.url.as_deref(), Some("ok"));
         session.drain_events(Duration::from_millis(100)).unwrap();
         server.join().unwrap();
         assert!(
@@ -246,6 +252,7 @@ impl Deadline {
 pub struct PageSession {
     client: CdpClient,
     session_id: String,
+    instance_id: Option<String>,
     target_id: String,
     frames_dir: Option<state::SecureDir>,
     instrumentation_registered: bool,
@@ -320,6 +327,7 @@ pub fn connect(deadline: Deadline, timeout: Duration) -> Result<PageSession> {
     let mut session = PageSession {
         client,
         session_id,
+        instance_id: state.instance_id.clone(),
         target_id,
         frames_dir,
         instrumentation_registered: false,
@@ -570,6 +578,46 @@ impl PageSession {
     /// Flat-protocol session id for this attached page target.
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// Browser instance selected when this page session was attached.
+    pub fn instance_id(&self) -> Option<&str> {
+        self.instance_id.as_deref()
+    }
+
+    /// CDP page target id (not the flat-protocol session id).
+    pub fn target_id(&self) -> &str {
+        &self.target_id
+    }
+
+    /// Capture page identity before a live page produces an artifact.
+    pub fn artifact_context(&mut self) -> Result<crate::commands::artifacts::ArtifactContext> {
+        let url = self
+            .eval("location.href")?
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .context("location.href did not return the current page URL")?
+            .to_string();
+        Ok(crate::commands::artifacts::ArtifactContext {
+            instance: self.instance_id().map(str::to_string),
+            target: Some(self.target_id().to_string()),
+            url: Some(url),
+        })
+    }
+
+    /// Capture optional context for recovery paths that must succeed without a
+    /// responsive browser.
+    pub fn artifact_context_best_effort(&mut self) -> crate::commands::artifacts::ArtifactContext {
+        let url = self
+            .eval("location.href")
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .filter(|value| !value.is_empty());
+        crate::commands::artifacts::ArtifactContext {
+            instance: self.instance_id().map(str::to_string),
+            target: Some(self.target_id().to_string()),
+            url,
+        }
     }
 
     /// Evaluate a JavaScript expression, returning its value by value.

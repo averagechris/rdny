@@ -7,6 +7,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 
+use crate::commands::artifacts::{HumanArtifactOutput, ProducedArtifact};
 use crate::commands::{artifacts, decode_base64, print_value};
 use crate::session::PageSession;
 
@@ -65,22 +66,23 @@ pub fn file(_sess: &mut PageSession, _selector: &str, _path: &Path) -> Result<()
     Ok(())
 }
 
-/// Download the href/src target of the first selector match; file "-"
-/// (or no file) streams to stdout.
+/// Download the href/src target of the first selector match. An omitted file or
+/// file "-" streams raw bytes to stdout.
 pub fn download(
     _sess: &mut PageSession,
     _selector: &str,
     _file: Option<&Path>,
     force: bool,
     max_bytes: Option<u64>,
-) -> Result<()> {
+) -> Result<Option<ProducedArtifact>> {
+    let context = _sess.artifact_context()?;
     let id = _sess.element(_selector)?;
     let url_value = _sess.call_on(
         &id,
         "function() { return this.href || this.currentSrc || this.src || null; }",
         &[],
     )?;
-    let url = url_value
+    let _url = url_value
         .as_str()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow::anyhow!("element has no href or src"))?
@@ -98,32 +100,50 @@ pub fn download(
         );
     }
     let data = _sess.call_on(&id,
-        "async function(max) { const url = this.href || this.currentSrc || this.src; const resp = await fetch(url, {credentials: 'include'}); if (!resp.ok) { throw new Error('fetch failed: HTTP ' + resp.status); } const len = Number(resp.headers.get('content-length')); if (Number.isFinite(len) && len > max) { throw new Error('download content-length ' + len + ' exceeds max ' + max); } const reader = resp.body && resp.body.getReader ? resp.body.getReader() : null; if (!reader) { const buf = await resp.arrayBuffer(); if (buf.byteLength > max) throw new Error('download exceeds max ' + max); const bytes = new Uint8Array(buf); let s = ''; for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)); return btoa(s); } let chunks = []; let total = 0; for (;;) { const {done, value} = await reader.read(); if (done) break; total += value.byteLength; if (total > max) throw new Error('download exceeds max ' + max); let s = ''; for (let i = 0; i < value.length; i += 0x8000) s += String.fromCharCode.apply(null, value.subarray(i, i + 0x8000)); chunks.push(btoa(s)); } return chunks.join('\n'); }",
+        "async function(max) { const url = this.href || this.currentSrc || this.src; const resp = await fetch(url, {credentials: 'include'}); if (!resp.ok) { throw new Error('fetch failed: HTTP ' + resp.status); } const contentType = resp.headers.get('content-type'); const len = Number(resp.headers.get('content-length')); if (Number.isFinite(len) && len > max) { throw new Error('download content-length ' + len + ' exceeds max ' + max); } const reader = resp.body && resp.body.getReader ? resp.body.getReader() : null; if (!reader) { const buf = await resp.arrayBuffer(); if (buf.byteLength > max) throw new Error('download exceeds max ' + max); const bytes = new Uint8Array(buf); let s = ''; for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)); return {chunks: btoa(s), contentType}; } let chunks = []; let total = 0; for (;;) { const {done, value} = await reader.read(); if (done) break; total += value.byteLength; if (total > max) throw new Error('download exceeds max ' + max); let s = ''; for (let i = 0; i < value.length; i += 0x8000) s += String.fromCharCode.apply(null, value.subarray(i, i + 0x8000)); chunks.push(btoa(s)); } return {chunks: chunks.join('\\n'), contentType}; }",
         &[json!(max_bytes)],
     )?;
-    let chunks = data.as_str().context("download returned no data")?;
+    let chunks = data["chunks"]
+        .as_str()
+        .context("download returned no data")?;
+    let media_type = artifacts::normalize_media_type(data["contentType"].as_str());
     match _file {
-        Some(path) if path == Path::new("-") => {
-            write_download_chunks(chunks, io::stdout().lock(), max_bytes)?
-        }
-        Some(path) => {
-            let mut reservation = artifacts::ReservedArtifact::reserve(path, force)?;
-            write_download_chunks(chunks, reservation.as_file_mut(), max_bytes)?;
-            reservation.finalize(force)?;
-            println!("saved {}", path.display());
-        }
         None => {
-            let name = filename_from_url(&url);
-            let mut reservation = artifacts::ReservedArtifact::reserve(Path::new(&name), force)?;
-            write_download_chunks(chunks, reservation.as_file_mut(), max_bytes)?;
-            reservation.finalize(force)?;
-            println!("saved {name}");
+            write_download_chunks(chunks, io::stdout().lock(), max_bytes)?;
+            Ok(None)
         }
+        Some(path) if path == Path::new("-") => {
+            write_download_chunks(chunks, io::stdout().lock(), max_bytes)?;
+            Ok(None)
+        }
+        Some(path) => Ok(Some(save_download_file(
+            chunks, path, force, max_bytes, media_type, context,
+        )?)),
     }
-    Ok(())
 }
 
-fn write_download_chunks(chunks: &str, mut out: impl std::io::Write, max: u64) -> Result<()> {
+fn save_download_file(
+    chunks: &str,
+    path: &Path,
+    force: bool,
+    max_bytes: u64,
+    media_type: String,
+    context: artifacts::ArtifactContext,
+) -> Result<ProducedArtifact> {
+    let mut reservation = artifacts::ReservedArtifact::reserve(path, force)?;
+    write_download_chunks(chunks, reservation.as_file_mut(), max_bytes)?;
+    let published = reservation.finalize(force)?;
+    Ok(ProducedArtifact::new(
+        published,
+        path.to_path_buf(),
+        HumanArtifactOutput::Saved,
+        media_type,
+        None,
+        context,
+    ))
+}
+
+fn write_download_chunks(chunks: &str, mut out: impl std::io::Write, max: u64) -> Result<u64> {
     let mut total = 0_u64;
     for chunk in chunks.split('\n').filter(|s| !s.is_empty()) {
         let bytes = decode_base64(chunk)?;
@@ -133,7 +153,7 @@ fn write_download_chunks(chunks: &str, mut out: impl std::io::Write, max: u64) -
         }
         out.write_all(&bytes).context("writing download chunk")?;
     }
-    Ok(())
+    Ok(total)
 }
 
 /// Select a dropdown option by value.
@@ -189,60 +209,45 @@ fn dispatch_mouse(
     Ok(())
 }
 
-fn filename_from_url(url: &str) -> String {
-    let without_fragment = url.split('#').next().unwrap_or(url);
-    let without_query = without_fragment
-        .split('?')
-        .next()
-        .unwrap_or(without_fragment);
-    let path = without_query
-        .split_once("://")
-        .map(|(_, rest)| rest.find('/').map(|i| &rest[i..]).unwrap_or(""))
-        .unwrap_or(without_query);
-    let name = path.rsplit('/').next().unwrap_or_default();
-    artifacts::sanitize_download_name(name)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{filename_from_url, write_download_chunks};
-
-    #[test]
-    fn filename_from_url_strips_query() {
-        assert_eq!(
-            filename_from_url("https://example.com/files/report.pdf?x=1"),
-            "report.pdf"
-        );
-    }
-
-    #[test]
-    fn filename_from_url_handles_trailing_slash() {
-        assert_eq!(
-            filename_from_url("https://example.com/files/"),
-            "download.bin"
-        );
-    }
-
-    #[test]
-    fn filename_from_url_handles_bare_domain() {
-        assert_eq!(filename_from_url("https://example.com"), "download.bin");
-    }
-
-    #[test]
-    fn filename_from_url_strips_fragment() {
-        assert_eq!(
-            filename_from_url("https://example.com/a/b.txt#part"),
-            "b.txt"
-        );
-    }
+    use super::{save_download_file, write_download_chunks};
+    use crate::commands::artifacts::ArtifactContext;
 
     #[test]
     fn download_chunks_write_incrementally_and_bound_total() {
         let mut out = Vec::new();
-        write_download_chunks("aGVs\nbG8=", &mut out, 5).unwrap();
+        assert_eq!(write_download_chunks("aGVs\nbG8=", &mut out, 5).unwrap(), 5);
         assert_eq!(out, b"hello");
         let mut out = Vec::new();
         let err = write_download_chunks("aGVs\nbG8=", &mut out, 4).unwrap_err();
         assert!(format!("{err}").contains("larger than 4 bytes"));
+    }
+
+    #[test]
+    fn download_file_result_uses_response_mime_and_final_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload.txt");
+        let artifact = save_download_file(
+            "aGVsbG8=",
+            &path,
+            false,
+            5,
+            "text/plain".into(),
+            ArtifactContext {
+                instance: Some("i".into()),
+                target: Some("t".into()),
+                url: Some("https://example.test/".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            artifact.path,
+            path.canonicalize().unwrap().to_string_lossy()
+        );
+        assert_eq!(artifact.media_type, "text/plain");
+        assert_eq!(artifact.bytes, 5);
+        assert_eq!(std::fs::read(path).unwrap(), b"hello");
+        assert_eq!(artifact.instance.as_deref(), Some("i"));
     }
 }
