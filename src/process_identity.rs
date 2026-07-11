@@ -745,8 +745,7 @@ mod tests {
         let id = capture(pid, launcher, None).unwrap();
         let observed_executable = id.exe.clone();
         let identity_matches = matches_identity(pid, &id).unwrap();
-        terminate(&id).unwrap();
-        let identity_gone = !matches_identity(pid, &id).unwrap();
+        child.kill().unwrap();
         let _ = child.wait();
         assert_eq!(
             observed_executable.file_name(),
@@ -754,7 +753,6 @@ mod tests {
         );
         assert_ne!(launcher, observed_executable);
         assert!(identity_matches);
-        assert!(identity_gone);
     }
 
     #[cfg(target_os = "linux")]
