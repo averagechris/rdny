@@ -19,8 +19,34 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Binaries {
-    pub chrome: Option<PathBuf>,
+    #[serde(default, deserialize_with = "deserialize_optional_chrome_paths")]
+    pub chrome: Option<Vec<PathBuf>>,
     pub ffmpeg: Option<PathBuf>,
+}
+
+fn deserialize_optional_chrome_paths<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<PathBuf>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ChromePaths {
+        One(PathBuf),
+        Many(Vec<PathBuf>),
+    }
+
+    Ok(
+        Option::<ChromePaths>::deserialize(deserializer)?.map(|paths| match paths {
+            ChromePaths::One(path) => vec![path],
+            ChromePaths::Many(paths) => paths,
+        }),
+    )
+}
+
+pub fn chrome_paths(config: &Config) -> Option<&[PathBuf]> {
+    config.binaries.as_ref()?.chrome.as_deref()
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -108,7 +134,7 @@ mod tests {
     fn parses_valid_full_config() {
         let raw = r#"
             [binaries]
-            chrome = "/Applications/Helium.app/Contents/MacOS/Helium"
+            chrome = ["/Applications/Helium.app/Contents/MacOS/Helium", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
             ffmpeg = "/opt/homebrew/bin/ffmpeg"
 
             [connect]
@@ -120,7 +146,10 @@ mod tests {
         let config: Config = toml::from_str(raw).unwrap();
         assert_eq!(
             config.binaries.as_ref().unwrap().chrome.as_ref().unwrap(),
-            &PathBuf::from("/Applications/Helium.app/Contents/MacOS/Helium")
+            &vec![
+                PathBuf::from("/Applications/Helium.app/Contents/MacOS/Helium"),
+                PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            ]
         );
         assert_eq!(
             config.connect.as_ref().unwrap().default.as_deref(),
@@ -184,6 +213,20 @@ mod tests {
         assert_eq!(
             resolve_ffmpeg(None, &Config::default()),
             PathBuf::from("ffmpeg")
+        );
+    }
+
+    #[test]
+    fn parses_legacy_single_chrome_path() {
+        let config: Config = toml::from_str(
+            r#"[binaries]
+chrome = "/legacy/chrome"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.binaries.unwrap().chrome.unwrap(),
+            vec![PathBuf::from("/legacy/chrome")]
         );
     }
 }

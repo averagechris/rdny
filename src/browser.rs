@@ -33,18 +33,20 @@ pub struct LaunchOpts {
     pub label: Option<String>,
 }
 
-/// Discover a browser binary: RDNY_CHROME env var, config file, then
-/// well-known locations, else an actionable hint error.
+/// Discover the preferred browser binary: RDNY_CHROME env var, config file,
+/// then well-known locations, else an actionable hint error.
 pub fn discover() -> Result<PathBuf> {
+    discover_candidates().map(|mut paths| paths.remove(0))
+}
+
+/// Discover browser binaries in launch preference order.
+pub(crate) fn discover_candidates() -> Result<Vec<PathBuf>> {
     let env_chrome = std::env::var_os("RDNY_CHROME");
     let config_path = config::config_path()?;
     let config = config::load_from_path(config_path.clone())?;
     discover_from(
         env_chrome.as_deref(),
-        config
-            .binaries
-            .as_ref()
-            .and_then(|binaries| binaries.chrome.as_deref()),
+        config::chrome_paths(&config),
         Some(config_path.as_path()),
         &well_known_candidates(),
     )
@@ -82,7 +84,7 @@ pub(crate) fn launch_armed_until(
     storage: BrowserStorage,
     deadline: Deadline,
 ) -> Result<LaunchedBrowser> {
-    let binary = discover()?;
+    let binaries = discover_candidates()?;
     let profile_dir = storage.profile.path().to_path_buf();
     let data_root = profile_dir.parent().context("profile has no state root")?;
     storage.profile.remove_file("DevToolsActivePort")?;
@@ -97,55 +99,91 @@ pub(crate) fn launch_armed_until(
 
     let log = storage.log;
     let log_err = log.try_clone().context("cloning chrome log handle")?;
-    let child = Command::new(&binary)
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err))
-        .spawn()
-        .with_context(|| format!("launching {}", binary.display()))?;
-    let launch_guard = ChildLaunchGuard::armed(child);
+    let mut last_error = None;
+    for binary in binaries {
+        storage.profile.remove_file("DevToolsActivePort")?;
+        let log_try = log.try_clone().context("cloning chrome log handle")?;
+        let log_err_try = log_err.try_clone().context("cloning chrome log handle")?;
+        let child = match Command::new(&binary)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log_try))
+            .stderr(Stdio::from(log_err_try))
+            .spawn()
+            .with_context(|| format!("launching {}", binary.display()))
+        {
+            Ok(child) => child,
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        };
+        let launch_guard = ChildLaunchGuard::armed(child);
+        let port = match wait_for_devtools_port(&storage.profile, deadline) {
+            Ok(port) => port,
+            Err(_) => {
+                last_error = Some(launch_probe_error(data_root));
+                continue;
+            }
+        };
+        let version = match wait_for_version("127.0.0.1", port, deadline) {
+            Ok(version) => version,
+            Err(_) => {
+                last_error = Some(launch_probe_error(data_root));
+                continue;
+            }
+        };
+        if let Err(error) =
+            crate::cdp::client::validate_debugger_url(&version.ws_url, "127.0.0.1", port)
+        {
+            last_error = Some(error);
+            continue;
+        }
+        let target_id = match first_page_target("127.0.0.1", port, deadline) {
+            Ok(target_id) => target_id,
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        };
 
-    let port = match wait_for_devtools_port(&storage.profile, deadline) {
-        Ok(port) => port,
-        Err(_) => return Err(launch_probe_error(data_root)),
-    };
-    let version = match wait_for_version("127.0.0.1", port, deadline) {
-        Ok(version) => version,
-        Err(_) => return Err(launch_probe_error(data_root)),
-    };
-    crate::cdp::client::validate_debugger_url(&version.ws_url, "127.0.0.1", port)?;
-    let target_id = first_page_target("127.0.0.1", port, deadline)?;
-
-    let child_id = launch_guard.id();
-    let process_identity = Some(
-        process_identity::capture(child_id, &binary, Some(&profile_dir))
-            .context("capturing launched browser process identity")?,
-    );
-    let state = SessionState {
-        instance_id: None,
-        endpoint: None,
-        ws_url: version.ws_url,
-        host: "127.0.0.1".into(),
-        port,
-        pid: Some(child_id),
-        process_identity,
-        user_data_dir: Some(profile_dir),
-        browser_path: Some(binary),
-        target_id,
-        label: opts.label.clone(),
-        viewport: None,
-        recording: false,
-        recording_id: None,
-        recording_frames_dir: None,
-        recoverable_recording: None,
-        recoverable_recordings: Vec::new(),
-        instrumentation: None,
-    };
-    Ok(LaunchedBrowser {
-        state,
-        guard: launch_guard,
-    })
+        let child_id = launch_guard.id();
+        let process_identity =
+            match process_identity::capture(child_id, &binary, Some(&profile_dir))
+                .context("capturing launched browser process identity")
+            {
+                Ok(identity) => Some(identity),
+                Err(error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+        let state = SessionState {
+            instance_id: None,
+            endpoint: None,
+            ws_url: version.ws_url,
+            host: "127.0.0.1".into(),
+            port,
+            pid: Some(child_id),
+            process_identity,
+            user_data_dir: Some(profile_dir),
+            browser_path: Some(binary),
+            target_id,
+            label: opts.label.clone(),
+            viewport: None,
+            recording: false,
+            recording_id: None,
+            recording_frames_dir: None,
+            recoverable_recording: None,
+            recoverable_recordings: Vec::new(),
+            instrumentation: None,
+        };
+        return Ok(LaunchedBrowser {
+            state,
+            guard: launch_guard,
+        });
+    }
+    Err(last_error.unwrap_or_else(|| launch_probe_error(data_root)))
 }
 
 /// Attach with an explicit remote policy. Direct remote CDP remains rejected:
@@ -345,14 +383,14 @@ pub fn status_until(state: &SessionState, deadline: Deadline) -> Result<BrowserS
 
 fn discover_from(
     env_chrome: Option<&OsStr>,
-    config_chrome: Option<&Path>,
+    config_chrome: Option<&[PathBuf]>,
     config_path: Option<&Path>,
     candidates: &[PathBuf],
-) -> Result<PathBuf> {
+) -> Result<Vec<PathBuf>> {
     if let Some(path) = env_chrome {
         let path = PathBuf::from(path);
         if path.is_file() {
-            return Ok(path);
+            return Ok(vec![path]);
         }
         return Err(hint_error(
             format!(
@@ -363,17 +401,21 @@ fn discover_from(
             Some("chromium-remote-debugging"),
         ));
     }
-    if let Some(path) = config_chrome {
-        if path.is_file() {
-            return Ok(path.to_path_buf());
+    if let Some(paths) = config_chrome {
+        let existing: Vec<_> = paths
+            .iter()
+            .filter(|path| path.is_file())
+            .cloned()
+            .collect();
+        if !existing.is_empty() {
+            return Ok(existing);
         }
         let config_source = config_path
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "the rdny config file".to_string());
         return Err(hint_error(
             format!(
-                "binaries.chrome in {config_source} is set to {}, which does not exist",
-                path.display()
+                "binaries.chrome in {config_source} has no existing Chrome/Chromium binary paths"
             ),
             format!(
                 "point binaries.chrome in {config_source} at a Chrome/Chromium binary, or set RDNY_CHROME"
@@ -381,17 +423,16 @@ fn discover_from(
             Some("chromium-remote-debugging"),
         ));
     }
-    candidates
-        .iter()
-        .find(|p| p.is_file())
-        .cloned()
-        .ok_or_else(|| {
-            hint_error(
-                "no Chrome or Chromium browser found",
-                "install Google Chrome, set RDNY_CHROME, or set binaries.chrome in the rdny config file to a Chromium-based binary",
-                Some("chromium-remote-debugging"),
-            )
-        })
+    let found: Vec<_> = candidates.iter().filter(|p| p.is_file()).cloned().collect();
+    if !found.is_empty() {
+        Ok(found)
+    } else {
+        Err(hint_error(
+            "no Chrome or Chromium browser found",
+            "install Google Chrome, set RDNY_CHROME, or set binaries.chrome in the rdny config file to a Chromium-based binary",
+            Some("chromium-remote-debugging"),
+        ))
+    }
 }
 
 /// Build a copy-pasteable command showing how to relaunch the browser
@@ -729,7 +770,7 @@ mod tests {
         fs::write(&candidate, "").unwrap();
         assert_eq!(
             discover_from(Some(env.as_os_str()), None, None, &[candidate]).unwrap(),
-            env
+            vec![env]
         );
     }
 
@@ -743,12 +784,12 @@ mod tests {
         assert_eq!(
             discover_from(
                 None,
-                Some(&config),
+                Some(std::slice::from_ref(&config)),
                 Some(Path::new("/cfg.toml")),
                 &[candidate]
             )
             .unwrap(),
-            config
+            vec![config]
         );
     }
 
@@ -774,12 +815,12 @@ mod tests {
         assert_eq!(
             discover_from(
                 Some(env.as_os_str()),
-                Some(&config),
+                Some(std::slice::from_ref(&config)),
                 Some(Path::new("/cfg.toml")),
                 &[]
             )
             .unwrap(),
-            env
+            vec![env]
         );
     }
 
@@ -787,7 +828,7 @@ mod tests {
     fn discover_config_missing_errors() {
         let err = discover_from(
             None,
-            Some(Path::new("/definitely/missing/config-chrome")),
+            Some(&[PathBuf::from("/definitely/missing/config-chrome")]),
             Some(Path::new("/tmp/rdny-config.toml")),
             &[],
         )
@@ -798,14 +839,36 @@ mod tests {
     }
 
     #[test]
-    fn discover_candidates_in_order() {
+    fn discover_candidates_preserve_order_and_skip_missing() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing");
+        let first = dir.path().join("first");
         let second = dir.path().join("second");
+        fs::write(&first, "").unwrap();
         fs::write(&second, "").unwrap();
         assert_eq!(
-            discover_from(None, None, None, &[missing, second.clone()]).unwrap(),
-            second
+            discover_from(None, None, None, &[missing, first.clone(), second.clone()]).unwrap(),
+            vec![first, second]
+        );
+    }
+
+    #[test]
+    fn discover_config_paths_fall_back_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        fs::write(&first, "").unwrap();
+        fs::write(&second, "").unwrap();
+        assert_eq!(
+            discover_from(
+                None,
+                Some(&[missing, first.clone(), second.clone()]),
+                Some(Path::new("/cfg.toml")),
+                &[]
+            )
+            .unwrap(),
+            vec![first, second]
         );
     }
 

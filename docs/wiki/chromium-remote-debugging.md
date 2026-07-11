@@ -66,5 +66,5 @@ If that request fails, rdny will fail too. Check that the browser is still runni
   ```
 
   After that, `rdny connect personal` or just `rdny connect` uses the configured target.
-- If rdny cannot find a browser binary for managed launches, set `RDNY_CHROME` to a Chrome/Chromium executable path or set `binaries.chrome` in the rdny config file.
+- If rdny cannot find a browser binary for managed launches, set `RDNY_CHROME` to a Chrome/Chromium executable path or set `binaries.chrome` to an ordered array of fallback paths in the rdny config file.
 - `RDNY_CHROME_ARGS` appends extra flags when rdny launches Chrome itself. It is split on ASCII whitespace, so shell-style quoting inside the variable is not supported.

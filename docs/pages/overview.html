@@ -40,7 +40,7 @@ rdny screenshot example.png
 rdny stop</code></pre>
 
     <h2>Browser provisioning</h2>
-    <p>The default rdny package does not bundle Chrome. At runtime rdny uses <code>RDNY_CHROME</code> when set, then checks well-known macOS and Linux Chrome/Chromium locations, then reports a clear error explaining how to provide a browser path. Use <code>RDNY_CHROME_ARGS</code> to append launch flags.</p>
+    <p>The default rdny package does not bundle Chrome. At runtime rdny uses <code>RDNY_CHROME</code> when set, then ordered <code>binaries.chrome</code> config paths, then well-known macOS and Linux Chrome/Chromium locations, then reports a clear error explaining how to provide a browser path. Use <code>RDNY_CHROME_ARGS</code> to append launch flags.</p>
     <p>Linux/Nix users can opt into a browser-containing closure with <code>nix run .#rdny-bundled</code>. That package wraps rdny with Nixpkgs <code>ungoogled-chromium</code> and <code>ffmpeg-headless</code>, setting <code>RDNY_CHROME</code> and <code>RDNY_FFMPEG</code> only as defaults. The bundled output is Linux-only; Darwin relies on system Chrome/Chromium discovery or an explicit <code>RDNY_CHROME</code>.</p>
     <p><code>stop-video</code> uses ffmpeg from <code>RDNY_FFMPEG</code>, config, or <code>PATH</code>. All Nix systems can opt into a managed ffmpeg binary without a bundled browser with <code>nix run .#rdny-ffmpeg</code>.</p>
 

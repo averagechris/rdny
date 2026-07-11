@@ -45,10 +45,11 @@ struct Startup {
     instance_id: String,
     token: Vec<u8>,
     state_root: PathBuf,
-    binary: PathBuf,
+    binaries: Vec<PathBuf>,
     profile: PathBuf,
     args: Vec<String>,
     expected_uid: u32,
+    startup_timeout_ms: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -56,6 +57,7 @@ enum StartupReply {
     Ready {
         browser_pid: u32,
         browser_identity: ProcessIdentity,
+        browser_path: PathBuf,
         browser_name: String,
         target_id: Option<String>,
         socket: PathBuf,
@@ -116,7 +118,7 @@ pub(crate) fn launch_armed(
     instance_id: String,
     deadline: Deadline,
 ) -> Result<ProvisionalBroker> {
-    let binary = crate::browser::discover()?;
+    let binaries = crate::browser::discover_candidates()?;
     let profile = storage.profile.path().to_path_buf();
     let state_root = profile
         .parent()
@@ -145,10 +147,16 @@ pub(crate) fn launch_armed(
         instance_id: instance_id.clone(),
         token: token.0.to_vec(),
         state_root: state_root.clone(),
-        binary: binary.clone(),
+        binaries,
         profile: profile.clone(),
         args,
         expected_uid: unsafe { libc::geteuid() },
+        startup_timeout_ms: deadline
+            .remaining()
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX),
     };
     let (mut parent, child_socket) = UnixStream::pair()?;
     set_cloexec(parent.as_raw_fd(), true)?;
@@ -189,14 +197,21 @@ pub(crate) fn launch_armed(
             return Err(error).context("waiting for managed broker startup");
         }
     };
-    let (browser_pid, browser_identity, target_id, socket) = match reply {
+    let (browser_pid, browser_identity, browser_path, target_id, socket) = match reply {
         StartupReply::Ready {
             browser_pid,
             browser_identity,
+            browser_path,
             browser_name: _,
             target_id,
             socket,
-        } => (browser_pid, browser_identity, target_id, socket),
+        } => (
+            browser_pid,
+            browser_identity,
+            browser_path,
+            target_id,
+            socket,
+        ),
         StartupReply::Error { message } => {
             let _ = child.wait();
             bail!("managed broker startup failed: {message}");
@@ -231,7 +246,7 @@ pub(crate) fn launch_armed(
         pid: Some(browser_pid),
         process_identity: Some(browser_identity),
         user_data_dir: Some(profile),
-        browser_path: Some(binary),
+        browser_path: Some(browser_path),
         target_id,
         label: opts.label.clone(),
         viewport: None,
@@ -374,7 +389,14 @@ fn run_broker(startup_stream: &mut UnixStream, startup: Startup) -> Result<()> {
     }
     let creds = OsCredentialProvider;
     let (listener, socket) = security::bind(&storage.broker, &startup.instance_id, &creds)?;
-    let mut chrome = match spawn_chrome_pipe(&startup.binary, &startup.args, storage.log) {
+    let startup_deadline = Deadline::after(Duration::from_millis(startup.startup_timeout_ms));
+    let (mut chrome, probe) = match spawn_first_chrome_pipe_until(
+        &startup.binaries,
+        &startup.args,
+        &startup.profile,
+        storage.log,
+        startup_deadline,
+    ) {
         Ok(value) => value,
         Err(error) => {
             let _ = fs::remove_file(&socket);
@@ -384,6 +406,7 @@ fn run_broker(startup_stream: &mut UnixStream, startup: Startup) -> Result<()> {
     let result = broker_after_chrome(
         startup_stream,
         &startup,
+        probe,
         &token,
         &listener,
         &socket,
@@ -398,6 +421,13 @@ struct ChromePipe {
     child: Child,
     read: Option<std::fs::File>,
     write: Arc<Mutex<std::fs::File>>,
+}
+
+struct ChromeStartupProbe {
+    browser_path: PathBuf,
+    browser_identity: ProcessIdentity,
+    browser_name: String,
+    target_id: Option<String>,
 }
 
 fn pipe_pair() -> Result<(OwnedFd, OwnedFd)> {
@@ -446,8 +476,91 @@ fn duplicate_cloexec(fd: RawFd) -> Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
 }
 
-fn spawn_chrome_pipe(binary: &Path, args: &[String], log: std::fs::File) -> Result<ChromePipe> {
-    spawn_chrome_pipe_with_env(binary, args, log, None)
+fn spawn_first_chrome_pipe_until(
+    binaries: &[PathBuf],
+    args: &[String],
+    profile: &Path,
+    log: std::fs::File,
+    deadline: Deadline,
+) -> Result<(ChromePipe, ChromeStartupProbe)> {
+    spawn_first_chrome_pipe_with_env_until(binaries, args, profile, log, deadline, None)
+}
+
+fn spawn_first_chrome_pipe_with_env_until(
+    binaries: &[PathBuf],
+    args: &[String],
+    profile: &Path,
+    log: std::fs::File,
+    deadline: Deadline,
+    test_env: Option<(&str, &str)>,
+) -> Result<(ChromePipe, ChromeStartupProbe)> {
+    let mut errors = Vec::new();
+    let total = binaries.len();
+    for (index, binary) in binaries.iter().enumerate() {
+        let remaining_candidates = total.saturating_sub(index);
+        let candidate_deadline = match fair_candidate_deadline(deadline, remaining_candidates) {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                errors.push(format!(
+                    "{}: timed out waiting for Chrome startup pipe response ({error:#})",
+                    binary.display()
+                ));
+                break;
+            }
+        };
+        let mut chrome = match spawn_chrome_pipe_with_env(binary, args, log.try_clone()?, test_env)
+        {
+            Ok(chrome) => chrome,
+            Err(error) => {
+                errors.push(format!("{}: {error:#}", binary.display()));
+                continue;
+            }
+        };
+        match probe_chrome_startup_until(&mut chrome, binary, Some(profile), candidate_deadline) {
+            Ok(probe) => return Ok((chrome, probe)),
+            Err(error) => {
+                errors.push(format!("{}: {error:#}", binary.display()));
+                kill_chrome(&mut chrome);
+            }
+        }
+    }
+    if errors.is_empty() {
+        bail!("no Chrome/Chromium binary candidates to launch")
+    }
+    bail!(
+        "no Chrome/Chromium binary candidates launched successfully: {}",
+        errors.join("; ")
+    )
+}
+
+fn fair_candidate_deadline(overall: Deadline, candidates_left: usize) -> Result<Deadline> {
+    let remaining = overall
+        .remaining()
+        .context("Chrome startup deadline expired before trying next candidate")?;
+    let share = remaining / candidates_left.max(1) as u32;
+    Ok(Deadline::after(share.max(Duration::from_millis(1))))
+}
+
+fn probe_chrome_startup_until(
+    chrome: &mut ChromePipe,
+    browser_path: &Path,
+    profile: Option<&Path>,
+    deadline: Deadline,
+) -> Result<ChromeStartupProbe> {
+    let version = startup_call_until(chrome, 1, "Browser.getVersion", deadline)?;
+    let targets = startup_call_until(chrome, 2, "Target.getTargets", deadline)?;
+    let target_id = targets["targetInfos"]
+        .as_array()
+        .and_then(|items| items.iter().find(|v| v["type"] == "page"))
+        .and_then(|v| v["targetId"].as_str())
+        .map(str::to_string);
+    let browser_identity = process_identity::capture(chrome.child.id(), browser_path, profile)?;
+    Ok(ChromeStartupProbe {
+        browser_path: browser_path.to_path_buf(),
+        browser_identity,
+        browser_name: version["product"].as_str().unwrap_or("Chrome").to_string(),
+        target_id,
+    })
 }
 
 fn spawn_chrome_pipe_with_env(
@@ -522,6 +635,22 @@ fn raw_send(write: &Arc<Mutex<std::fs::File>>, value: &Value) -> Result<()> {
 }
 
 fn raw_read(read: &mut std::fs::File, buffer: &mut Vec<u8>) -> Result<Value> {
+    raw_read_inner(read, buffer, None)
+}
+
+fn raw_read_until(
+    read: &mut std::fs::File,
+    buffer: &mut Vec<u8>,
+    deadline: Deadline,
+) -> Result<Value> {
+    raw_read_inner(read, buffer, Some(deadline))
+}
+
+fn raw_read_inner(
+    read: &mut std::fs::File,
+    buffer: &mut Vec<u8>,
+    deadline: Option<Deadline>,
+) -> Result<Value> {
     loop {
         if let Some(pos) = buffer.iter().position(|b| *b == 0) {
             let frame: Vec<_> = buffer.drain(..=pos).take(pos).collect();
@@ -529,6 +658,9 @@ fn raw_read(read: &mut std::fs::File, buffer: &mut Vec<u8>) -> Result<Value> {
         }
         if buffer.len() >= MAX_PIPE_MESSAGE_BYTES {
             bail!("Chrome pipe message exceeds limit");
+        }
+        if let Some(deadline) = deadline {
+            wait_readable(read.as_raw_fd(), deadline)?;
         }
         let mut chunk = [0; 8192];
         let n = read.read(&mut chunk)?;
@@ -539,12 +671,37 @@ fn raw_read(read: &mut std::fs::File, buffer: &mut Vec<u8>) -> Result<Value> {
     }
 }
 
-fn startup_call(chrome: &mut ChromePipe, id: u64, method: &str) -> Result<Value> {
+fn wait_readable(fd: RawFd, deadline: Deadline) -> Result<()> {
+    let remaining = deadline
+        .remaining()
+        .context("timed out waiting for Chrome startup pipe response")?;
+    let timeout_ms: i32 = remaining.as_millis().min(i32::MAX as u128) as i32;
+    let mut poll_fd = libc::pollfd {
+        fd,
+        events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+        revents: 0,
+    };
+    let rc = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if rc == 0 {
+        bail!("timed out waiting for Chrome startup pipe response");
+    }
+    Ok(())
+}
+
+fn startup_call_until(
+    chrome: &mut ChromePipe,
+    id: u64,
+    method: &str,
+    deadline: Deadline,
+) -> Result<Value> {
     raw_send(&chrome.write, &json!({"id":id,"method":method,"params":{}}))?;
     let read = chrome.read.as_mut().context("Chrome pipe reader missing")?;
     let mut buf = Vec::new();
     loop {
-        let value = raw_read(read, &mut buf)?;
+        let value = raw_read_until(read, &mut buf, deadline)?;
         if value["id"] == id {
             if value.get("error").is_some() {
                 bail!("{method} failed: {}", value["error"]);
@@ -557,27 +714,20 @@ fn startup_call(chrome: &mut ChromePipe, id: u64, method: &str) -> Result<Value>
 fn broker_after_chrome(
     startup_stream: &mut UnixStream,
     startup: &Startup,
+    probe: ChromeStartupProbe,
     token: &Token,
     listener: &UnixListener,
     socket: &Path,
     chrome: &mut ChromePipe,
 ) -> Result<()> {
-    let version = startup_call(chrome, 1, "Browser.getVersion")?;
-    let targets = startup_call(chrome, 2, "Target.getTargets")?;
-    let target_id = targets["targetInfos"]
-        .as_array()
-        .and_then(|items| items.iter().find(|v| v["type"] == "page"))
-        .and_then(|v| v["targetId"].as_str())
-        .map(str::to_string);
-    let browser_identity =
-        process_identity::capture(chrome.child.id(), &startup.binary, Some(&startup.profile))?;
     protocol::write_frame(
         startup_stream,
         &StartupReply::Ready {
             browser_pid: chrome.child.id(),
-            browser_identity,
-            browser_name: version["product"].as_str().unwrap_or("Chrome").to_string(),
-            target_id,
+            browser_identity: probe.browser_identity,
+            browser_path: probe.browser_path,
+            browser_name: probe.browser_name,
+            target_id: probe.target_id,
             socket: socket.to_path_buf(),
         },
     )?;
@@ -806,10 +956,18 @@ fn shutdown_chrome(chrome: &mut ChromePipe) {
     let _ = chrome.child.wait();
 }
 
+fn kill_chrome(chrome: &mut ChromePipe) {
+    if chrome.child.try_wait().ok().flatten().is_none() {
+        let _ = chrome.child.kill();
+    }
+    let _ = chrome.child.wait();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::IntoRawFd;
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    use std::os::unix::fs::PermissionsExt;
 
     fn empty_state() -> SessionState {
         SessionState {
@@ -886,6 +1044,149 @@ mod tests {
         bytes.push(0);
         let written = unsafe { libc::write(4, bytes.as_ptr().cast(), bytes.len()) };
         assert_eq!(written as usize, bytes.len());
+    }
+
+    #[test]
+    fn pipe_chrome_probe_helper() {
+        if std::env::var_os("RDNY_PIPE_CHROME_PROBE_HELPER").is_none() {
+            return;
+        }
+        let argv0 = std::env::args().next().unwrap_or_default();
+        if argv0.contains("hang") {
+            loop {
+                thread::sleep(Duration::from_secs(60));
+            }
+        }
+        if !argv0.contains("good") {
+            std::process::exit(42);
+        }
+        let mut read = unsafe { std::fs::File::from_raw_fd(3) };
+        let write = unsafe { std::fs::File::from_raw_fd(4) };
+        let write = Arc::new(Mutex::new(write));
+        for _ in 0..2 {
+            let request = raw_read(&mut read, &mut Vec::new()).unwrap();
+            let id = request["id"].clone();
+            let result = match request["method"].as_str().unwrap() {
+                "Browser.getVersion" => json!({"product":"FakeChrome/1"}),
+                "Target.getTargets" => json!({"targetInfos":[{"type":"page","targetId":"page-1"}]}),
+                other => panic!("unexpected method {other}"),
+            };
+            raw_send(&write, &json!({"id":id,"result":result})).unwrap();
+        }
+        loop {
+            thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    fn copy_test_exe(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::copy(std::env::current_exe().unwrap(), &path).unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    #[test]
+    fn spawn_first_chrome_pipe_probes_and_falls_back_after_nonworking_spawn() {
+        let temp = tempfile::tempdir().unwrap();
+        let bad = copy_test_exe(temp.path(), "bad-chrome");
+        let good = copy_test_exe(temp.path(), "good-chrome");
+        let log = fs::File::create(temp.path().join("chrome.log")).unwrap();
+        let args = vec![
+            "broker::tests::pipe_chrome_probe_helper".to_string(),
+            "--exact".to_string(),
+        ];
+        let (mut chrome, probe) = spawn_first_chrome_pipe_with_env_until(
+            &[bad, good.clone()],
+            &args,
+            temp.path(),
+            log,
+            Deadline::after(Duration::from_secs(5)),
+            Some(("RDNY_PIPE_CHROME_PROBE_HELPER", "1")),
+        )
+        .unwrap();
+        assert_eq!(probe.browser_path, good);
+        assert_eq!(probe.browser_name, "FakeChrome/1");
+        assert_eq!(probe.target_id.as_deref(), Some("page-1"));
+        shutdown_chrome(&mut chrome);
+    }
+
+    #[test]
+    fn spawn_first_chrome_pipe_reports_all_probe_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        let bad_one = copy_test_exe(temp.path(), "bad-chrome-one");
+        let bad_two = copy_test_exe(temp.path(), "bad-chrome-two");
+        let log = fs::File::create(temp.path().join("chrome.log")).unwrap();
+        let args = vec![
+            "broker::tests::pipe_chrome_probe_helper".to_string(),
+            "--exact".to_string(),
+        ];
+        let err = match spawn_first_chrome_pipe_with_env_until(
+            &[bad_one.clone(), bad_two.clone()],
+            &args,
+            temp.path(),
+            log,
+            Deadline::after(Duration::from_secs(5)),
+            Some(("RDNY_PIPE_CHROME_PROBE_HELPER", "1")),
+        ) {
+            Ok(_) => panic!("nonworking candidates unexpectedly passed startup probe"),
+            Err(error) => error,
+        };
+        let text = format!("{err:#}");
+        assert!(text.contains("Chrome debugging pipe closed"));
+        assert!(text.contains(&bad_one.display().to_string()));
+        assert!(text.contains(&bad_two.display().to_string()));
+    }
+
+    #[test]
+    fn spawn_first_chrome_pipe_times_out_hung_candidate_and_falls_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let hung = copy_test_exe(temp.path(), "hang-chrome");
+        let good = copy_test_exe(temp.path(), "good-chrome");
+        let log = fs::File::create(temp.path().join("chrome.log")).unwrap();
+        let args = vec![
+            "broker::tests::pipe_chrome_probe_helper".to_string(),
+            "--exact".to_string(),
+        ];
+        let (mut chrome, probe) = spawn_first_chrome_pipe_with_env_until(
+            &[hung, good.clone()],
+            &args,
+            temp.path(),
+            log,
+            Deadline::after(Duration::from_secs(5)),
+            Some(("RDNY_PIPE_CHROME_PROBE_HELPER", "1")),
+        )
+        .unwrap();
+        assert_eq!(probe.browser_path, good);
+        shutdown_chrome(&mut chrome);
+    }
+
+    #[test]
+    fn spawn_first_chrome_pipe_reports_hung_all_candidates_with_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let hung_one = copy_test_exe(temp.path(), "hang-chrome-one");
+        let hung_two = copy_test_exe(temp.path(), "hang-chrome-two");
+        let log = fs::File::create(temp.path().join("chrome.log")).unwrap();
+        let args = vec![
+            "broker::tests::pipe_chrome_probe_helper".to_string(),
+            "--exact".to_string(),
+        ];
+        let err = match spawn_first_chrome_pipe_with_env_until(
+            &[hung_one.clone(), hung_two.clone()],
+            &args,
+            temp.path(),
+            log,
+            Deadline::after(Duration::from_secs(1)),
+            Some(("RDNY_PIPE_CHROME_PROBE_HELPER", "1")),
+        ) {
+            Ok(_) => panic!("hung candidates unexpectedly passed startup probe"),
+            Err(error) => error,
+        };
+        let text = format!("{err:#}");
+        assert!(text.contains("timed out waiting for Chrome startup pipe response"));
+        assert!(text.contains(&hung_one.display().to_string()));
+        assert!(text.contains(&hung_two.display().to_string()));
     }
 
     #[test]

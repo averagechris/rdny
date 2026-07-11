@@ -27,9 +27,10 @@ behavior for now.
 Runtime browser discovery is:
 
 1. `RDNY_CHROME` when set.
-2. Well-known Chrome/Chromium locations on macOS and Linux.
-3. A clear, actionable error explaining how to install Chrome or set
-   `RDNY_CHROME`.
+2. Ordered `binaries.chrome` paths from the rdny config file, when set.
+3. Well-known Chrome/Chromium locations on macOS and Linux.
+4. A clear, actionable error explaining how to install Chrome or set
+   `RDNY_CHROME` / `binaries.chrome`.
 
 The default flake package remains browser-free. A separate opt-in package,
 `.#rdny-bundled`, wraps `rdny` with Nixpkgs `ungoogled-chromium` and sets
@@ -44,11 +45,12 @@ network downloads implicit.
 ## Consequences
 
 - Default installs and `.#rdny` builds do not include or download a browser.
-- Users can override any discovered or bundled browser with `RDNY_CHROME`.
+- Users can override any discovered, configured, or bundled browser with
+  `RDNY_CHROME`; config can list multiple fallback browser paths.
 - Linux/Nix users who want one closure containing both the CLI and browser can
   use `.#rdny-bundled`.
-- Darwin users need system Chrome/Chromium today, or an explicit
-  `RDNY_CHROME` path.
+- Darwin users need system Chrome/Chromium today, or explicit `RDNY_CHROME` /
+  `binaries.chrome` paths.
 
 ## Addendum: ffmpeg provisioning
 
