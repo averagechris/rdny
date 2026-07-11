@@ -124,8 +124,8 @@ fn validate_profile_arg(argv: &[OsString], profile: Option<&Path>) -> Result<()>
         }
         index += 1;
     }
-    if matches != 1 {
-        bail!("process argv must contain exactly one matching --user-data-dir");
+    if matches > 1 {
+        bail!("process argv contains duplicate --user-data-dir arguments");
     }
     Ok(())
 }
