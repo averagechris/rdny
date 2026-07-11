@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use crate::commands::artifacts::{ArtifactContext, HumanArtifactOutput, ProducedArtifact};
+use crate::selector::ElementSelector;
 use crate::session::PageSession;
 use crate::state::ViewportOverride;
 
@@ -50,7 +51,7 @@ pub fn screenshot(
 /// Capture a screenshot clipped to the first selector match.
 pub fn screenshot_el(
     sess: &mut PageSession,
-    selector: &str,
+    selector: &ElementSelector,
     file: Option<&Path>,
     force: bool,
 ) -> Result<ProducedArtifact> {

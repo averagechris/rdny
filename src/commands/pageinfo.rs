@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 
 use crate::commands::artifacts::{HumanArtifactOutput, ProducedArtifact};
 use crate::commands::print_value;
+use crate::selector::ElementSelector;
 use crate::session::PageSession;
 
 /// Print the current page URL.
@@ -22,7 +23,7 @@ pub fn title(sess: &mut PageSession) -> Result<()> {
 }
 
 /// Print page HTML, or the outerHTML of the first selector match.
-pub fn html(sess: &mut PageSession, selector: Option<&str>) -> Result<()> {
+pub fn html(sess: &mut PageSession, selector: Option<&ElementSelector>) -> Result<()> {
     let value = match selector {
         Some(selector) => {
             let object_id = sess.element(selector)?;
@@ -35,7 +36,7 @@ pub fn html(sess: &mut PageSession, selector: Option<&str>) -> Result<()> {
 }
 
 /// Print the text content of the first selector match.
-pub fn text(sess: &mut PageSession, selector: &str) -> Result<()> {
+pub fn text(sess: &mut PageSession, selector: &ElementSelector) -> Result<()> {
     let object_id = sess.element(selector)?;
     let value = sess.call_on(&object_id, "function() { return this.textContent; }", &[])?;
     print_value(&value);
@@ -43,7 +44,7 @@ pub fn text(sess: &mut PageSession, selector: &str) -> Result<()> {
 }
 
 /// Print an attribute of the first selector match.
-pub fn attr(sess: &mut PageSession, selector: &str, name: &str) -> Result<()> {
+pub fn attr(sess: &mut PageSession, selector: &ElementSelector, name: &str) -> Result<()> {
     let object_id = sess.element(selector)?;
     let value = sess.call_on(
         &object_id,
@@ -51,7 +52,10 @@ pub fn attr(sess: &mut PageSession, selector: &str, name: &str) -> Result<()> {
         &[json!(name)],
     )?;
     if value == Value::Null {
-        bail!("no attribute `{name}` on first match of `{selector}`");
+        bail!(
+            "no attribute `{name}` on first match of selector `{}`",
+            selector.raw()
+        );
     }
     print_value(&value);
     Ok(())

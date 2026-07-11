@@ -6,6 +6,7 @@ mod commands;
 mod config;
 mod hint;
 mod process_identity;
+mod selector;
 mod session;
 mod state;
 

@@ -9,6 +9,7 @@ use serde_json::json;
 
 use crate::commands::artifacts::{HumanArtifactOutput, ProducedArtifact};
 use crate::commands::{artifacts, decode_base64, print_value};
+use crate::selector::ElementSelector;
 use crate::session::PageSession;
 
 /// Evaluate a JavaScript expression and print its result.
@@ -19,7 +20,7 @@ pub fn js(sess: &mut PageSession, expression: &str) -> Result<()> {
 }
 
 /// Click the first selector match (real mouse events).
-pub fn click(_sess: &mut PageSession, _selector: &str) -> Result<()> {
+pub fn click(_sess: &mut PageSession, _selector: &ElementSelector) -> Result<()> {
     let id = _sess.element(_selector)?;
     let (x, y) = _sess.element_center(&id)?;
     dispatch_mouse(_sess, "mouseMoved", x, y, None)?;
@@ -29,7 +30,7 @@ pub fn click(_sess: &mut PageSession, _selector: &str) -> Result<()> {
 }
 
 /// Type text into the first selector match.
-pub fn input(_sess: &mut PageSession, _selector: &str, _text: &str) -> Result<()> {
+pub fn input(_sess: &mut PageSession, _selector: &ElementSelector, _text: &str) -> Result<()> {
     let id = _sess.element(_selector)?;
     _sess.call_on(&id, "function() { this.focus(); }", &[])?;
     _sess.call("Input.insertText", json!({ "text": _text }))?;
@@ -37,7 +38,7 @@ pub fn input(_sess: &mut PageSession, _selector: &str, _text: &str) -> Result<()
 }
 
 /// Clear the value of the first selector match.
-pub fn clear(_sess: &mut PageSession, _selector: &str) -> Result<()> {
+pub fn clear(_sess: &mut PageSession, _selector: &ElementSelector) -> Result<()> {
     let id = _sess.element(_selector)?;
     _sess.call_on(
         &id,
@@ -48,7 +49,7 @@ pub fn clear(_sess: &mut PageSession, _selector: &str) -> Result<()> {
 }
 
 /// Set a file on a file input; path "-" reads the payload from stdin.
-pub fn file(_sess: &mut PageSession, _selector: &str, _path: &Path) -> Result<()> {
+pub fn file(_sess: &mut PageSession, _selector: &ElementSelector, _path: &Path) -> Result<()> {
     let upload;
     let path = if _path == Path::new("-") {
         upload = artifacts::stdin_upload(io::stdin())?;
@@ -70,7 +71,7 @@ pub fn file(_sess: &mut PageSession, _selector: &str, _path: &Path) -> Result<()
 /// file "-" streams raw bytes to stdout.
 pub fn download(
     _sess: &mut PageSession,
-    _selector: &str,
+    _selector: &ElementSelector,
     _file: Option<&Path>,
     force: bool,
     max_bytes: Option<u64>,
@@ -157,7 +158,7 @@ fn write_download_chunks(chunks: &str, mut out: impl std::io::Write, max: u64) -
 }
 
 /// Select a dropdown option by value.
-pub fn select(_sess: &mut PageSession, _selector: &str, _value: &str) -> Result<()> {
+pub fn select(_sess: &mut PageSession, _selector: &ElementSelector, _value: &str) -> Result<()> {
     let id = _sess.element(_selector)?;
     _sess.call_on(
         &id,
@@ -168,7 +169,7 @@ pub fn select(_sess: &mut PageSession, _selector: &str, _value: &str) -> Result<
 }
 
 /// Submit the form containing (or matching) the selector.
-pub fn submit(_sess: &mut PageSession, _selector: &str) -> Result<()> {
+pub fn submit(_sess: &mut PageSession, _selector: &ElementSelector) -> Result<()> {
     let id = _sess.element(_selector)?;
     _sess.call_on(
         &id,
@@ -179,7 +180,7 @@ pub fn submit(_sess: &mut PageSession, _selector: &str) -> Result<()> {
 }
 
 /// Hover over the first selector match (real mouse events).
-pub fn hover(_sess: &mut PageSession, _selector: &str) -> Result<()> {
+pub fn hover(_sess: &mut PageSession, _selector: &ElementSelector) -> Result<()> {
     let id = _sess.element(_selector)?;
     let (x, y) = _sess.element_center(&id)?;
     dispatch_mouse(_sess, "mouseMoved", x, y, None)?;
@@ -187,7 +188,7 @@ pub fn hover(_sess: &mut PageSession, _selector: &str) -> Result<()> {
 }
 
 /// Focus the first selector match.
-pub fn focus(_sess: &mut PageSession, _selector: &str) -> Result<()> {
+pub fn focus(_sess: &mut PageSession, _selector: &ElementSelector) -> Result<()> {
     let id = _sess.element(_selector)?;
     _sess.call_on(&id, "function() { this.focus(); }", &[])?;
     Ok(())

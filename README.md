@@ -73,6 +73,37 @@ rdny screenshot example.png
 rdny stop
 ```
 
+### Selecting elements in open shadow DOM
+
+Element commands use ordinary CSS selectors by default. To traverse open shadow
+roots explicitly, pass `--pierce` and separate each host/target CSS selector with
+`>>>`:
+
+```sh
+rdny wait --pierce 'app-shell >>> user-card >>> button.save'
+rdny text --pierce 'app-shell >>> user-card >>> .status'
+rdny click --pierce 'app-shell >>> user-card >>> button.save'
+```
+
+With `--pierce`, rdny queries the first segment in the document, enters that
+element's open `shadowRoot`, queries the next segment there, and repeats. This is
+deterministic for nested open roots and retains first-match CSS semantics within
+each root. Every segment must be non-empty and is validated as CSS in its own
+root. Errors identify the failing host or target segment, invalid CSS, a missing
+match, or a host that does not expose an open root.
+
+The `>>>` delimiter has no special meaning without `--pierce`; the complete
+argument is passed to `document.querySelector` as ordinary CSS. This preserves
+the default CSS interface and prevents accidental traversal. Shadow traversal is
+available on `wait`, `html` (when given a selector), `text`, `attr`, `click`,
+`input`, `clear`, `hover`, `focus`, `submit`, `select`, `screenshot-el`, `file`,
+and `download`.
+
+Closed shadow roots are intentionally unsupported because page JavaScript cannot
+access them. Shadow traversal also does not cross iframe boundaries; in
+particular, cross-origin frames are unsupported. Selectors operate only in the
+current page document.
+
 Use an isolated state directory while experimenting or in tests:
 
 ```sh

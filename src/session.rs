@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use crate::cdp::client::{CdpClient, Event};
 use crate::cdp::http;
 use crate::hint::hint_error;
+use crate::selector::{ElementProbe, ElementSelector};
 use crate::state;
 
 pub const RDNY_INSTRUMENTATION_VERSION: u32 = 2;
@@ -97,6 +98,7 @@ pub struct Deadline {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use crate::selector::{ElementProbe, ElementSelector};
     use std::net::TcpListener;
     use std::thread;
     use tungstenite::{Message, accept};
@@ -213,6 +215,117 @@ mod tests {
             unsafe { std::env::set_var("XDG_STATE_HOME", prior) };
         } else {
             unsafe { std::env::remove_var("XDG_STATE_HOME") };
+        }
+    }
+
+    #[test]
+    fn element_and_wait_probe_share_nested_shadow_traversal() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = accept(stream).unwrap();
+
+            let element_command = read_json_message(&mut socket);
+            assert_eq!(element_command["method"], "Runtime.evaluate");
+            let element_expression = element_command["params"]["expression"].as_str().unwrap();
+            assert!(
+                element_expression
+                    .contains(r#"const segments = ["outer-host","inner-host","button.save"];"#)
+            );
+            assert!(element_expression.contains("root = element.shadowRoot"));
+            assert!(element_expression.contains("const probe = false"));
+            socket
+                .send(Message::Text(
+                    format!(
+                        r#"{{"id":{},"result":{{"result":{{"type":"object","subtype":"node","objectId":"node-1"}}}}}}"#,
+                        element_command["id"]
+                    )
+                    .into(),
+                ))
+                .unwrap();
+
+            let probe_command = read_json_message(&mut socket);
+            assert_eq!(probe_command["method"], "Runtime.evaluate");
+            let probe_expression = probe_command["params"]["expression"].as_str().unwrap();
+            assert!(
+                probe_expression
+                    .contains(r#"const segments = ["outer-host","inner-host","button.save"];"#)
+            );
+            assert!(probe_expression.contains("root = element.shadowRoot"));
+            assert!(probe_expression.contains("const probe = true"));
+            socket
+                .send(Message::Text(
+                    format!(
+                        r#"{{"id":{},"result":{{"result":{{"type":"object","value":{{"found":false,"kind":"missing","index":1,"css":"inner-host"}}}}}}}}"#,
+                        probe_command["id"]
+                    )
+                    .into(),
+                ))
+                .unwrap();
+        });
+
+        let mut session = test_page_session(port);
+        let selector =
+            ElementSelector::parse("outer-host >>> inner-host >>> button.save", true).unwrap();
+        assert_eq!(session.element(&selector).unwrap(), "node-1");
+        assert_eq!(
+            session.probe_element(&selector).unwrap(),
+            ElementProbe::Missing {
+                index: 1,
+                css: "inner-host".into()
+            }
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn element_surfaces_segment_specific_invalid_css_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = accept(stream).unwrap();
+            let command = read_json_message(&mut socket);
+            socket
+                .send(Message::Text(
+                    format!(
+                        r#"{{"id":{},"result":{{"result":{{"type":"object","subtype":"error"}},"exceptionDetails":{{"text":"Uncaught","exception":{{"description":"Error: invalid CSS in shadow host segment 1 `[`: SyntaxError"}}}}}}}}"#,
+                        command["id"]
+                    )
+                    .into(),
+                ))
+                .unwrap();
+        });
+
+        let mut session = test_page_session(port);
+        let selector = ElementSelector::parse("[ >>> button", true).unwrap();
+        let error = session.element(&selector).unwrap_err().to_string();
+        assert!(error.contains("selector resolution failed"), "{error}");
+        assert!(
+            error.contains("invalid CSS in shadow host segment 1 `[`"),
+            "{error}"
+        );
+        server.join().unwrap();
+    }
+
+    fn read_json_message(socket: &mut tungstenite::WebSocket<std::net::TcpStream>) -> Value {
+        match socket.read().unwrap() {
+            Message::Text(text) => serde_json::from_str(&text).unwrap(),
+            message => panic!("unexpected command message {message:?}"),
+        }
+    }
+
+    fn test_page_session(port: u16) -> PageSession {
+        PageSession {
+            client: CdpClient::connect(&format!("ws://127.0.0.1:{port}")).unwrap(),
+            session_id: "page-session".into(),
+            instance_id: None,
+            target_id: "target".into(),
+            frames_dir: None,
+            instrumentation_registered: true,
+            timeout: Duration::from_secs(1),
+            deadline: Deadline::after(Duration::from_secs(1)),
         }
     }
 }
@@ -386,11 +499,6 @@ pub(crate) fn create_target_until(
         title: String::new(),
         url: "about:blank".into(),
     })
-}
-
-/// Quote a string as a JavaScript string literal.
-pub fn js_string(s: &str) -> String {
-    serde_json::to_string(s).expect("strings always serialize")
 }
 
 fn check_exception(result: &Value, what: &str) -> Result<()> {
@@ -654,26 +762,40 @@ impl PageSession {
         Ok(result["result"]["value"].clone())
     }
 
-    /// Resolve a CSS selector to a remote object id, or a hint error
-    /// when nothing matches.
-    pub fn element(&mut self, selector: &str) -> Result<String> {
+    /// Resolve an ordinary or open-shadow-piercing selector to a remote object
+    /// id. The traversal and segment validation are shared with `wait` probes.
+    pub fn element(&mut self, selector: &ElementSelector) -> Result<String> {
         let result = self.call(
             "Runtime.evaluate",
             json!({
-                "expression": format!("document.querySelector({})", js_string(selector)),
+                "expression": selector.resolution_expression(false),
                 "returnByValue": false,
             }),
         )?;
-        check_exception(&result, "invalid selector")?;
+        check_exception(&result, "selector resolution failed")?;
         let object = &result["result"];
         match object["objectId"].as_str() {
             Some(id) if object["subtype"] != "null" => Ok(id.to_string()),
             _ => Err(hint_error(
-                format!("no element matches selector `{selector}`"),
+                format!("no element matches CSS selector `{}`", selector.raw()),
                 "inspect the page with `rdny html` to find the right selector",
                 None,
             )),
         }
+    }
+
+    /// Probe the same selector traversal used by `element`, returning why it is
+    /// not yet resolvable without treating a missing host/target/root as fatal.
+    pub(crate) fn probe_element(&mut self, selector: &ElementSelector) -> Result<ElementProbe> {
+        let result = self.call(
+            "Runtime.evaluate",
+            json!({
+                "expression": selector.resolution_expression(true),
+                "returnByValue": true,
+            }),
+        )?;
+        check_exception(&result, "selector resolution failed")?;
+        ElementProbe::from_value(&result["result"]["value"])
     }
 
     /// Call a JS function with the resolved element bound to `this`.

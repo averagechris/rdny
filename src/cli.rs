@@ -9,6 +9,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use crate::browser::{self, BrowserStatus, LaunchOpts};
+use crate::selector::ElementSelector;
 use crate::{commands, config, session};
 
 /// Chrome automation from the command line.
@@ -180,11 +181,27 @@ pub enum Command {
     /// Print the current page title.
     Title,
     /// Print page or element HTML.
-    Html { selector: Option<String> },
+    Html {
+        selector: Option<String>,
+        /// Split SELECTOR on `>>>` and traverse nested open shadow roots.
+        #[arg(long, requires = "selector")]
+        pierce: bool,
+    },
     /// Print element text.
-    Text { selector: String },
+    Text {
+        selector: String,
+        /// Split SELECTOR on `>>>` and traverse nested open shadow roots.
+        #[arg(long)]
+        pierce: bool,
+    },
     /// Print an element attribute.
-    Attr { selector: String, name: String },
+    Attr {
+        selector: String,
+        name: String,
+        /// Split SELECTOR on `>>>` and traverse nested open shadow roots.
+        #[arg(long)]
+        pierce: bool,
+    },
     /// Save the current page as PDF.
     Pdf(ArtifactArgs),
     /// Evaluate JavaScript in the current page. Pass `-` or omit EXPRESSION to read stdin.
@@ -197,17 +214,36 @@ pub enum Command {
     /// Print or set viewport/mobile emulation.
     Viewport(ViewportArgs),
     /// Click an element.
-    Click { selector: String },
+    Click {
+        selector: String,
+        /// Split SELECTOR on `>>>` and traverse nested open shadow roots.
+        #[arg(long)]
+        pierce: bool,
+    },
     /// Type text into an element.
     Input(InputArgs),
     /// Clear an element's value.
-    Clear { selector: String },
+    Clear {
+        selector: String,
+        /// Split SELECTOR on `>>>` and traverse nested open shadow roots.
+        #[arg(long)]
+        pierce: bool,
+    },
     /// Upload a file to an input element.
-    File { selector: String, path: PathBuf },
+    File {
+        selector: String,
+        path: PathBuf,
+        /// Split SELECTOR on `>>>` and traverse nested open shadow roots.
+        #[arg(long)]
+        pierce: bool,
+    },
     /// Click and download a linked resource.
     Download {
         /// Link or element selector to click.
         selector: String,
+        /// Split SELECTOR on `>>>` and traverse nested open shadow roots.
+        #[arg(long)]
+        pierce: bool,
         /// Maximum accepted payload bytes (default 268435456; env RDNY_MAX_DOWNLOAD_BYTES).
         #[arg(long)]
         max_bytes: Option<u64>,
@@ -217,15 +253,41 @@ pub enum Command {
         file: Option<PathBuf>,
     },
     /// Select an option by value.
-    Select { selector: String, value: String },
+    Select {
+        selector: String,
+        value: String,
+        /// Split SELECTOR on `>>>` and traverse nested open shadow roots.
+        #[arg(long)]
+        pierce: bool,
+    },
     /// Submit a form.
-    Submit { selector: String },
+    Submit {
+        selector: String,
+        /// Split SELECTOR on `>>>` and traverse nested open shadow roots.
+        #[arg(long)]
+        pierce: bool,
+    },
     /// Hover an element.
-    Hover { selector: String },
+    Hover {
+        selector: String,
+        /// Split SELECTOR on `>>>` and traverse nested open shadow roots.
+        #[arg(long)]
+        pierce: bool,
+    },
     /// Focus an element.
-    Focus { selector: String },
+    Focus {
+        selector: String,
+        /// Split SELECTOR on `>>>` and traverse nested open shadow roots.
+        #[arg(long)]
+        pierce: bool,
+    },
     /// Wait for an element to appear.
-    Wait { selector: String },
+    Wait {
+        selector: String,
+        /// Split SELECTOR on `>>>` and traverse nested open shadow roots.
+        #[arg(long)]
+        pierce: bool,
+    },
     /// Wait for page load.
     Waitload,
     /// Wait for page stability.
@@ -239,6 +301,9 @@ pub enum Command {
     /// Capture an element screenshot.
     ScreenshotEl {
         selector: String,
+        /// Split SELECTOR on `>>>` and traverse nested open shadow roots.
+        #[arg(long)]
+        pierce: bool,
         /// Replace an existing output file.
         #[arg(long)]
         force: bool,
@@ -485,6 +550,9 @@ pub struct CookieSetArgs {
 pub struct InputArgs {
     /// CSS selector.
     pub selector: String,
+    /// Split SELECTOR on `>>>` and traverse nested open shadow roots.
+    #[arg(long)]
+    pub pierce: bool,
     /// Text to type. Prefer --text-stdin/--text-file/--text-fd for secrets.
     pub text: Option<String>,
     /// Read input text from stdin to avoid argv leakage.
@@ -805,9 +873,24 @@ pub fn run() -> Result<()> {
         },
         Command::Url => commands::pageinfo::url(sess!())?,
         Command::Title => commands::pageinfo::title(sess!())?,
-        Command::Html { selector } => commands::pageinfo::html(sess!(), selector.as_deref())?,
-        Command::Text { selector } => commands::pageinfo::text(sess!(), &selector)?,
-        Command::Attr { selector, name } => commands::pageinfo::attr(sess!(), &selector, &name)?,
+        Command::Html { selector, pierce } => {
+            let selector = selector
+                .map(|selector| ElementSelector::parse(selector, pierce))
+                .transpose()?;
+            commands::pageinfo::html(sess!(), selector.as_ref())?
+        }
+        Command::Text { selector, pierce } => {
+            let selector = ElementSelector::parse(selector, pierce)?;
+            commands::pageinfo::text(sess!(), &selector)?
+        }
+        Command::Attr {
+            selector,
+            name,
+            pierce,
+        } => {
+            let selector = ElementSelector::parse(selector, pierce)?;
+            commands::pageinfo::attr(sess!(), &selector, &name)?
+        }
         Command::Pdf(args) => {
             let artifact = commands::pageinfo::pdf(sess!(), args.file.as_deref(), args.force)?;
             cli.format.emit_artifact(&artifact)?;
@@ -830,8 +913,12 @@ pub fn run() -> Result<()> {
             args.reset,
             cli.format != OutputFormat::Human,
         )?,
-        Command::Click { selector } => commands::interact::click(sess!(), &selector)?,
+        Command::Click { selector, pierce } => {
+            let selector = ElementSelector::parse(selector, pierce)?;
+            commands::interact::click(sess!(), &selector)?
+        }
         Command::Input(args) => {
+            let selector = ElementSelector::parse(args.selector, args.pierce)?;
             let text = resolve_secret(
                 args.text.as_deref(),
                 args.text_stdin,
@@ -839,29 +926,58 @@ pub fn run() -> Result<()> {
                 args.text_fd,
                 "input text",
             )?;
-            commands::interact::input(sess!(), &args.selector, &text)?
+            commands::interact::input(sess!(), &selector, &text)?
         }
-        Command::Clear { selector } => commands::interact::clear(sess!(), &selector)?,
-        Command::File { selector, path } => commands::interact::file(sess!(), &selector, &path)?,
+        Command::Clear { selector, pierce } => {
+            let selector = ElementSelector::parse(selector, pierce)?;
+            commands::interact::clear(sess!(), &selector)?
+        }
+        Command::File {
+            selector,
+            path,
+            pierce,
+        } => {
+            let selector = ElementSelector::parse(selector, pierce)?;
+            commands::interact::file(sess!(), &selector, &path)?
+        }
         Command::Download {
             selector,
+            pierce,
             max_bytes,
             force,
             file,
         } => {
+            let selector = ElementSelector::parse(selector, pierce)?;
             if let Some(artifact) =
                 commands::interact::download(sess!(), &selector, file.as_deref(), force, max_bytes)?
             {
                 cli.format.emit_artifact(&artifact)?;
             }
         }
-        Command::Select { selector, value } => {
+        Command::Select {
+            selector,
+            value,
+            pierce,
+        } => {
+            let selector = ElementSelector::parse(selector, pierce)?;
             commands::interact::select(sess!(), &selector, &value)?
         }
-        Command::Submit { selector } => commands::interact::submit(sess!(), &selector)?,
-        Command::Hover { selector } => commands::interact::hover(sess!(), &selector)?,
-        Command::Focus { selector } => commands::interact::focus(sess!(), &selector)?,
-        Command::Wait { selector } => commands::wait::wait(sess!(), &selector)?,
+        Command::Submit { selector, pierce } => {
+            let selector = ElementSelector::parse(selector, pierce)?;
+            commands::interact::submit(sess!(), &selector)?
+        }
+        Command::Hover { selector, pierce } => {
+            let selector = ElementSelector::parse(selector, pierce)?;
+            commands::interact::hover(sess!(), &selector)?
+        }
+        Command::Focus { selector, pierce } => {
+            let selector = ElementSelector::parse(selector, pierce)?;
+            commands::interact::focus(sess!(), &selector)?
+        }
+        Command::Wait { selector, pierce } => {
+            let selector = ElementSelector::parse(selector, pierce)?;
+            commands::wait::wait(sess!(), &selector)?
+        }
         Command::Waitload => commands::wait::waitload(sess!())?,
         Command::Waitstable(args) => {
             if args.quiet_ms == 500 {
@@ -898,9 +1014,11 @@ pub fn run() -> Result<()> {
         }
         Command::ScreenshotEl {
             selector,
+            pierce,
             force,
             file,
         } => {
+            let selector = ElementSelector::parse(selector, pierce)?;
             let artifact =
                 commands::shot::screenshot_el(sess!(), &selector, file.as_deref(), force)?;
             cli.format.emit_artifact(&artifact)?;
@@ -1402,7 +1520,7 @@ mod tests {
             matches!(parse(&["rdny", "sleep", "1.5"]), Command::Sleep { seconds } if seconds.get() == Duration::from_secs_f64(1.5))
         );
         assert!(
-            matches!(parse(&["rdny", "attr", "a", "href"]), Command::Attr { selector, name } if selector == "a" && name == "href")
+            matches!(parse(&["rdny", "attr", "a", "href"]), Command::Attr { selector, name, pierce: false } if selector == "a" && name == "href")
         );
         assert!(matches!(
             parse(&["rdny", "reload", "--hard"]),
@@ -1410,7 +1528,10 @@ mod tests {
         ));
         assert!(matches!(
             parse(&["rdny", "html"]),
-            Command::Html { selector: None }
+            Command::Html {
+                selector: None,
+                pierce: false
+            }
         ));
         assert!(matches!(
             parse(&["rdny", "js"]),
@@ -1420,7 +1541,7 @@ mod tests {
             matches!(parse(&["rdny", "js", "1 + 1"]), Command::Js { expression: Some(expression) } if expression == "1 + 1")
         );
         assert!(
-            matches!(parse(&["rdny", "html", "div"]), Command::Html { selector: Some(selector) } if selector == "div")
+            matches!(parse(&["rdny", "html", "div"]), Command::Html { selector: Some(selector), pierce: false } if selector == "div")
         );
         assert!(matches!(parse(&["rdny", "waitload"]), Command::Waitload));
         assert!(matches!(
@@ -1467,8 +1588,82 @@ mod tests {
             Command::Page { index: 2 }
         ));
         assert!(
-            matches!(parse(&["rdny", "download", "a.link", "-"]), Command::Download { selector, file: Some(file), force: false, max_bytes: None } if selector == "a.link" && file.as_os_str() == "-")
+            matches!(parse(&["rdny", "download", "a.link", "-"]), Command::Download { selector, file: Some(file), force: false, max_bytes: None, pierce: false } if selector == "a.link" && file.as_os_str() == "-")
         );
+    }
+
+    #[test]
+    fn parses_pierced_selectors_for_every_element_command() {
+        const SHADOW: &str = "outer-host >>> inner-host >>> .target";
+
+        assert!(matches!(
+            parse(&["rdny", "html", "--pierce", SHADOW]),
+            Command::Html { selector: Some(selector), pierce: true } if selector == SHADOW
+        ));
+        assert!(matches!(
+            parse(&["rdny", "text", SHADOW, "--pierce"]),
+            Command::Text { selector, pierce: true } if selector == SHADOW
+        ));
+        assert!(matches!(
+            parse(&["rdny", "attr", "--pierce", SHADOW, "data-state"]),
+            Command::Attr { selector, name, pierce: true }
+                if selector == SHADOW && name == "data-state"
+        ));
+        assert!(matches!(
+            parse(&["rdny", "click", "--pierce", SHADOW]),
+            Command::Click { selector, pierce: true } if selector == SHADOW
+        ));
+        assert!(matches!(
+            parse(&["rdny", "input", SHADOW, "hello", "--pierce"]),
+            Command::Input(InputArgs { selector, text: Some(text), pierce: true, .. })
+                if selector == SHADOW && text == "hello"
+        ));
+        assert!(matches!(
+            parse(&["rdny", "clear", "--pierce", SHADOW]),
+            Command::Clear { selector, pierce: true } if selector == SHADOW
+        ));
+        assert!(matches!(
+            parse(&["rdny", "file", "--pierce", SHADOW, "upload.txt"]),
+            Command::File { selector, path, pierce: true }
+                if selector == SHADOW && path.as_os_str() == "upload.txt"
+        ));
+        assert!(matches!(
+            parse(&["rdny", "download", SHADOW, "--pierce", "out.txt"]),
+            Command::Download { selector, pierce: true, file: Some(file), .. }
+                if selector == SHADOW && file.as_os_str() == "out.txt"
+        ));
+        assert!(matches!(
+            parse(&["rdny", "select", "--pierce", SHADOW, "dog"]),
+            Command::Select { selector, value, pierce: true }
+                if selector == SHADOW && value == "dog"
+        ));
+        assert!(matches!(
+            parse(&["rdny", "submit", SHADOW, "--pierce"]),
+            Command::Submit { selector, pierce: true } if selector == SHADOW
+        ));
+        assert!(matches!(
+            parse(&["rdny", "hover", "--pierce", SHADOW]),
+            Command::Hover { selector, pierce: true } if selector == SHADOW
+        ));
+        assert!(matches!(
+            parse(&["rdny", "focus", SHADOW, "--pierce"]),
+            Command::Focus { selector, pierce: true } if selector == SHADOW
+        ));
+        assert!(matches!(
+            parse(&["rdny", "wait", "--pierce", SHADOW]),
+            Command::Wait { selector, pierce: true } if selector == SHADOW
+        ));
+        assert!(matches!(
+            parse(&["rdny", "screenshot-el", SHADOW, "--pierce", "shadow.png"]),
+            Command::ScreenshotEl { selector, pierce: true, file: Some(file), .. }
+                if selector == SHADOW && file.as_os_str() == "shadow.png"
+        ));
+
+        assert!(Cli::try_parse_from(["rdny", "html", "--pierce"]).is_err());
+        assert!(matches!(
+            parse(&["rdny", "text", SHADOW]),
+            Command::Text { selector, pierce: false } if selector == SHADOW
+        ));
     }
 
     #[test]

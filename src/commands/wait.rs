@@ -6,27 +6,38 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
+use crate::selector::{ElementProbe, ElementSelector};
 use crate::session::{Deadline, PageSession};
 
 const DEFAULT_QUIET_WINDOW: Duration = Duration::from_millis(500);
 
 /// Wait for a selector to match an element.
-pub fn wait(sess: &mut PageSession, selector: &str) -> Result<()> {
+pub fn wait(sess: &mut PageSession, selector: &ElementSelector) -> Result<()> {
     let deadline = sess.deadline();
-    let expression = format!(
-        "document.querySelector({}) !== null",
-        crate::session::js_string(selector)
-    );
+    let mut last_probe = None;
     loop {
-        if sess.eval(&expression)? == json!(true) {
+        if deadline.expired() {
+            let detail = last_probe
+                .as_ref()
+                .map(|probe| selector.describe_unresolved(probe))
+                .unwrap_or_else(|| format!("selector `{}` did not resolve", selector.raw()));
+            bail!(
+                "timed out after {:.3}s: {detail}",
+                sess.timeout.as_secs_f64()
+            );
+        }
+        let probe = sess.probe_element(selector)?;
+        if probe == ElementProbe::Found {
             return Ok(());
         }
         if deadline.expired() {
             bail!(
-                "timed out after {:.3}s waiting for selector {selector}",
-                sess.timeout.as_secs_f64()
+                "timed out after {:.3}s: {}",
+                sess.timeout.as_secs_f64(),
+                selector.describe_unresolved(&probe)
             );
         }
+        last_probe = Some(probe);
         deadline.sleep(Duration::from_millis(100));
     }
 }

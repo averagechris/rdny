@@ -139,6 +139,19 @@ cat >"$page" <<'HTML'
         <option value="dog">dog</option>
       </select>
     </form>
+    <outer-shell id="shadow-outer"></outer-shell>
+    <script>
+      const outerRoot = document.querySelector('#shadow-outer').attachShadow({mode: 'open'});
+      outerRoot.innerHTML = '<inner-shell id="shadow-inner"></inner-shell>';
+      const innerRoot = outerRoot.querySelector('#shadow-inner').attachShadow({mode: 'open'});
+      window.installShadowButton = () => {
+        const button = document.createElement('button');
+        button.id = 'shadow-button';
+        button.textContent = 'Nested shadow ready';
+        button.onclick = () => { document.title = 'shadow clicked'; };
+        innerRoot.appendChild(button);
+      };
+    </script>
   </body>
 </html>
 HTML
@@ -174,6 +187,16 @@ expect_contains "status running" "running:" "$("${RDNY[@]}" status)"
 "${RDNY[@]}" waitidle
 expect "url" "file://$page" "$("${RDNY[@]}" url)"
 expect "title" "rdny smoke" "$("${RDNY[@]}" title)"
+
+# Explicit traversal through two nested open shadow roots. Install the final
+# target after the command begins so the shared wait resolver must poll it.
+shadow_selector='#shadow-outer >>> #shadow-inner >>> #shadow-button'
+"${RDNY[@]}" js 'setTimeout(window.installShadowButton, 500)' >/dev/null
+"${RDNY[@]}" wait --pierce "$shadow_selector"
+expect "nested shadow text" "Nested shadow ready" "$("${RDNY[@]}" text --pierce "$shadow_selector")"
+"${RDNY[@]}" click --pierce "$shadow_selector"
+expect "nested shadow click" "shadow clicked" "$("${RDNY[@]}" title)"
+"${RDNY[@]}" js "document.title = 'rdny smoke'" >/dev/null
 
 # Chromium internal URLs stay denied by default, fail without changing the
 # current page when malformed, and navigate only with the explicit privilege.
