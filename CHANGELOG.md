@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+
+## v0.2.0 - 2026-07-11
+
 - Added explicit opt-ins for Chromium internal URLs and aliases
   (~averagechris/projects#179).
 - Added exact instance selection help and registry selector ergonomics for
@@ -36,7 +39,6 @@
 - Added global `--instance` / `RDNY_INSTANCE` selection by exact registered id
   or unique label, with strict `--state-dir` conflict handling and copyable
   selectors in `rdny list` (~averagechris/projects#180).
-
 ## v0.1.0 - 2026-07-08
 
 ### Added
