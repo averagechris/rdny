@@ -23,6 +23,14 @@
 <outer-host id="outer"></outer-host>
 <button id="plain-action">plain action</button>
 <input id="key-target">
+<input id="prop-input" value="attribute-value">
+<input id="prop-check" type="checkbox" checked>
+<div id="prop-object"></div>
+<div id="prop-array"></div>
+<div id="prop-sanitize"></div>
+<div id="prop-errors"></div>
+<div id="prop-revalidate"></div>
+<img id="prop-image" alt="tiny deterministic image" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='1' height='1'%3E%3C/svg%3E">
 <button id="pointer-target">pointer</button>
 <button id="composed-child" class="actionability-fixture"><span>child covers button</span></button>
 <button id="partially-visible" class="actionability-fixture">visible edge</button>
@@ -53,7 +61,7 @@
   const outer = document.querySelector('#outer').attachShadow({mode: 'open'});
   outer.innerHTML = '<inner-host id="inner"></inner-host>';
   const inner = outer.querySelector('#inner').attachShadow({mode: 'open'});
-  inner.innerHTML = '<button id="action"><span>action</span></button>';
+  inner.innerHTML = '<button id="action"><span>action</span></button><input id="shadow-prop" value="shadow-live">';
   inner.querySelector('#action').addEventListener('click', event => {
     window.result.clicked = event.isTrusted && event.target.localName === 'span';
   });
@@ -110,4 +118,26 @@
     document.querySelector('#download').href = window.largeDownloadUrl;
     return size;
   };
+  document.querySelector('#prop-input').value = 'live-value';
+  const propObject = document.querySelector('#prop-object');
+  propObject.state = {name: 'plain', nested: {ok: true}, count: 2};
+  propObject.protoState = Object.create(null);
+  Object.defineProperty(propObject.protoState, '__proto__', {value: 'own-proto-key', enumerable: true});
+  document.querySelector('#prop-array').items = ['one', 2, false, null];
+  document.querySelector('#prop-sanitize').dirty = 'safe\u001b[31mtext';
+  const propErrors = document.querySelector('#prop-errors');
+  Object.defineProperty(propErrors, 'boom', {get() { throw new Error('fixture boom'); }});
+  propErrors.undef = undefined;
+  propErrors.nanValue = NaN;
+  propErrors.fnValue = () => true;
+  propErrors.cycle = {}; propErrors.cycle.self = propErrors.cycle;
+  propErrors.huge = 'x'.repeat(70 * 1024);
+  propErrors.hugeKey = Object.create(null);
+  propErrors.hugeKey['k'.repeat(2048)] = true;
+  propErrors.manyNodes = Array.from({length: 5000}, (_, i) => i);
+  propErrors.deep = {}; let cursor = propErrors.deep; for (let i = 0; i < 40; i++) { cursor.next = {}; cursor = cursor.next; }
+  Object.defineProperty(propErrors, 'escBoom', {get() { throw new Error('getter \u001b[31mboom'); }});
+  const propRevalidate = document.querySelector('#prop-revalidate');
+  Object.defineProperty(propRevalidate, 'detachOnRead', {get() { propRevalidate.remove(); return 'stale'; }});
+  Object.defineProperty(propRevalidate, 'replaceOnRead', {get() { const replacement = document.createElement('div'); replacement.id = 'prop-revalidate'; propRevalidate.replaceWith(replacement); return 'stale'; }});
 </script>

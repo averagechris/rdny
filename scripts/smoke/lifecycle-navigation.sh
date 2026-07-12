@@ -20,6 +20,40 @@ expect 'fixture title' 'rdny browser programs' "$("${R[@]}" title)"
 selector='#outer >>> #inner >>> #action'
 "${R[@]}" wait --pierce "$selector"
 expect 'shadow traversal text' 'action' "$("${R[@]}" text --pierce "$selector")"
+expect 'prop live value differs from attr' 'live-value' "$("${R[@]}" prop '#prop-input' value)"
+expect 'attr remains initial value' 'attribute-value' "$("${R[@]}" attr '#prop-input' value)"
+expect 'prop boolean' 'true' "$("${R[@]}" prop '#prop-check' checked)"
+expect 'prop number' '0' "$("${R[@]}" prop '#prop-input' tabIndex)"
+expect 'prop object' '{"count":2,"name":"plain","nested":{"ok":true}}' "$("${R[@]}" prop '#prop-object' state)"
+expect 'prop preserves own __proto__ key' '{"__proto__":"own-proto-key"}' "$("${R[@]}" prop '#prop-object' protoState)"
+expect 'prop array' '["one",2,false,null]' "$("${R[@]}" prop '#prop-array' items)"
+expect 'prop shadow pierce' 'shadow-live' "$("${R[@]}" prop --pierce '#outer >>> #inner >>> #shadow-prop' value)"
+expect 'prop human sanitizes controls' 'safe[31mtext' "$("${R[@]}" prop '#prop-sanitize' dirty)"
+expect 'prop image complete' 'true' "$("${R[@]}" prop '#prop-image' complete)"
+expect 'prop image naturalWidth' '1' "$("${R[@]}" prop '#prop-image' naturalWidth)"
+json_prop=$("${R[@]}" --format json prop '#prop-input' value)
+expect_contains 'prop json schema' '"schemaVersion":1' "$json_prop"
+expect_contains 'prop json kind' '"kind":"prop"' "$json_prop"
+expect_contains 'prop json value' '"value":"live-value"' "$json_prop"
+jsonl_prop=$("${R[@]}" --format jsonl prop '#prop-check' checked)
+expect_contains 'prop jsonl bool' '"value":true' "$jsonl_prop"
+if [[ $(printf '%s\n' "$jsonl_prop" | wc -l | tr -d ' ') != 1 ]]; then fail 'prop jsonl one line'; fi
+if error=$("${R[@]}" prop '#prop-errors' boom 2>&1); then exit 1; fi
+expect_contains 'prop error boom' 'getter for property `boom` threw: fixture boom' "$error"
+for prop_error in undef nanValue fnValue cycle huge hugeKey manyNodes deep; do
+  if error=$("${R[@]}" prop '#prop-errors' "$prop_error" 2>&1); then exit 1; fi
+  expect_contains "prop error $prop_error" 'not JSON-compatible' "$error"
+done
+if error=$("${R[@]}" prop '#prop-errors' escBoom 2>&1); then exit 1; fi
+expect_contains 'prop getter esc sanitized' 'getter �[31mboom' "$error"
+if [[ "$error" == *$'\e'* ]]; then fail 'prop getter esc not sanitized'; fi
+if error=$("${R[@]}" prop '#prop-revalidate' detachOnRead 2>&1); then exit 1; fi
+expect_contains 'prop rejects getter detach' 'detached while reading property' "$error"
+"${R[@]}" open "file://$(pwd)/scripts/fixtures/browser-programs.html" --allow-file-url >/dev/null
+if error=$("${R[@]}" prop '#prop-revalidate' replaceOnRead 2>&1); then exit 1; fi
+expect_contains 'prop rejects getter replace' 'while reading property' "$error"
+if error=$("${R[@]}" prop '#prop-input' 'value.length' 2>&1); then exit 1; fi
+expect_contains 'prop rejects expression property' 'literal property name' "$error"
 
 "${R[@]}" open about:blank >/dev/null
 expect 'about blank default allow' 'about:blank' "$("${R[@]}" url)"

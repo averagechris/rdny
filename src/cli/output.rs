@@ -112,6 +112,11 @@ mod tests {
                 "Example — https://example.com/",
             ),
             (
+                "prop",
+                serde_json::json!({"schemaVersion":1,"kind":"prop","selector":"input[name=q]","property":"value","value":"hello"}),
+                "hello",
+            ),
+            (
                 "cookie list",
                 serde_json::json!({"schemaVersion":1,"kind":"cookies","url":"https://example.com/","cookies":[]}),
                 "",

@@ -71,6 +71,7 @@ rdny start
 rdny open https://example.com
 rdny title
 rdny text h1
+rdny prop 'input[name=q]' value
 rdny screenshot example.png
 rdny stop
 ```
@@ -97,9 +98,19 @@ match, or a host that does not expose an open root.
 The `>>>` delimiter has no special meaning without `--pierce`; the complete
 argument is passed to `document.querySelector` as ordinary CSS. This preserves
 the default CSS interface and prevents accidental traversal. Shadow traversal is
-available on `wait`, `html` (when given a selector), `text`, `attr`, `click`,
+available on `wait`, `html` (when given a selector), `text`, `attr`, `prop`, `click`,
 `input`, `clear`, `hover`, `focus`, `submit`, `select`, `screenshot-el`, `file`,
 and `download`.
+
+Use `rdny attr SELECTOR NAME` for HTML attributes and `rdny prop SELECTOR NAME`
+for live DOM properties such as `value`, `checked`, `selectedIndex`,
+`naturalWidth`, or `complete`. `prop` accepts one literal property name, resolves
+exactly one live element, performs no mutation or method invocation, and returns
+only JSON-compatible null/bool/finite number/string/array/plain-object values.
+The 64 KiB limit applies to the serialized property value; selectors and property
+names are separately bounded before structured output is emitted.
+Paths or expressions such as `a.b`, `a[0]`, or `fn()` are rejected; use `rdny js`
+when you intentionally need arbitrary JavaScript.
 
 Closed shadow roots are intentionally unsupported because page JavaScript cannot
 access them. Shadow traversal also does not cross iframe boundaries; in

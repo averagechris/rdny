@@ -595,6 +595,20 @@ fn check_exception(result: &Value, what: &str) -> Result<()> {
 }
 
 impl PageSession {
+    #[cfg(test)]
+    pub(crate) fn new_for_test(client: CdpClient, session_id: &str, target_id: &str) -> Self {
+        Self {
+            client,
+            session_id: session_id.into(),
+            instance_id: Some("test-instance".into()),
+            target_id: target_id.into(),
+            frames_dir: None,
+            instrumentation_registered: true,
+            timeout: Duration::from_secs(1),
+            deadline: Deadline::after(Duration::from_secs(1)),
+        }
+    }
+
     /// Minimal page session for focused fake-CDP input protocol tests.
     #[cfg(test)]
     pub(crate) fn connect_for_input_test(ws_url: &str) -> Result<Self> {

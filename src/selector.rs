@@ -48,6 +48,10 @@ impl ElementSelector {
         &self.raw
     }
 
+    pub(crate) fn segments(&self) -> &[String] {
+        &self.segments
+    }
+
     /// Build the single traversal used by both required element resolution and
     /// wait probes. Every segment is passed separately to `querySelector`, so
     /// Chromium validates CSS in the document/shadow-root context where it is

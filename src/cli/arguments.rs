@@ -9,8 +9,8 @@ use crate::input::{
     MIN_DRAG_DURATION_MS, MIN_DRAG_STEPS,
 };
 
-pub(super) const STRUCTURED_COMMAND_INVENTORY: &str = "status, list, cleanup, open, cookie list, viewport, logs, pages, screenshot, screenshot-el, pdf, download FILE, stop-video, skills list, skills show, skills install";
-const TOP_LEVEL_AFTER_HELP: &str = "Structured output commands: status, list, cleanup, open, cookie list, viewport, logs, pages, screenshot, screenshot-el, pdf, download FILE, stop-video, skills list, skills show, skills install.\n\nInput discovery: use `rdny key --help` for key names and `rdny pointer --help` for pointer targets. Trusted key names assume a US keyboard layout.\n\nArtifact commands accept an optional FILE positional. Omit FILE for the default artifact path; use FILE=- only where documented for raw stdout bytes.";
+pub(super) const STRUCTURED_COMMAND_INVENTORY: &str = "status, list, cleanup, open, prop, cookie list, viewport, logs, pages, screenshot, screenshot-el, pdf, download FILE, stop-video, skills list, skills show, skills install";
+const TOP_LEVEL_AFTER_HELP: &str = "Structured output commands: status, list, cleanup, open, prop, cookie list, viewport, logs, pages, screenshot, screenshot-el, pdf, download FILE, stop-video, skills list, skills show, skills install.\n\nInput discovery: use `rdny key --help` for key names and `rdny pointer --help` for pointer targets. Trusted key names assume a US keyboard layout.\n\nArtifact commands accept an optional FILE positional. Omit FILE for the default artifact path; use FILE=- only where documented for raw stdout bytes.";
 
 /// Chrome automation from the command line.
 #[derive(Debug, Parser)]
@@ -174,6 +174,19 @@ pub enum Command {
         #[arg(long)]
         pierce: bool,
     },
+    /// Read a live DOM property as a typed JSON-compatible value.
+    #[command(
+        after_long_help = "Use `prop` for live DOM properties such as value, checked, selectedIndex, naturalWidth, or complete. Use `attr` for HTML attributes. PROPERTY is one literal name; use `rdny js` for paths or expressions."
+    )]
+    Prop {
+        selector: String,
+        /// Literal property name. Paths/expressions such as a.b, a[0], or fn() are rejected.
+        #[arg(value_parser = crate::commands::pageinfo::validate_property_name)]
+        property: String,
+        /// Split SELECTOR on `>>>` and traverse nested open shadow roots.
+        #[arg(long)]
+        pierce: bool,
+    },
     /// Save the current page as PDF.
     Pdf(ArtifactArgs),
     /// Evaluate JavaScript in the current page. Pass `-` or omit EXPRESSION to read stdin.
@@ -328,6 +341,7 @@ impl Command {
             Self::Html { .. } => "html",
             Self::Text { .. } => "text",
             Self::Attr { .. } => "attr",
+            Self::Prop { .. } => "prop",
             Self::Pdf(_) => "pdf",
             Self::Js { .. } => "js",
             Self::Logs(_) => "logs",
@@ -366,6 +380,7 @@ impl Command {
                 | Self::Skills(_)
                 | Self::Cleanup(_)
                 | Self::Open { .. }
+                | Self::Prop { .. }
                 | Self::Cookie(CookieArgs {
                     command: CookieCommand::List
                 })
@@ -402,6 +417,7 @@ impl Command {
             | Self::Html { .. }
             | Self::Text { .. }
             | Self::Attr { .. }
+            | Self::Prop { .. }
             | Self::Pdf(_)
             | Self::Js { .. }
             | Self::Logs(_)
@@ -938,6 +954,11 @@ mod tests {
         let pointer = help_for(&["pointer"]);
         assert!(pointer.contains("selector hit-tested action points"));
         assert!(pointer.contains("X,Y viewport coordinates"));
+        let prop = help_for(&["prop"]);
+        assert!(prop.contains("live DOM properties"));
+        assert!(prop.contains("Use `attr` for HTML attributes"));
+        assert!(prop.contains("use `rdny js` for paths or expressions"));
+        assert!(prop.contains("PROPERTY"));
     }
 
     #[test]
@@ -1050,6 +1071,16 @@ mod tests {
         assert!(
             matches!(parse(&["rdny", "attr", "a", "href"]), Command::Attr { selector, name, pierce: false } if selector == "a" && name == "href")
         );
+        assert!(
+            matches!(parse(&["rdny", "prop", "input", "value"]), Command::Prop { selector, property, pierce: false } if selector == "input" && property == "value")
+        );
+        assert!(Cli::try_parse_from(["rdny", "prop", "input"]).is_err());
+        assert!(Cli::try_parse_from(["rdny", "prop"]).is_err());
+        for property in ["", "a.b", "a[0]", "onclick()", "a/b", "a b", "x=y"] {
+            let err = Cli::try_parse_from(["rdny", "prop", "input", property]).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+            assert_eq!(err.exit_code(), 2);
+        }
         assert!(matches!(
             parse(&["rdny", "reload", "--hard"]),
             Command::Reload(ReloadArgs { hard: true })
@@ -1323,6 +1354,11 @@ mod tests {
             parse(&["rdny", "attr", "--pierce", SHADOW, "data-state"]),
             Command::Attr { selector, name, pierce: true }
                 if selector == SHADOW && name == "data-state"
+        ));
+        assert!(matches!(
+            parse(&["rdny", "prop", "--pierce", SHADOW, "value"]),
+            Command::Prop { selector, property, pierce: true }
+                if selector == SHADOW && property == "value"
         ));
         assert!(matches!(
             parse(&["rdny", "click", "--pierce", SHADOW]),

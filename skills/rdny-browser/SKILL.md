@@ -19,8 +19,10 @@ Workflow:
    Use a short sleep when startup, animation, or external readiness has no reliable
    observable condition. Use robust selectors and `--pierce` only for known open
    shadow roots.
-4. Use first-class commands for ordinary user actions. Use `js` when it is the
-   clearest interface for inspection, assertions, runtime APIs, or intentional DOM
+4. Use first-class commands for ordinary user actions. Use `prop` for simple live
+   element state (`value`, `checked`, `selectedIndex`, `naturalWidth`, `complete`),
+   `attr` for HTML attributes. Use `js` when it is the clearest interface for
+   inspection, assertions, runtime APIs, or intentional DOM
    work. Use trusted input (`rdny key`, `rdny pointer`) when event fidelity matters.
 5. Verify mutations with observable state and capture proportionate evidence: URL,
    title, text, attributes, logs, screenshots, or artifact metadata.

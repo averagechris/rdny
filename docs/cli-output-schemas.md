@@ -3,7 +3,7 @@
 # CLI output formats and schema version 1
 
 `rdny --format human|json|jsonl` selects output for commands that expose stable
-structured output: `status`, `list`, `cleanup`, `open`, `cookie list`,
+structured output: `status`, `list`, `cleanup`, `open`, `prop`, `cookie list`,
 `viewport`, `logs`, `pages`, and artifact-producing commands. Human output is for terminals;
 page-controlled text is stripped of terminal-control bytes before printing.
 Progress, warnings, and diagnostics are written to stderr so stdout remains
@@ -53,6 +53,20 @@ suppressing stdout:
 
 ```json
 {"schemaVersion":1,"kind":"open","url":"https://example.com/"}
+```
+
+## prop
+
+`rdny prop SELECTOR PROPERTY --format json|jsonl` reads one literal live DOM
+property from exactly one matched element. `PROPERTY` is data, not a JavaScript
+path or expression; traversal-like names such as `a.b`, `a[0]`, and `fn()` are
+rejected. Values are limited to JSON-compatible `null`, booleans, finite numbers,
+strings, arrays, and plain objects under the explicit output limit.
+That 64 KiB limit is for the serialized property value; selector/property
+metadata is bounded separately and the final structured record is size-checked.
+
+```json
+{"schemaVersion":1,"kind":"prop","selector":"input[name=q]","property":"value","value":"hello"}
 ```
 
 ## pages

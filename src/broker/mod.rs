@@ -494,6 +494,20 @@ fn spawn_first_chrome_pipe_with_env_until(
     deadline: Deadline,
     test_env: Option<(&str, &str)>,
 ) -> Result<(ChromePipe, ChromeStartupProbe)> {
+    spawn_first_chrome_pipe_with_env_until_and_fd_scan_limit(
+        binaries, args, profile, log, deadline, test_env, None,
+    )
+}
+
+fn spawn_first_chrome_pipe_with_env_until_and_fd_scan_limit(
+    binaries: &[PathBuf],
+    args: &[String],
+    profile: &Path,
+    log: std::fs::File,
+    deadline: Deadline,
+    test_env: Option<(&str, &str)>,
+    fd_scan_limit: Option<RawFd>,
+) -> Result<(ChromePipe, ChromeStartupProbe)> {
     let mut errors = Vec::new();
     let total = binaries.len();
     for (index, binary) in binaries.iter().enumerate() {
@@ -508,8 +522,13 @@ fn spawn_first_chrome_pipe_with_env_until(
                 break;
             }
         };
-        let mut chrome = match spawn_chrome_pipe_with_env(binary, args, log.try_clone()?, test_env)
-        {
+        let mut chrome = match spawn_chrome_pipe_with_env_and_fd_scan_limit(
+            binary,
+            args,
+            log.try_clone()?,
+            test_env,
+            fd_scan_limit,
+        ) {
             Ok(chrome) => chrome,
             Err(error) => {
                 errors.push(format!("{}: {error:#}", binary.display()));
@@ -563,11 +582,12 @@ fn probe_chrome_startup_until(
     })
 }
 
-fn spawn_chrome_pipe_with_env(
+fn spawn_chrome_pipe_with_env_and_fd_scan_limit(
     binary: &Path,
     args: &[String],
     log: std::fs::File,
     test_env: Option<(&str, &str)>,
+    fd_scan_limit: Option<RawFd>,
 ) -> Result<ChromePipe> {
     let (from_chrome_read, from_chrome_write) = pipe_pair()?;
     let (to_chrome_read, to_chrome_write) = pipe_pair()?;
@@ -599,7 +619,9 @@ fn spawn_chrome_pipe_with_env(
             // closing preserves std::process's private exec-error pipe until
             // exec succeeds, while the child executable still receives only
             // stdio and fd3/fd4.
-            let max = libc::sysconf(libc::_SC_OPEN_MAX).clamp(5, 65_536);
+            let max = fd_scan_limit
+                .map(|limit| limit.clamp(5, 65_536))
+                .unwrap_or_else(|| libc::sysconf(libc::_SC_OPEN_MAX).clamp(5, 65_536) as RawFd);
             for fd in 5..max as RawFd {
                 let flags = libc::fcntl(fd, libc::F_GETFD);
                 if flags >= 0 {
@@ -968,6 +990,24 @@ mod tests {
     use super::*;
     use std::os::fd::{FromRawFd, IntoRawFd};
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Mutex as TestMutex, OnceLock};
+
+    // Unit-test helper children are copies of this test binary under our control.
+    // Bounding the post-fork descriptor scan keeps parallel fake-Chrome spawns
+    // deterministic while still exercising the fd3/fd4 setup and leakage checks
+    // over the descriptor range those tests inspect. Production callers pass
+    // None and retain the full _SC_OPEN_MAX-capped scan.
+    const TEST_HELPER_FD_SCAN_LIMIT: RawFd = 64;
+
+    fn spawn_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        // These tests launch copied instances of the current test harness. Keep
+        // the process-heavy candidate-spawn scenarios narrow-serialized so
+        // unrelated harness scheduling/copy-exec contention cannot consume the
+        // deliberately small per-candidate deadlines. The fd scan itself is
+        // still bounded for deterministic helper startup.
+        static LOCK: OnceLock<TestMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| TestMutex::new(())).lock().unwrap()
+    }
 
     fn empty_state() -> SessionState {
         SessionState {
@@ -1063,18 +1103,19 @@ mod tests {
         let mut read = unsafe { std::fs::File::from_raw_fd(3) };
         let write = unsafe { std::fs::File::from_raw_fd(4) };
         let write = Arc::new(Mutex::new(write));
-        for _ in 0..2 {
+        loop {
             let request = raw_read(&mut read, &mut Vec::new()).unwrap();
             let id = request["id"].clone();
             let result = match request["method"].as_str().unwrap() {
                 "Browser.getVersion" => json!({"product":"FakeChrome/1"}),
                 "Target.getTargets" => json!({"targetInfos":[{"type":"page","targetId":"page-1"}]}),
+                "Browser.close" => {
+                    raw_send(&write, &json!({"id":id,"result":{}})).unwrap();
+                    return;
+                }
                 other => panic!("unexpected method {other}"),
             };
             raw_send(&write, &json!({"id":id,"result":result})).unwrap();
-        }
-        loop {
-            thread::sleep(Duration::from_secs(60));
         }
     }
 
@@ -1089,6 +1130,7 @@ mod tests {
 
     #[test]
     fn spawn_first_chrome_pipe_probes_and_falls_back_after_nonworking_spawn() {
+        let _guard = spawn_test_lock();
         let temp = tempfile::tempdir().unwrap();
         let bad = copy_test_exe(temp.path(), "bad-chrome");
         let good = copy_test_exe(temp.path(), "good-chrome");
@@ -1097,13 +1139,14 @@ mod tests {
             "broker::tests::pipe_chrome_probe_helper".to_string(),
             "--exact".to_string(),
         ];
-        let (mut chrome, probe) = spawn_first_chrome_pipe_with_env_until(
+        let (mut chrome, probe) = spawn_first_chrome_pipe_with_env_until_and_fd_scan_limit(
             &[bad, good.clone()],
             &args,
             temp.path(),
             log,
             Deadline::after(Duration::from_secs(5)),
             Some(("RDNY_PIPE_CHROME_PROBE_HELPER", "1")),
+            Some(TEST_HELPER_FD_SCAN_LIMIT),
         )
         .unwrap();
         assert_eq!(probe.browser_path, good);
@@ -1114,6 +1157,7 @@ mod tests {
 
     #[test]
     fn spawn_first_chrome_pipe_reports_all_probe_failures() {
+        let _guard = spawn_test_lock();
         let temp = tempfile::tempdir().unwrap();
         let bad_one = copy_test_exe(temp.path(), "bad-chrome-one");
         let bad_two = copy_test_exe(temp.path(), "bad-chrome-two");
@@ -1122,13 +1166,14 @@ mod tests {
             "broker::tests::pipe_chrome_probe_helper".to_string(),
             "--exact".to_string(),
         ];
-        let err = match spawn_first_chrome_pipe_with_env_until(
+        let err = match spawn_first_chrome_pipe_with_env_until_and_fd_scan_limit(
             &[bad_one.clone(), bad_two.clone()],
             &args,
             temp.path(),
             log,
             Deadline::after(Duration::from_secs(5)),
             Some(("RDNY_PIPE_CHROME_PROBE_HELPER", "1")),
+            Some(TEST_HELPER_FD_SCAN_LIMIT),
         ) {
             Ok(_) => panic!("nonworking candidates unexpectedly passed startup probe"),
             Err(error) => error,
@@ -1141,6 +1186,7 @@ mod tests {
 
     #[test]
     fn spawn_first_chrome_pipe_times_out_hung_candidate_and_falls_back() {
+        let _guard = spawn_test_lock();
         let temp = tempfile::tempdir().unwrap();
         let hung = copy_test_exe(temp.path(), "hang-chrome");
         let good = copy_test_exe(temp.path(), "good-chrome");
@@ -1149,13 +1195,14 @@ mod tests {
             "broker::tests::pipe_chrome_probe_helper".to_string(),
             "--exact".to_string(),
         ];
-        let (mut chrome, probe) = spawn_first_chrome_pipe_with_env_until(
+        let (mut chrome, probe) = spawn_first_chrome_pipe_with_env_until_and_fd_scan_limit(
             &[hung, good.clone()],
             &args,
             temp.path(),
             log,
             Deadline::after(Duration::from_secs(5)),
             Some(("RDNY_PIPE_CHROME_PROBE_HELPER", "1")),
+            Some(TEST_HELPER_FD_SCAN_LIMIT),
         )
         .unwrap();
         assert_eq!(probe.browser_path, good);
@@ -1164,6 +1211,7 @@ mod tests {
 
     #[test]
     fn spawn_first_chrome_pipe_reports_hung_all_candidates_with_paths() {
+        let _guard = spawn_test_lock();
         let temp = tempfile::tempdir().unwrap();
         let hung_one = copy_test_exe(temp.path(), "hang-chrome-one");
         let hung_two = copy_test_exe(temp.path(), "hang-chrome-two");
@@ -1172,13 +1220,14 @@ mod tests {
             "broker::tests::pipe_chrome_probe_helper".to_string(),
             "--exact".to_string(),
         ];
-        let err = match spawn_first_chrome_pipe_with_env_until(
+        let err = match spawn_first_chrome_pipe_with_env_until_and_fd_scan_limit(
             &[hung_one.clone(), hung_two.clone()],
             &args,
             temp.path(),
             log,
             Deadline::after(Duration::from_secs(1)),
             Some(("RDNY_PIPE_CHROME_PROBE_HELPER", "1")),
+            Some(TEST_HELPER_FD_SCAN_LIMIT),
         ) {
             Ok(_) => panic!("hung candidates unexpectedly passed startup probe"),
             Err(error) => error,
@@ -1197,14 +1246,23 @@ mod tests {
     fn run_fd_report_child() {
         let temp = tempfile::tempdir().unwrap();
         let log = fs::File::create(temp.path().join("child.log")).unwrap();
+        let leaked_source = fs::File::create(temp.path().join("parent-only-fd")).unwrap();
+        let leaked_fd = unsafe { libc::fcntl(leaked_source.as_raw_fd(), libc::F_DUPFD, 10) };
+        assert!((10..TEST_HELPER_FD_SCAN_LIMIT).contains(&leaked_fd));
+        let _leaked_fd = unsafe { std::fs::File::from_raw_fd(leaked_fd) };
         let exe = std::env::current_exe().unwrap();
         let args = vec![
             "broker::tests::fd_report_helper".to_string(),
             "--exact".to_string(),
         ];
-        let mut child =
-            spawn_chrome_pipe_with_env(&exe, &args, log, Some(("RDNY_FD_REPORT_HELPER", "1")))
-                .unwrap();
+        let mut child = spawn_chrome_pipe_with_env_and_fd_scan_limit(
+            &exe,
+            &args,
+            log,
+            Some(("RDNY_FD_REPORT_HELPER", "1")),
+            Some(TEST_HELPER_FD_SCAN_LIMIT),
+        )
+        .unwrap();
         let mut buffer = Vec::new();
         let report = raw_read(child.read.as_mut().unwrap(), &mut buffer).unwrap();
         assert_eq!(report["open"], json!([0, 1, 2, 3, 4]));

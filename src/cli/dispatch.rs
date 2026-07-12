@@ -250,6 +250,14 @@ pub(super) fn execute(cli: Cli) -> Result<()> {
             let selector = ElementSelector::parse(selector, pierce)?;
             commands::pageinfo::attr(sess!(), &selector, &name)?
         }
+        Command::Prop {
+            selector,
+            property,
+            pierce,
+        } => {
+            let selector = ElementSelector::parse(selector, pierce)?;
+            commands::pageinfo::prop(sess!(), &selector, &property, cli.format)?
+        }
         Command::Pdf(args) => {
             let artifact = commands::pageinfo::pdf(sess!(), args.file.as_deref(), args.force)?;
             cli.format.emit_artifact(&artifact)?;
