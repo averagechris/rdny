@@ -49,4 +49,9 @@ expect_contains() {
   printf 'smoke: ok: %s\n' "$description"
 }
 
+fail() {
+  printf 'smoke: FAIL: %s\n' "$1" >&2
+  return 1
+}
+
 smoke_pass() { printf 'smoke: PASS: %s\n' "$SMOKE_NAME"; }

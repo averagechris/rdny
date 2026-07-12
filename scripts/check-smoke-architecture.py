@@ -15,6 +15,25 @@ for key, expected in {
     if result.get(key) != expected:
         raise SystemExit(f"browser-program {key}: expected {expected!r}, got {result.get(key)!r}; {result!r}")
 
+for key, expected in {
+    "plainTrusted": True,
+    "hoverTrusted": True,
+    "childTrusted": True,
+    "partialTrusted": True,
+    "occludedClicks": 0,
+    "occluderClicks": 0,
+    "pointerNoneClicks": 0,
+    "pointerUnderlayClicks": 0,
+    "detachedMoves": 1,
+    "detachedClicks": 0,
+}.items():
+    actionability = result.get("actionability", {})
+    if actionability.get(key) != expected:
+        raise SystemExit(
+            f"browser-program actionability.{key}: expected {expected!r}, "
+            f"got {actionability.get(key)!r}; {result!r}"
+        )
+
 keys = result["keys"]
 assert all(event["trusted"] for event in keys), keys
 primary = [(event["type"], event["key"], event["code"], event["shift"], event["control"]) for event in keys if event["key"] not in {"Control", "Shift"}]

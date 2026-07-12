@@ -6,6 +6,17 @@
   #drag-source { left: 80px; background: #9cf; }
   #drop-target { left: 360px; background: #cfc; }
   #pointer-target { position: fixed; left: 200px; top: 100px; width: 120px; height: 60px; }
+  .actionability-fixture { display: none; position: fixed; z-index: 100; }
+  #composed-child { left: 20px; top: 100px; width: 140px; height: 44px; }
+  #composed-child > span { position: absolute; inset: 0; display: grid; place-items: center; }
+  #partially-visible { left: -80px; top: 180px; width: 100px; height: 44px; }
+  #occluded-fixture { left: 20px; top: 100px; width: 140px; height: 44px; }
+  #occluded-button, #occluder { position: absolute; inset: 0; }
+  #occluder { z-index: 1; background: rgba(0, 0, 0, 0.1); }
+  #pointer-fixture { left: 20px; top: 100px; width: 140px; height: 44px; }
+  #pointer-underlay, #pointer-none { position: absolute; inset: 0; }
+  #pointer-none { z-index: 1; pointer-events: none; }
+  #detached-target { left: 20px; top: 100px; width: 140px; height: 44px; }
 </style>
 <a id="download" href="data:text/plain;base64,YXJjaGl0ZWN0dXJlCg==">download</a>
 <h1 id="heading">browser programs</h1>
@@ -13,10 +24,32 @@
 <button id="plain-action">plain action</button>
 <input id="key-target">
 <button id="pointer-target">pointer</button>
+<button id="composed-child" class="actionability-fixture"><span>child covers button</span></button>
+<button id="partially-visible" class="actionability-fixture">visible edge</button>
+<div id="occluded-fixture" class="actionability-fixture">
+  <button id="occluded-button" class="blocked primary">blocked target</button>
+  <div id="occluder" class="cover modal"></div>
+</div>
+<div id="pointer-fixture" class="actionability-fixture">
+  <button id="pointer-underlay">underlay</button>
+  <button id="pointer-none" class="disabled-target">no pointer events</button>
+</div>
+<button id="detached-target" class="actionability-fixture">detach on move</button>
 <div id="drag-source" draggable="true">source</div>
 <div id="drop-target">target</div>
 <script>
-  window.result = {clicked: false, dragged: false, dropData: '', keys: [], pointer: false, releaseButtons: null};
+  window.result = {clicked: false, dragged: false, dropData: '', keys: [], pointer: false, releaseButtons: null, actionability: {
+    plainTrusted: false,
+    hoverTrusted: false,
+    childTrusted: false,
+    partialTrusted: false,
+    occludedClicks: 0,
+    occluderClicks: 0,
+    pointerNoneClicks: 0,
+    pointerUnderlayClicks: 0,
+    detachedMoves: 0,
+    detachedClicks: 0,
+  }};
   const outer = document.querySelector('#outer').attachShadow({mode: 'open'});
   outer.innerHTML = '<inner-host id="inner"></inner-host>';
   const inner = outer.querySelector('#inner').attachShadow({mode: 'open'});
@@ -24,6 +57,28 @@
   inner.querySelector('#action').addEventListener('click', event => {
     window.result.clicked = event.isTrusted && event.target.localName === 'span';
   });
+  document.querySelector('#plain-action').addEventListener('click', event => {
+    window.result.actionability.plainTrusted = event.isTrusted;
+  });
+  document.querySelector('#plain-action').addEventListener('mouseover', event => {
+    window.result.actionability.hoverTrusted = event.isTrusted;
+  });
+  document.querySelector('#composed-child').addEventListener('click', event => {
+    window.result.actionability.childTrusted = event.isTrusted && event.target.localName === 'span';
+  });
+  document.querySelector('#partially-visible').addEventListener('click', event => {
+    window.result.actionability.partialTrusted = event.isTrusted;
+  });
+  document.querySelector('#occluded-button').addEventListener('click', () => window.result.actionability.occludedClicks++);
+  document.querySelector('#occluder').addEventListener('click', () => window.result.actionability.occluderClicks++);
+  document.querySelector('#pointer-none').addEventListener('click', () => window.result.actionability.pointerNoneClicks++);
+  document.querySelector('#pointer-underlay').addEventListener('click', () => window.result.actionability.pointerUnderlayClicks++);
+  const detached = document.querySelector('#detached-target');
+  detached.addEventListener('mousemove', () => {
+    window.result.actionability.detachedMoves++;
+    detached.remove();
+  });
+  detached.addEventListener('click', () => window.result.actionability.detachedClicks++);
   for (const type of ['keydown', 'keyup']) {
     document.querySelector('#key-target').addEventListener(type, event => {
       window.result.keys.push({type, key: event.key, code: event.code, shift: event.shiftKey, control: event.ctrlKey, trusted: event.isTrusted});
