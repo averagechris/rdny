@@ -8,6 +8,7 @@ pub mod logs;
 pub mod nav;
 pub mod pageinfo;
 pub mod shot;
+pub mod skills;
 pub mod tabs;
 pub mod video;
 pub mod viewport;

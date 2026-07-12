@@ -405,13 +405,18 @@ mod tests {
                 let cli = parse_cli(&["rdny", "--instance", "from-cli", "status"]);
                 assert_eq!(cli.instance.as_deref(), Some("from-cli"));
             }
+            "skills-reject" => {
+                let cli = parse_cli(&["rdny", "skills", "list"]);
+                let error = before_dispatch(&cli).unwrap_err();
+                assert!(format!("{error:#}").contains("does not apply to this command"));
+            }
             _ => panic!("unknown helper mode"),
         }
     }
 
     #[test]
     fn rdny_instance_is_equivalent_and_cli_overrides_it() {
-        for mode in ["env", "override"] {
+        for mode in ["env", "override", "skills-reject"] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .arg("cli::tests::cli_instance_env_process_helper")
                 .arg("--exact")
@@ -459,6 +464,9 @@ mod tests {
             parse(&["rdny", "list"]),
             parse(&["rdny", "cleanup"]),
             parse(&["rdny", "completion", "bash"]),
+            parse(&["rdny", "skills", "list"]),
+            parse(&["rdny", "skills", "show", "rdny-browser"]),
+            parse(&["rdny", "skills", "install", "rdny-browser"]),
             parse(&["rdny", "sleep", "1"]),
         ] {
             assert!(!command.targets_registered_instance());
@@ -478,6 +486,19 @@ mod tests {
         ] {
             assert!(command.targets_registered_instance());
         }
+    }
+
+    #[test]
+    fn skills_instance_selectors_reject_before_registry_lookup() {
+        let command = parse(&["rdny", "skills", "list"]);
+        assert!(!command.targets_registered_instance());
+        let error = validate_selection_inputs(Some("missing"), None, None, false).unwrap_err();
+        assert!(format!("{error:#}").contains("does not apply to this command"));
+
+        let cli = Cli::try_parse_adjusted_from(["rdny", "--instance", "missing", "skills", "list"])
+            .unwrap();
+        let error = before_dispatch(&cli).unwrap_err();
+        assert!(format!("{error:#}").contains("does not apply to this command"));
     }
 
     #[test]

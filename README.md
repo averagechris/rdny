@@ -8,6 +8,8 @@ persistent-browser philosophy, but no code. Where rodney wraps
 [go-rod](https://github.com/go-rod/rod), rdny speaks the Chrome DevTools
 Protocol from Rust.
 
+Bundled Agent Skills are discoverable with `rdny skills list`, `rdny skills show rdny-browser`, and `rdny skills install`.
+
 ## Installation
 
 rdny currently builds through the Nix flake for `x86_64-linux`,

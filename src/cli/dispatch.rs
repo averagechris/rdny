@@ -173,6 +173,13 @@ pub(super) fn execute(cli: Cli) -> Result<()> {
             let mut cmd = arguments::adjusted_command();
             clap_complete::generate(shell, &mut cmd, "rdny", &mut std::io::stdout());
         }
+        Command::Skills(args) => match args.command {
+            SkillsCommand::List => commands::skills::list(cli.format)?,
+            SkillsCommand::Show { name } => commands::skills::show(&name, cli.format)?,
+            SkillsCommand::Install(args) => {
+                commands::skills::install(&args.names, args.dir, args.force, cli.format)?
+            }
+        },
         Command::Cleanup(args) => {
             commands::instances::cleanup_until(args.all, cli.format, deadline)?
         }

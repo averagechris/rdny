@@ -9,8 +9,8 @@ use crate::input::{
     MIN_DRAG_DURATION_MS, MIN_DRAG_STEPS,
 };
 
-pub(super) const STRUCTURED_COMMAND_INVENTORY: &str = "status, list, cleanup, open, cookie list, viewport, logs, pages, screenshot, screenshot-el, pdf, download FILE, stop-video";
-const TOP_LEVEL_AFTER_HELP: &str = "Structured output commands: status, list, cleanup, open, cookie list, viewport, logs, pages, screenshot, screenshot-el, pdf, download FILE, stop-video.\n\nInput discovery: use `rdny key --help` for key names and `rdny pointer --help` for pointer targets. Trusted key names assume a US keyboard layout.\n\nArtifact commands accept an optional FILE positional. Omit FILE for the default artifact path; use FILE=- only where documented for raw stdout bytes.";
+pub(super) const STRUCTURED_COMMAND_INVENTORY: &str = "status, list, cleanup, open, cookie list, viewport, logs, pages, screenshot, screenshot-el, pdf, download FILE, stop-video, skills list, skills show, skills install";
+const TOP_LEVEL_AFTER_HELP: &str = "Structured output commands: status, list, cleanup, open, cookie list, viewport, logs, pages, screenshot, screenshot-el, pdf, download FILE, stop-video, skills list, skills show, skills install.\n\nInput discovery: use `rdny key --help` for key names and `rdny pointer --help` for pointer targets. Trusted key names assume a US keyboard layout.\n\nArtifact commands accept an optional FILE positional. Omit FILE for the default artifact path; use FILE=- only where documented for raw stdout bytes.";
 
 /// Chrome automation from the command line.
 #[derive(Debug, Parser)]
@@ -128,6 +128,8 @@ pub enum Command {
     List,
     /// Generate shell completion script for a supported shell.
     Completion { shell: clap_complete::Shell },
+    /// List, show, or install bundled Agent Skills.
+    Skills(SkillsArgs),
     /// Clean up stale instance state files.
     Cleanup(CleanupArgs),
     /// Open a URL in the current page.
@@ -313,6 +315,7 @@ impl Command {
             Self::Status(_) => "status",
             Self::List => "list",
             Self::Completion { .. } => "completion",
+            Self::Skills(_) => "skills",
             Self::Cleanup(_) => "cleanup",
             Self::Open { .. } => "open",
             Self::Back => "back",
@@ -360,6 +363,7 @@ impl Command {
             self,
             Self::Status(_)
                 | Self::List
+                | Self::Skills(_)
                 | Self::Cleanup(_)
                 | Self::Open { .. }
                 | Self::Cookie(CookieArgs {
@@ -382,6 +386,7 @@ impl Command {
             | Self::Connect { .. }
             | Self::List
             | Self::Completion { .. }
+            | Self::Skills(_)
             | Self::Cleanup(_)
             | Self::Sleep { .. } => false,
             Self::Stop
@@ -425,6 +430,34 @@ impl Command {
             | Self::StopVideo(_) => true,
         }
     }
+}
+
+#[derive(Debug, Parser)]
+pub struct SkillsArgs {
+    #[command(subcommand)]
+    pub command: SkillsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SkillsCommand {
+    /// List bundled skills.
+    List,
+    /// Print one bundled skill Markdown file.
+    Show { name: String },
+    /// Install bundled skills to an Agent Skills directory.
+    Install(SkillsInstallArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SkillsInstallArgs {
+    /// Skill names to install; omit to install all bundled skills.
+    pub names: Vec<String>,
+    /// Install root directory. Defaults to ~/.agents/skills.
+    #[arg(long)]
+    pub dir: Option<PathBuf>,
+    /// Replace existing skill files.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Opt-ins for navigation targets that can expose local browser privileges.

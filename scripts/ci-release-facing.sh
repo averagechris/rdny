@@ -14,6 +14,10 @@ nix build .#rdny --out-link result-rdny
 [[ $(./result-rdny/bin/rdny --version) == "rdny $version" ]]
 ./result-rdny/bin/rdny --help | grep -q 'Chrome automation from the command line'
 ./result-rdny/bin/rdny help screenshot | grep -q 'Capture a screenshot'
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+env -i HOME="$tmp/home" PATH=/usr/bin:/bin ./result-rdny/bin/rdny skills show rdny-browser > "$tmp/package-skill.md"
+cmp "$tmp/package-skill.md" skills/rdny-browser/SKILL.md
 if grep -R -- '--json' README.md docs/pages; then
   printf 'docs mention nonexistent --json support\n' >&2
   exit 1
@@ -24,8 +28,6 @@ shopt -s nullglob
 artifacts=(result-release-artifact/*.tar.gz)
 [[ ${#artifacts[@]} -gt 0 ]] || { printf 'no release tarballs found\n' >&2; exit 1; }
 
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
 for artifact in "${artifacts[@]}"; do
   [[ -s $artifact.sha256 ]] || { printf 'missing checksum for %s\n' "$artifact" >&2; exit 1; }
   (cd "$(dirname "$artifact")" && sha256sum -c "$(basename "$artifact").sha256")
@@ -39,6 +41,8 @@ binary=$(find "$tmp" -type f -name rdny -perm -111 -print -quit)
 mkdir -p "$tmp/home"
 env -i HOME="$tmp/home" PATH=/usr/bin:/bin "$binary" --version | grep -q "^rdny $version$"
 env -i HOME="$tmp/home" PATH=/usr/bin:/bin "$binary" --help | grep -q 'Chrome automation from the command line'
+env -i HOME="$tmp/home" PATH=/usr/bin:/bin "$binary" skills show rdny-browser > "$tmp/release-skill.md"
+cmp "$tmp/release-skill.md" "$tmp/package-skill.md"
 
 [[ -n $(find "$tmp" -type f -name README.md -print -quit) ]] || { printf 'release artifact did not contain README.md\n' >&2; exit 1; }
 [[ -n $(find "$tmp" -type f -name CHANGELOG.md -print -quit) ]] || { printf 'release artifact did not contain CHANGELOG.md\n' >&2; exit 1; }

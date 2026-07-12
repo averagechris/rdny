@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add bundled `rdny-browser` Agent Skill and `rdny skills` list/show/install commands (~averagechris/projects#234).
 
 ## v0.2.0 - 2026-07-11
 

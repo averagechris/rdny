@@ -181,6 +181,21 @@ mod tests {
                 .unwrap(),
                 "saved example.png",
             ),
+            (
+                "skills list",
+                serde_json::json!({"schemaVersion":1,"kind":"skills.list","skills":[{"name":"rdny-browser","description":"Use when automating browsers safely with rdny"}]}),
+                "rdny-browser\tUse when",
+            ),
+            (
+                "skills show",
+                serde_json::json!({"schemaVersion":1,"kind":"skills.show","skill":{"name":"rdny-browser","description":"Use when automating browsers safely with rdny","markdown":"---\n"}}),
+                "---",
+            ),
+            (
+                "skills install",
+                serde_json::json!({"schemaVersion":1,"kind":"skills.install","installed":[{"name":"rdny-browser","path":"/tmp/skills/rdny-browser/SKILL.md"}]}),
+                "installed rdny-browser ->",
+            ),
         ];
         assert_eq!(
             contracts
