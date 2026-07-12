@@ -40,8 +40,7 @@ impl OutputFormat {
     pub fn write_json(self, value: &Value, mut writer: impl Write) -> Result<()> {
         match self {
             Self::Human => writeln!(writer, "{}", human_sanitize(&value.to_string()))?,
-            Self::Json => writeln!(writer, "{}", serde_json::to_string_pretty(value)?)?,
-            Self::Jsonl => writeln!(writer, "{}", serde_json::to_string(value)?)?,
+            Self::Json | Self::Jsonl => writeln!(writer, "{}", serde_json::to_string(value)?)?,
         }
         Ok(())
     }
@@ -49,8 +48,7 @@ impl OutputFormat {
     pub fn render_json(self, value: &Value) -> Result<String> {
         Ok(match self {
             Self::Human => human_sanitize(&value.to_string()),
-            Self::Json => serde_json::to_string_pretty(value)?,
-            Self::Jsonl => serde_json::to_string(value)?,
+            Self::Json | Self::Jsonl => serde_json::to_string(value)?,
         })
     }
 }
@@ -93,7 +91,8 @@ mod tests {
             .write_json(&value, &mut json_out)
             .unwrap();
         let json_text = String::from_utf8(json_out).unwrap();
-        assert!(json_text.contains("\n  \"items\": [\n"));
+        assert_eq!(json_text.lines().count(), 1);
+        assert_eq!(json_text.trim(), serde_json::to_string(&value).unwrap());
         assert_eq!(serde_json::from_str::<Value>(&json_text).unwrap(), value);
 
         let mut jsonl_out = Vec::new();

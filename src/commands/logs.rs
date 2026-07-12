@@ -255,7 +255,7 @@ mod tests {
             "target-2",
         )
         .unwrap();
-        assert!(raw.contains('\n'));
+        assert!(!raw.contains('\n'));
         let parsed: Value = serde_json::from_str(&raw).unwrap();
         assert!(parsed.get("instance").is_none());
         assert_eq!(parsed["target"], "target-2");

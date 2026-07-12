@@ -7,12 +7,12 @@ import sys
 root = pathlib.Path(sys.argv[1])
 
 def structured(name, kind):
-    pretty = (root / f"{name}.json").read_text()
-    compact = (root / f"{name}.jsonl").read_text()
-    assert "\n" in pretty.strip(), (name, pretty)
-    assert compact.count("\n") == 1 and compact.endswith("\n"), (name, compact)
-    assert compact.strip() == json.dumps(json.loads(compact), separators=(",", ":")), name
-    left, right = json.loads(pretty), json.loads(compact)
+    compact_json = (root / f"{name}.json").read_text()
+    compact_jsonl = (root / f"{name}.jsonl").read_text()
+    for text in (compact_json, compact_jsonl):
+        assert text.count("\n") == 1 and text.endswith("\n"), (name, text)
+        assert text.strip() == json.dumps(json.loads(text), separators=(",", ":")), name
+    left, right = json.loads(compact_json), json.loads(compact_jsonl)
     if kind == "artifact":
         assert {key: value for key, value in left.items() if key != "path"} == {
             key: value for key, value in right.items() if key != "path"
@@ -59,5 +59,4 @@ for format_name in ("json", "jsonl"):
     assert record["schemaVersion"] == 1 and record["kind"] == "log", record
     assert record["instance"] and record["target"] and record["cdpSession"], record
     assert record["target"] != record["cdpSession"], record
-    if format_name == "jsonl":
-        assert all(line == json.dumps(json.loads(line), separators=(",", ":")) for line in text.splitlines()), text
+    assert all(line == json.dumps(json.loads(line), separators=(",", ":")) for line in text.splitlines()), text

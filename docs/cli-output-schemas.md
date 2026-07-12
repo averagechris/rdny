@@ -10,8 +10,9 @@ Progress, warnings, and diagnostics are written to stderr so stdout remains
 parseable. Commands without structured output reject unsupported formats rather
 than silently printing human text.
 
-Every structured record includes `schemaVersion: 1` and `kind`. `json` prints a
-single pretty JSON document. `jsonl` prints one compact JSON document per line;
+Every structured record includes `schemaVersion: 1` and `kind`. Both `json` and
+`jsonl` print compact JSON; `json` emits one document for finite commands, while
+`jsonl` prints one compact JSON document per line;
 streaming commands such as `logs --follow` emit one record per event. Empty lists
 are represented as `[]`. Finite multi-item commands wrap results in one document
 containing an array; `jsonl` still uses one compact line for that document.
@@ -116,8 +117,8 @@ Screenshot records include `width` and `height` when the PNG header can be
 parsed. Video records may include them when the first JPEG frame can be parsed;
 reported video dimensions include the even-pixel padding applied by the encoder.
 `instance`, `target`, and `url` may be included when available and are omitted
-otherwise. `json` prints one pretty JSON document. `jsonl` prints one compact
-JSON document on one line.
+otherwise. Both `json` and `jsonl` print compact JSON documents on one line for
+artifact commands. Pipe either format through `jq .` when pretty output is desired.
 
 `type` is the artifact's MIME media type: screenshots use `image/png`, PDFs use
 `application/pdf`, downloads use the normalized response `Content-Type` (or

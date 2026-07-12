@@ -15,8 +15,7 @@ impl OutputFormat {
     ) -> Result<String> {
         match self {
             Self::Human => Ok(artifact.human_summary()),
-            Self::Json => Ok(serde_json::to_string_pretty(artifact)?),
-            Self::Jsonl => Ok(serde_json::to_string(artifact)?),
+            Self::Json | Self::Jsonl => Ok(serde_json::to_string(artifact)?),
         }
     }
 
@@ -56,7 +55,7 @@ mod focused_tests {
             "saved example.png"
         );
         let json = OutputFormat::Json.render_artifact(&artifact()).unwrap();
-        assert!(json.contains('\n'));
+        assert!(!json.contains('\n'));
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&json).unwrap()["schemaVersion"],
             1
@@ -194,10 +193,10 @@ mod tests {
         for (name, value, human_hint) in contracts {
             assert_eq!(value["schemaVersion"], 1, "{name}");
             assert!(value["kind"].is_string(), "{name}");
-            let pretty = OutputFormat::Json.render_json(&value).unwrap();
-            assert!(pretty.contains('\n'), "{name} json should be pretty");
+            let compact = OutputFormat::Json.render_json(&value).unwrap();
+            assert!(!compact.contains('\n'), "{name} json should be compact");
             assert_eq!(
-                serde_json::from_str::<serde_json::Value>(&pretty).unwrap(),
+                serde_json::from_str::<serde_json::Value>(&compact).unwrap(),
                 value
             );
             let jsonl = OutputFormat::Jsonl.render_json(&value).unwrap();
@@ -247,7 +246,7 @@ mod tests {
         );
 
         let json = OutputFormat::Json.render_artifact(&artifact).unwrap();
-        assert!(json.contains('\n'));
+        assert!(!json.contains('\n'));
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&json).unwrap(),
             serde_json::json!({
