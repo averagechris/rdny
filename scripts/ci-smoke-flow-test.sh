@@ -22,7 +22,7 @@ for helper in scripts/smoke/lib.sh scripts/check-smoke-architecture.py scripts/c
   [[ -s $helper ]]
 done
 scenarios=$(scripts/smoke.sh --list-scenarios)
-for scenario in lifecycle-navigation output-artifacts trusted-input-browser-programs video-tabs; do
+for scenario in lifecycle-navigation output-artifacts trusted-input-browser-programs video-tabs attached-cdp; do
   [[ $scenarios == *"$scenario"* ]]
   route_dir="$tmp/routes"
   RDNY_SMOKE_ROUTE_ONLY=1 RDNY_SMOKE_WORKDIR="$route_dir" scripts/smoke.sh --scenario "$scenario" /bin/true

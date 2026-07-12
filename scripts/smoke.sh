@@ -13,7 +13,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --list-scenarios)
-      printf '%s\n' lifecycle-navigation output-artifacts trusted-input-browser-programs video-tabs
+      printf '%s\n' lifecycle-navigation output-artifacts trusted-input-browser-programs video-tabs attached-cdp
       exit 0
       ;;
     *)

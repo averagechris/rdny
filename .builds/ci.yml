@@ -48,6 +48,10 @@ tasks:
   - packaged-smoke-gate: |
       cd rdny
       nix run .#ci-smoke-gate
+  - attached-cdp-smoke: |
+      cd rdny
+      nix build .#rdny-bundled --out-link result-rdny-bundled --print-build-logs
+      nix run .#ci-smoke-attached -- ./result-rdny-bundled/bin/rdny
   - smoke-flow-test: |
       cd rdny
       nix run .#ci-smoke-flow-test

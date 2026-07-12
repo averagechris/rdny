@@ -75,6 +75,11 @@
       mkToolApp system "ci-smoke-flow-test" [(pkgsFor system).bash (pkgsFor system).coreutils (pkgsFor system).gnugrep (pkgsFor system).python3] ''
         exec bash scripts/ci-smoke-flow-test.sh "$@"
       '';
+    ciSmokeAttached = system:
+      mkToolApp system "ci-smoke-attached" [(pkgsFor system).bash (pkgsFor system).coreutils (pkgsFor system).python3 (pkgsFor system).ungoogled-chromium] ''
+        export RDNY_ATTACHED_CHROME="${(pkgsFor system).ungoogled-chromium}/bin/chromium"
+        exec bash scripts/smoke.sh --scenario attached-cdp "$@"
+      '';
     ciReleaseFacing = system:
       mkToolApp system "ci-release-facing" [(pkgsFor system).bash (pkgsFor system).coreutils (pkgsFor system).findutils (pkgsFor system).gawk (pkgsFor system).gnugrep (pkgsFor system).gnutar (pkgsFor system).nix] ''
         exec bash scripts/ci-release-facing.sh "$@"
@@ -162,6 +167,7 @@
         release-artifact = (fleetApps system).releaseArtifact system;
       }
       // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+        ci-smoke-attached = ciSmokeAttached system;
         rdny-bundled = bundled;
       });
 
@@ -214,6 +220,10 @@
         inherit ((fleetApps system).apps) prepare-release release-tag release ci-fmt ci-clippy static-checks ci-test;
       }
       // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+        ci-smoke-attached = {
+          type = "app";
+          program = "${self.packages.${system}.ci-smoke-attached}/bin/ci-smoke-attached";
+        };
         rdny-bundled = {
           type = "app";
           program = "${self.packages.${system}.rdny-bundled}/bin/rdny";
