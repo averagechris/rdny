@@ -2,9 +2,11 @@
 
 ## Unreleased
 
+
+## v0.3.0 - 2026-07-11
+
 - Add bundled `rdny-browser` Agent Skill and `rdny skills` list/show/install commands (~averagechris/projects#234).
 - Add `rdny prop SELECTOR PROPERTY` for safe typed live DOM property reads with structured output (~averagechris/projects#237).
-
 ## v0.2.0 - 2026-07-11
 
 - Added explicit opt-ins for Chromium internal URLs and aliases
