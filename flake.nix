@@ -9,14 +9,12 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     fleet.url = "git+https://git.sr.ht/~averagechris/averagechris.srht.site";
-    srht.url = "git+https://git.sr.ht/~averagechris/srht";
   };
 
   outputs = {
     self,
     nixpkgs,
     fleet,
-    srht,
   }: let
     systems = [
       "aarch64-darwin"
@@ -33,6 +31,7 @@
       fleet.lib.fleet.presets.rust {
         pkgs = pkgsFor system;
         inherit self;
+        srhtPackage = fleet.packages.${system}.srht;
         pname = "rdny";
         binaries = ["rdny"];
         subdir = "rdny";
@@ -256,7 +255,7 @@
             rustfmt
             sccache
           ]
-          ++ [srht.packages.${system}.srht];
+          ++ [fleet.packages.${system}.srht];
       };
     });
 
