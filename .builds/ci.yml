@@ -37,7 +37,7 @@ tasks:
       nix build .#rdny --print-build-logs
   - platform-eval: |
       cd rdny
-      for system in x86_64-linux aarch64-linux x86_64-darwin aarch64-darwin; do
+      for system in x86_64-linux aarch64-linux aarch64-darwin; do
         nix eval ".#packages.${system}.rdny.name"
         nix eval ".#packages.${system}.release-artifact.name"
       done
