@@ -61,5 +61,5 @@ tasks:
       EOF
       srht builds submit "$manifest" --secrets --note "site refresh: rdny $tag"
 artifacts:
-  - artifacts/rdny-v0.3.0-x86_64-linux.tar.gz
-  - artifacts/rdny-v0.3.0-x86_64-linux.tar.gz.sha256
+  - artifacts/rdny-v0.3.1-x86_64-linux.tar.gz
+  - artifacts/rdny-v0.3.1-x86_64-linux.tar.gz.sha256

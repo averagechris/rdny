@@ -11,9 +11,21 @@ if [[ $# -ne 1 ]]; then
 fi
 
 rdny=$1
-export RDNY_SMOKE_WORKDIR=${RDNY_SMOKE_WORKDIR:-"$PWD/smoke-artifacts"}
-rm -rf "$RDNY_SMOKE_WORKDIR"
-mkdir -p "$RDNY_SMOKE_WORKDIR"
+artifact_dir=${RDNY_SMOKE_WORKDIR:-"$PWD/smoke-artifacts"}
+rm -rf "$artifact_dir"
+mkdir -p "$artifact_dir"
+artifact_dir=$(cd "$artifact_dir" && pwd -P)
+
+# AF_UNIX paths are especially short on macOS. Run in a short real directory
+# (the secure state opener deliberately rejects symlinks), then copy the
+# retained evidence to the requested CI artifact location on exit.
+smoke_runtime_dir=$(mktemp -d "${TMPDIR:-/tmp}/rdny-smoke.XXXXXX")
+cleanup_smoke_runtime() {
+  cp -R "$smoke_runtime_dir"/. "$artifact_dir"/
+  rm -rf "$smoke_runtime_dir"
+}
+trap cleanup_smoke_runtime EXIT
+export RDNY_SMOKE_WORKDIR=$smoke_runtime_dir
 
 status=0
 if [[ -n ${RDNY_SMOKE_FAKE_STATUS:-} ]]; then

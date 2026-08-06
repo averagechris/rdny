@@ -3,6 +3,14 @@
 ## Unreleased
 
 
+
+## v0.3.1 - 2026-08-06
+
+### Changed
+
+- Update Rust and Nix dependencies to current stable compatible versions.
+- Keep browser smoke-test broker sockets within platform path limits while
+  retaining evidence at the requested artifact location.
 ## v0.3.0 - 2026-07-11
 
 - Add bundled `rdny-browser` Agent Skill and `rdny skills` list/show/install commands (~averagechris/projects#234).
