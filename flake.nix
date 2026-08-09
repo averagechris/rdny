@@ -38,6 +38,13 @@
         versionMode = "package";
         versionFile = "Cargo.toml";
         lockPackages = ["rdny"];
+        releaseValidationApps = [
+          "ci-deny"
+          "ci-machete"
+          "ci-sort"
+          "ci-release-contract"
+          "ci-release-facing"
+        ];
       };
     mkToolApp = system: name: runtimeInputs: text: let
       pkgs = pkgsFor system;
@@ -81,6 +88,10 @@
     ciReleaseFacing = system:
       mkToolApp system "ci-release-facing" [(pkgsFor system).bash (pkgsFor system).coreutils (pkgsFor system).findutils (pkgsFor system).gawk (pkgsFor system).gnugrep (pkgsFor system).gnutar (pkgsFor system).nix] ''
         exec bash scripts/ci-release-facing.sh "$@"
+      '';
+    ciReleaseContract = system:
+      mkToolApp system "ci-release-contract" [(pkgsFor system).bash (pkgsFor system).coreutils (pkgsFor system).gnugrep (pkgsFor system).nix] ''
+        exec bash scripts/ci-release-contract.sh
       '';
     nixFormatter = system: let
       pkgs = pkgsFor system;
@@ -158,6 +169,7 @@
         ci-deny = ciDeny system;
         ci-machete = ciMachete system;
         ci-release-facing = ciReleaseFacing system;
+        ci-release-contract = ciReleaseContract system;
         ci-smoke = ciSmoke system;
         ci-smoke-flow-test = ciSmokeFlowTest system;
         ci-smoke-gate = ciSmokeGate system;
@@ -198,6 +210,10 @@
         ci-release-facing = {
           type = "app";
           program = "${self.packages.${system}.ci-release-facing}/bin/ci-release-facing";
+        };
+        ci-release-contract = {
+          type = "app";
+          program = "${self.packages.${system}.ci-release-contract}/bin/ci-release-contract";
         };
         ci-smoke = {
           type = "app";

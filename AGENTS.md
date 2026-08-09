@@ -21,12 +21,21 @@ server.
 This repo uses the standard averagechris fleet interface:
 
 ```sh
-nix run .#prepare-release -- --version X.Y.Z
-nix run .#release-tag
-nix build .#release-artifact
 nix run .#static-checks
+nix run .#release -- --version X.Y.Z --check
 nix run .#release -- --version X.Y.Z --submit-linux-build
 ```
+
+The preflight is non-mutating and fails fast unless the checkout is Git-backed,
+SourceHut authentication works, the requested tag is available, and the empty
+jj working-copy commit's parent, local `main`, and `main@origin` agree. The
+release prepares the tree, runs fmt/clippy/test plus deny, machete, sort, the
+evaluated help/docs contract, and `ci-release-facing`, then builds and verifies
+the artifact and checksum before atomically publishing `main` and the annotated
+tag. Browser-backed smoke gates remain separate so release does not depend on a
+volatile browser environment. After a post-publication failure, rerun the exact
+same command: only exact matching release state resumes idempotently; mismatched
+checkout, refs, tag, or version fail closed.
 
 `.builds/ci.yml` runs automatically on every push. `builds/release-linux-x86_64.yml`
 is explicit-submit only; do not move it to `.builds/`.

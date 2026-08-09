@@ -79,11 +79,11 @@
         "srht": "srht"
       },
       "locked": {
-        "lastModified": 1785966204,
-        "narHash": "sha256-fbzjxI5R6rn88s4RD5oaJkPhMFSTdVqug8fb7S/8YYg=",
+        "lastModified": 1786310054,
+        "narHash": "sha256-6pUr4JYqW7Xf47OnM8hr3ex+1jcwwi4/tzqxXl4TQkw=",
         "ref": "refs/heads/main",
-        "rev": "9c64b42bcd59b363b283b3ee11aad99e5ca505c3",
-        "revCount": 81,
+        "rev": "19416e3fc0c0415e39104476565ec0c375bce69b",
+        "revCount": 84,
         "type": "git",
         "url": "https://git.sr.ht/~averagechris/averagechris.srht.site"
       },

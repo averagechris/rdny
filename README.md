@@ -560,8 +560,17 @@ nix run .#ci-test
 ## Release
 
 ```sh
+nix run .#release -- --version X.Y.Z --check
 nix run .#release -- --version X.Y.Z --submit-linux-build
 ```
+
+The first command is a non-mutating readiness preflight. It fails fast on an
+invalid checkout, authentication, or tag state and requires an empty `@` whose
+parent, local `main`, and `main@origin` agree. The release validates the prepared
+tree, including the packaged CLI/help/skill contract, and verifies the artifact
+and checksum before atomically publishing refs. Browser smoke remains a separate
+CI gate. If a later upload or build submission fails, the exact same command
+resumes only when the checkout, refs, annotated tag, and version match exactly.
 
 The shared release interface comes from
 `git+https://git.sr.ht/~averagechris/averagechris.srht.site#lib.fleet.presets.rust`.

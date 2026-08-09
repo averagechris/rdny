@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add fail-safe release preflight and deterministic prepared-tree release-contract gates.
+
 
 
 ## v0.3.1 - 2026-08-06
