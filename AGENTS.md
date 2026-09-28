@@ -23,19 +23,18 @@ This repo uses the standard averagechris fleet interface:
 ```sh
 nix run .#static-checks
 nix run .#release -- --version X.Y.Z --check
-nix run .#release -- --version X.Y.Z --submit-linux-build
+nix run .#release -- --version X.Y.Z
 ```
 
-The preflight is non-mutating and fails fast unless the checkout is Git-backed,
-SourceHut authentication works, the requested tag is available, and the empty
-jj working-copy commit's parent, local `main`, and `main@origin` agree. The
-release prepares the tree, runs fmt/clippy/test plus deny, machete, sort, the
-evaluated help/docs contract, and `ci-release-facing`, then builds and verifies
-the artifact and checksum before atomically publishing `main` and the annotated
-tag. Browser-backed smoke gates remain separate so release does not depend on a
-volatile browser environment. After a post-publication failure, rerun the exact
-same command: only exact matching release state resumes idempotently; mismatched
-checkout, refs, tag, or version fail closed.
+The preflight is non-mutating and fails fast unless the requested GitHub tag is
+available and the empty jj working-copy commit's parent, local `main`, and
+`main@origin` agree. The release runs fmt/clippy/test plus deny, machete, sort,
+the evaluated help/docs contract, and `ci-release-facing`, then atomically
+publishes `main` and the annotated tag. A read-only GitHub workflow builds and
+verifies the unbundled CLI archive/checksum pairs for both platforms. Follow
+`docs/release.md` to verify identities and checksums, manually publish four
+assets, and refresh Pages. Browser-backed smoke remains a separate gate.
 
-`.builds/ci.yml` runs automatically on every push. `builds/release-linux-x86_64.yml`
-is explicit-submit only; do not move it to `.builds/`.
+`.builds/ci.yml` still runs automatically on SourceHut pushes. Historical
+SourceHut assets and `builds/release-linux-x86_64.yml` are archival only: do not
+submit that manifest or dual-publish a new release.

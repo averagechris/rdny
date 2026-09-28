@@ -561,16 +561,18 @@ nix run .#ci-test
 
 ```sh
 nix run .#release -- --version X.Y.Z --check
-nix run .#release -- --version X.Y.Z --submit-linux-build
+nix run .#release -- --version X.Y.Z
 ```
 
-The first command is a non-mutating readiness preflight. It fails fast on an
-invalid checkout, authentication, or tag state and requires an empty `@` whose
-parent, local `main`, and `main@origin` agree. The release validates the prepared
-tree, including the packaged CLI/help/skill contract, and verifies the artifact
-and checksum before atomically publishing refs. Browser smoke remains a separate
-CI gate. If a later upload or build submission fails, the exact same command
-resumes only when the checkout, refs, annotated tag, and version match exactly.
+The first command is a non-mutating ref/version preflight. Both commands require
+an empty `@` whose parent, local `main`, and `main@origin` agree. The release
+validates the prepared tree, including the packaged CLI/help/skill contract,
+then atomically publishes `main` and its annotated tag. A read-only GitHub
+Actions workflow builds the unbundled CLI archive and checksum for
+`aarch64-darwin` and `x86_64-linux`; browser smoke remains a separate CI gate.
+Follow [docs/release.md](docs/release.md) to verify identities and checksums,
+publish the four assets as a draft release, byte-verify them, undraft, and
+refresh Pages. Historical SourceHut releases remain available but are archival.
 
 The shared release interface comes from
-`git+https://git.sr.ht/~averagechris/averagechris.srht.site#lib.fleet.presets.rust`.
+the SHA-pinned `github:averagechris/fleet` `lib.fleet.presets.rust` preset.
